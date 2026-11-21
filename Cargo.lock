@@ -761,7 +761,9 @@ dependencies = [
 name = "cascade-diag"
 version = "0.1.0"
 dependencies = [
+ "cascade-core",
  "cascade-iface",
+ "cascade-runner",
  "serialport",
 ]
 
@@ -770,6 +772,7 @@ name = "cascade-gui"
 version = "0.1.0"
 dependencies = [
  "cascade-core",
+ "cascade-diag",
  "cascade-iface",
  "cascade-runner",
  "gpui-kit",

@@ -3,6 +3,7 @@
 # offset: byte index after "61 01". Multi-byte values little-endian. value = raw * scale + add.
 # Flags come in bit pairs: the listed bit is the state, the bit above it means "not available"
 # (both set shows NOT SUPP.). Scales from 3-4 sample points each.
+# Offset 4 (transmission range) is an enum, lowest set bit: P,N R D 4 3 2 L SPORTS; 0 = "-".
 name,offset,size,signed,scale,add,unit,metric
 engine_speed,0,2,no,0.25,0,rpm,
 vehicle_speed,2,1,no,0.621371,0,mph,1 km/h/bit

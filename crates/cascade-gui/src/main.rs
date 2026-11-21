@@ -99,7 +99,20 @@ fn kwp_engine() -> KwpConfig {
     cfg
 }
 
-const IFACES: [&str; 3] = ["Fake ECU", "KWP engine", "None"];
+const IFACES: [&str; 4] = ["Fake", "KWP", "None", "Adapter"];
+/// Index of "Adapter" in IFACES.
+const ADAPTER: usize = 3;
+
+/// A real K-line adapter on `path` (opened inside the emulator thread).
+fn adapter_iface(path: String, echo: bool) -> IfaceKind {
+    let label = format!("adapter {path}{}", if echo { "" } else { " (no echo)" });
+    let make: cascade_runner::IfaceFactory = std::sync::Arc::new(move || {
+        cascade_diag::kline_iface::SerialKLine::open(&path, echo)
+            .map(|k| Box::new(k) as Box<dyn cascade_iface::Interface>)
+            .map_err(|e| e.to_string())
+    });
+    IfaceKind::Custom { label, make }
+}
 
 fn iface_kind(i: usize) -> IfaceKind {
     match i {
@@ -179,6 +192,11 @@ struct CascadeView {
     /// The key held with the mouse, so a release outside it still lands.
     mouse_key: Option<Cap>,
     iface_choice: usize,
+    /// Adapter ports found by the last scan, the chosen one, and whether
+    /// the adapter hears its own bytes.
+    ports: Vec<String>,
+    port: Option<String>,
+    adapter_echo: bool,
     _refresh: Task<()>,
 }
 
@@ -223,6 +241,9 @@ impl CascadeView {
             pressed: Vec::new(),
             mouse_key: None,
             iface_choice: 0,
+            ports: Vec::new(),
+            port: None,
+            adapter_echo: true,
             _refresh: refresh,
         }
     }
@@ -235,10 +256,25 @@ impl CascadeView {
                 }
                 self.runner.send(Command::Key { key: k, down: true });
             }
-            Cap::Power => self
-                .runner
-                .send(Command::Restart(iface_kind(self.iface_choice))),
+            Cap::Power => self.runner.send(Command::Restart(self.current_iface())),
         }
+    }
+
+    /// What the diagnostic-line selection currently means.
+    fn current_iface(&self) -> IfaceKind {
+        match (self.iface_choice, &self.port) {
+            (ADAPTER, Some(p)) => adapter_iface(p.clone(), self.adapter_echo),
+            (ADAPTER, None) => IfaceKind::Null,
+            (i, _) => iface_kind(i),
+        }
+    }
+
+    /// Switch to an adapter port: power-cycle onto it at real time (a real
+    /// line has real-time partners).
+    fn use_port(&mut self, port: String) {
+        self.port = Some(port);
+        self.runner.send(Command::Speed(Speed::Real(1.0)));
+        self.runner.send(Command::Restart(self.current_iface()));
     }
 
     fn cap_up(&mut self, cap: Cap) {
@@ -602,6 +638,75 @@ impl CascadeView {
             )
     }
 
+    /// Port list and options shown when "Adapter" is selected.
+    fn adapter_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ports =
+            self.ports
+                .iter()
+                .enumerate()
+                .fold(div().flex().flex_col().gap(px(4.)), |d, (i, p)| {
+                    let selected = self.port.as_deref() == Some(p.as_str());
+                    let name = p.trim_start_matches("/dev/cu.").to_string();
+                    let path = p.clone();
+                    let b = Button::new(SharedString::from(format!("port-{i}")))
+                        .label(name)
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            v.use_port(path.clone());
+                            cx.notify();
+                        }));
+                    d.child(if selected { b.primary() } else { b.ghost() })
+                });
+        let echo = self.adapter_echo;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .rounded(px(8.))
+            .bg(rgb(CARD))
+            .text_sm()
+            .when(self.ports.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_color(rgb(TEXT_DIM))
+                        .child("No adapter found. Plug it in and rescan."),
+                )
+            })
+            .child(ports)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.))
+                    .child(
+                        Button::new("rescan")
+                            .icon(IconName::RefreshCw)
+                            .label("Rescan")
+                            .ghost()
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.ports = cascade_diag::serial::list_ports();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("echo")
+                            .label(if echo { "Echo: on" } else { "Echo: off" })
+                            .ghost()
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                v.adapter_echo = !echo;
+                                if let Some(p) = v.port.clone() {
+                                    v.use_port(p);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+                "Runs the original Hi-Scan software on the car. Its menus include actuator \
+                 tests and resets: use them only on purpose.",
+            ))
+    }
+
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = &self.snap;
         let paused = s.paused;
@@ -650,7 +755,12 @@ impl CascadeView {
                     seg(format!("iface-{i}"), name, self.iface_choice == i).on_click(cx.listener(
                         move |v, _, _, cx| {
                             v.iface_choice = i;
-                            v.runner.send(Command::Restart(iface_kind(i)));
+                            if i == ADAPTER {
+                                // pick a port first; nothing changes until then
+                                v.ports = cascade_diag::serial::list_ports();
+                            } else {
+                                v.runner.send(Command::Restart(iface_kind(i)));
+                            }
                             cx.notify();
                         },
                     )),
@@ -711,6 +821,9 @@ impl CascadeView {
             .child(div().h(px(4.)))
             .child(section("DIAGNOSTIC LINE"))
             .child(line_row)
+            .when(self.iface_choice == ADAPTER, |d| {
+                d.child(self.adapter_panel(cx))
+            })
             .child(div().h(px(4.)))
             .child(section("STATUS"))
             .child(

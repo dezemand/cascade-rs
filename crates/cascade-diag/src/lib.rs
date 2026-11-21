@@ -6,6 +6,8 @@
 
 pub mod defs;
 pub mod guard;
+#[cfg(feature = "serial")]
+pub mod kline_iface;
 pub mod kwp;
 pub mod line;
 #[cfg(feature = "serial")]

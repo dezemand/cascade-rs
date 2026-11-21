@@ -57,7 +57,10 @@ checking them on the real ECU.
 ## Identification check [emulator-derived]
 
 - Request `1A 8E` (ReadEcuIdentification option 0x8E). The firmware accepts
-  `5A 8E` + ASCII but showed nothing further; not explored.
+  `5A 8E` + ASCII and shows it in a large font under MODEL / SYSTEM.
+  With the 11-character reply `39110-23700` (an ECU part number, made up)
+  it showed `39110-23`: the first 8 characters only, or cut by the screen
+  width at that font size (not distinguished). One request, no polling.
 - Function 11 VERSION CONFIGURATION writes a configuration into the ECM and
   10 RESETTING ADAPTIVE VALUES resets the ECU: not explored, not to be used.
 

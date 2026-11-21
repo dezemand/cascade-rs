@@ -32,8 +32,12 @@ pub const KEY_GAP_CYCLES: u64 = MIN_HOLD_CYCLES;
 /// Line events kept for display.
 const LOG_KEEP: usize = 500;
 
+/// Builds an interface inside the emulator thread (interfaces need not be
+/// `Send`). Used for real adapters, which may fail to open.
+pub type IfaceFactory = Arc<dyn Fn() -> Result<Box<dyn Interface>, String> + Send + Sync>;
+
 /// What is on the diagnostic line.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum IfaceKind {
     /// Nothing attached.
     Null,
@@ -41,6 +45,14 @@ pub enum IfaceKind {
     Fake,
     /// The KWP2000 ECU model with the given configuration.
     Kwp(KwpConfig),
+    /// Anything else, e.g. a serial K-line adapter; `label` is shown.
+    Custom { label: String, make: IfaceFactory },
+}
+
+impl std::fmt::Debug for IfaceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
 }
 
 impl IfaceKind {
@@ -49,6 +61,7 @@ impl IfaceKind {
             IfaceKind::Null => "nothing".into(),
             IfaceKind::Fake => "upstream fake".into(),
             IfaceKind::Kwp(c) => format!("KWP2000 ECU @{:02X}", c.address),
+            IfaceKind::Custom { label, .. } => label.clone(),
         }
     }
 }
@@ -214,11 +227,25 @@ struct Emu {
     ratio: f64,
 }
 
-fn build_cpu(rom: &[u8], iface: &IfaceKind, max_cycles: Option<u64>) -> (Cpu, EventLog) {
+/// Returns the machine, its line log, and an error if the interface could
+/// not be built (the machine then has nothing on the line).
+fn build_cpu(
+    rom: &[u8],
+    iface: &IfaceKind,
+    max_cycles: Option<u64>,
+) -> (Cpu, EventLog, Option<String>) {
+    let mut error = None;
     let inner: Box<dyn Interface> = match iface {
         IfaceKind::Null => Box::new(Null),
         IfaceKind::Fake => Box::new(Fake::default()),
         IfaceKind::Kwp(cfg) => Box::new(KwpEcu::new(cfg.clone())),
+        IfaceKind::Custom { label, make } => match make() {
+            Ok(i) => i,
+            Err(e) => {
+                error = Some(format!("{label}: {e}"));
+                Box::new(Null)
+            }
+        },
     };
     let traced = Traced::new(inner);
     let log = traced.log_handle();
@@ -226,7 +253,7 @@ fn build_cpu(rom: &[u8], iface: &IfaceKind, max_cycles: Option<u64>) -> (Cpu, Ev
     if let Some(m) = max_cycles {
         cpu.max_cycles = m;
     }
-    (cpu, log)
+    (cpu, log, error)
 }
 
 fn format_event(e: &cascade_iface::Stamped) -> String {
@@ -254,14 +281,17 @@ impl Emu {
         max_cycles: Option<u64>,
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
-        let (cpu, log) = build_cpu(&rom, &iface, max_cycles);
+        let (cpu, log, error) = build_cpu(&rom, &iface, max_cycles);
         let now = Instant::now();
-        Self {
+        let mut emu = Self {
             rom,
             cpu,
             log,
             log_read: 0,
-            iface_label: iface.label(),
+            iface_label: match &error {
+                Some(_) => format!("{} (failed to open)", iface.label()),
+                None => iface.label(),
+            },
             speed,
             paused: false,
             stopped: None,
@@ -280,7 +310,11 @@ impl Emu {
             ratio_wall: now,
             ratio_cycles: 0,
             ratio: 0.0,
+        };
+        if let Some(e) = error {
+            emu.note(e);
         }
+        emu
     }
 
     fn reanchor(&mut self) {
@@ -360,18 +394,24 @@ impl Emu {
                 self.reanchor();
             }
             Command::Restart(iface) => {
-                let (cpu, log) = build_cpu(&self.rom, &iface, self.max_cycles);
+                let (cpu, log, error) = build_cpu(&self.rom, &iface, self.max_cycles);
                 self.cpu = cpu;
                 self.log = log;
                 self.total_cycles = 0;
                 self.log_read = 0;
-                self.iface_label = iface.label();
+                self.iface_label = match &error {
+                    Some(_) => format!("{} (failed to open)", iface.label()),
+                    None => iface.label(),
+                };
                 self.stopped = None;
                 self.held.clear();
                 self.pending_release.clear();
                 self.lines.clear();
                 self.log_seq += 1;
                 self.resets = 0;
+                if let Some(e) = error {
+                    self.note(e);
+                }
                 self.reanchor();
             }
             Command::Quit => return false,

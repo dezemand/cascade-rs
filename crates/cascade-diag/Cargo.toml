@@ -21,3 +21,7 @@ workspace = true
 [features]
 default = ["serial"]
 serial = ["dep:serialport"]
+
+[dev-dependencies]
+cascade-core.workspace = true
+cascade-runner.workspace = true

@@ -75,6 +75,23 @@ impl SerialLine {
     }
 }
 
+/// Serial devices that could be an adapter: `/dev/cu.*`, without the
+/// Mac's built-in Bluetooth and debug ports.
+pub fn list_ports() -> Vec<String> {
+    serialport::available_ports()
+        .map(|v| {
+            v.into_iter()
+                .map(|p| p.port_name)
+                .filter(|n| {
+                    n.starts_with("/dev/cu.")
+                        && !n.contains("Bluetooth")
+                        && !n.contains("debug-console")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Sleep with sub-millisecond accuracy: OS sleep, then spin the last 2 ms.
 pub fn precise_sleep(d: Duration) {
     let end = Instant::now() + d;

@@ -235,15 +235,13 @@ fn connect(o: &Opts) -> Result<Client<Box<dyn Line>>, String> {
 fn selftest(port: &str) -> Result<(), String> {
     use cascade_diag::serial::{SerialLine, Status, selftest};
     let mut line = SerialLine::open(port, true).map_err(|e| {
-        let ports: Vec<String> = serialport::available_ports()
-            .map(|v| {
-                v.into_iter()
-                    .map(|p| p.port_name)
-                    .filter(|n| n.starts_with("/dev/cu."))
-                    .collect()
-            })
-            .unwrap_or_default();
-        format!("{port}: {e}\navailable ports: {}", ports.join(", "))
+        let ports = cascade_diag::serial::list_ports();
+        let list = if ports.is_empty() {
+            "none found".to_string()
+        } else {
+            ports.join(", ")
+        };
+        format!("{port}: {e}\nadapter ports: {list}")
     })?;
     println!("Adapter self-test on {port}");
     println!("Needs 12 V on OBD pin 16 (car with ignition OFF, or a bench supply).\n");
@@ -314,17 +312,15 @@ fn dtc(o: &Opts) -> Result<(), String> {
             .map(dtc_name)
             .collect(),
         System::Srs => {
-            // the Hi-Scan asks twice, with status filters 00 and 01
+            // The Hi-Scan asks twice; it marks codes from filter 01 as
+            // history (H), whatever their status byte (emulator-derived).
             let mut v = Vec::new();
-            for status in [0x00, 0x01] {
+            for (status, kind) in [(0x00, "current"), (0x01, "history")] {
                 for (code, st) in c
                     .read_dtcs_by_status(status, 0xff00)
                     .map_err(|e| format!("DTCs: {e}"))?
                 {
-                    v.push(format!(
-                        "{} status {st:02X} (filter {status:02X}; record format unverified)",
-                        dtc_name(code)
-                    ));
+                    v.push(format!("{} {kind}, status {st:02X}", dtc_name(code)));
                 }
             }
             v

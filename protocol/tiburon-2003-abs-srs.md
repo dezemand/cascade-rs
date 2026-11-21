@@ -34,13 +34,24 @@ seen on the car. Menu paths: 09 TIBURON > 04 ANTI-LOCK BRAKE SYSTEM, and
   `tiburon-2003-abs-current-data.csv`. Highlights: engine speed u16 LE ÷ 4,
   vehicle and four wheel speeds 1 km/h per bit, G sensors raw × 4/255 − 2 g,
   warning lamps and switches as bit pairs (state, not-available).
-- Not mapped: transmission range byte (offset 4: 0 shows "-", FF "P,N").
+- Transmission range (TR SWITCH), offset 4: the lowest set bit wins.
+  bit0 P,N; bit1 R; bit2 D; bit3 4; bit4 3; bit5 2; bit6 L; bit7 SPORTS;
+  0x00 shows "-" (swept 0x00-0x08 and every single bit; 0x03 shows P,N,
+  0x06 shows R). Not in the CSV, which has no enum type; kdiag logs it raw.
 
 ## SRS (0x58)
 
 - Function menu: DTCs, Crashing Information, Identification Check.
 - DTCs: two requests, `18 00 FF 00` and `18 01 FF 00` (ReadDTCsByStatus,
   all groups, status filters 0x00 and 0x01). `58 00` shows NO TROUBLE CODE.
-  Record format with codes present: not yet checked.
-- Crashing Information (front/side): starts with `21 00 01`; not explored
-  (it shows COMMUNICATION ERROR when refused).
+- Record format with codes present: as the engine, `58 N` + N × (code
+  high, code low, status). B1102 (`11 02`) shows "BATTERY VOLTAGE LOW".
+  Codes from both requests are listed and counted ("2 ITEMS" for one of
+  each). Codes from `18 01` are marked H (history) whatever their status
+  byte; codes from `18 00` are not, so `18 00` reads current and `18 01`
+  stored codes.
+- Crashing Information (front/side): `21 00 01` first; when answered
+  `61 00 …` the firmware polls `21 00` continuously (refused: four tries,
+  then `20`, an unsupported service, and back). Answered with a 40-byte
+  record of all 00 or all FF, the screen stays blank, so the record layout
+  is unknown. Only the car's reply will tell; the trace is what matters.
