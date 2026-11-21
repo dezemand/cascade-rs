@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 publish.workspace = true
+repository.workspace = true
+license-file.workspace = true
 description = "Minimal SAE J2534 PassThru access for ISO 14230 (K-line): a platform-neutral trait, and on Windows a vendor-DLL backend"
 
 # Not `workspace = true`: the Windows DLL backend needs `unsafe` (FFI), which

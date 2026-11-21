@@ -575,11 +575,13 @@ mod tests {
         let get = |n: &str| report.iter().find(|c| c.name == n).map(|c| c.status);
         assert_eq!(get("echo"), Some(Status::Pass), "{report:#?}");
         assert_eq!(get("echo latency"), Some(Status::Pass), "{report:#?}");
-        assert_eq!(
-            get("10,400 baud"),
-            Some(Status::Fail),
-            "a pty cannot set baud rates"
-        );
+        // macOS ptys refuse IOSSIOSPEED; Linux ptys accept any baud rate
+        let expected = if cfg!(target_os = "macos") {
+            Status::Fail
+        } else {
+            Status::Pass
+        };
+        assert_eq!(get("10,400 baud"), Some(expected), "{report:#?}");
         assert!(get("host timing").is_some());
     }
 

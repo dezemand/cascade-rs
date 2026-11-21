@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "Siemens 80C517-class 8051 emulator for offline analysis of the Coupe engine ECU ROM"
+repository.workspace = true
+license-file.workspace = true
+description = "Siemens 80C517-class 8051 emulator for offline analysis of an earlier Hyundai engine ECU ROM"
 
 [lints]
 workspace = true

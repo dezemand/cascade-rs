@@ -6,6 +6,7 @@ license-file.workspace = true
 authors.workspace = true
 description = "Native KWP2000 K-line diagnostics and logging, using protocol data learned with cascade-rs"
 publish.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "kdiag"

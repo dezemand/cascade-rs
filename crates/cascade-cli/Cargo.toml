@@ -6,6 +6,7 @@ license-file.workspace = true
 authors.workspace = true
 description.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "cascade"

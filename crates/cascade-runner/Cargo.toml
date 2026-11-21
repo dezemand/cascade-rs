@@ -6,6 +6,7 @@ license-file.workspace = true
 authors.workspace = true
 description = "Runs the cascade-rs emulator on its own thread in real time, for front ends"
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 cascade-core.workspace = true

@@ -11,6 +11,7 @@ license-file = "LICENSE"
 authors = ["Maarten"]
 description = "Rust port of CASCADE by Ulrich Hecht (CASCADE Public License 1.0)"
 publish = false
+repository = "https://github.com/dezemand/cascade-rs"
 
 [workspace.dependencies]
 cascade-core = { path = "crates/cascade-core" }

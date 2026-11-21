@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # default members: everything except the GUI (GPUI is large and needs
+      # Wayland/X11 on Linux); the GUI has its own job below
+      - run: cargo clippy --all-targets -- -D warnings
+      # No ROMs in CI: the ROM-dependent tests skip themselves.
+      - run: cargo test
+
+  gui:
+    name: GUI (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p cascade-gui --all-targets -- -D warnings
+      - run: cargo test -p cascade-gui
+
+  windows:
+    name: kdiag + J2534 (32-bit Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p cascade-j2534 -p cascade-diag --target i686-pc-windows-msvc -- -D warnings
+      - run: cargo build -p cascade-diag --bin kdiag --target i686-pc-windows-msvc
+      - run: cargo test -p cascade-j2534 --target i686-pc-windows-msvc

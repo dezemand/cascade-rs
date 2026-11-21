@@ -6,6 +6,7 @@ license-file.workspace = true
 authors.workspace = true
 description = "Desktop front end for the cascade-rs Hi-Scan emulator (GPUI via gpui-kit)"
 publish.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "cascade-gui"
