@@ -1,0 +1,8 @@
+upstream/
+roms/
+target/
+traces/
+*.his.dat
+*.HIS_EN.DAT
+*.DAT
+oracle/.ctx/

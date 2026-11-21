@@ -1,0 +1,11 @@
+[package]
+name = "cascade-iface"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

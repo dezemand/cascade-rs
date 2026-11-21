@@ -1,0 +1,19 @@
+[package]
+name = "cascade-cli"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cascade"
+path = "src/main.rs"
+
+[dependencies]
+cascade-core.workspace = true
+cascade-iface.workspace = true
+
+[lints]
+workspace = true
