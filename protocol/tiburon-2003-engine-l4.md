@@ -109,7 +109,7 @@ Machine-readable copy: `tiburon-2003-engine-l4-current-data.csv`.
 | 67–68 | u16 | EVAP.PURGE VALVE | ≈0.0030518 (200/65536) | 0 | % |
 
 Checked against the ECU's own code **[verified in emulation, not on the car]**:
-the GK-20 SIMK41 dump (`docs/simk41-notes.md`) runs in `ecuc167` behind the
+a GK-20 SIMK41 engine ECU dump (not in this repository) runs in `ecuc167` behind the
 Hi-Scan emulator and behind `kdiag --sim-ecu`.
 - StartCommunication answers key bytes EF 8F; `21 01` returns 78 data bytes
   (the Hi-Scan reads up to offset 75).

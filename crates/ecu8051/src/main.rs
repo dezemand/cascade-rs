@@ -23,7 +23,7 @@
 //!   wrapped in an ISO 14230 header.
 //!
 //! `--fosc` defaults to 16 MHz: the ROM's 5-baud decoder only syncs for
-//! 15-16 MHz in this model (see `docs/ecu-rom-notes.md`).
+//! 15-16 MHz in this model (12-14.75 and 17-20 MHz all fail).
 
 mod cpu;
 

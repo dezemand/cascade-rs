@@ -6,7 +6,7 @@
 //! The SFR map follows the SAB 80C517A data sheet as remembered **[assumed]**;
 //! what the ROM actually does with each register is what the analysis checks.
 //!
-//! Banking (from the ROM, see `docs/ecu-rom-notes.md`): the whole 64 KB code
+//! Banking (from the ROM's trampolines at 0x1E1D/0x1E38/0x1E43): the whole 64 KB code
 //! space is switched by P5.4 (SFR F8h bit 4). P5.4 = 1 selects file half 0,
 //! P5.4 = 0 selects file half 1.
 

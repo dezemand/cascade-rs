@@ -2,8 +2,8 @@
 //! mode, ...), via the `serialport` crate. macOS arbitrary baud rates
 //! (10,400) go through the IOSSIOSPEED ioctl inside `serialport`.
 //!
-//! **Untested on hardware**: no adapter has been connected yet. The Phase 3
-//! checklist in CLAUDE.md lists what to verify (baud, break, echo).
+//! **Untested on hardware**: no adapter has been connected yet. To verify
+//! on one: 10,400 baud, BREAK on the line, and the echo (`kdiag selftest`).
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};

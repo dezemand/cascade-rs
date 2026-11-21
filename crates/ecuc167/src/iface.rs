@@ -2,7 +2,8 @@
 //! ECU's own code on the other end.
 //!
 //! Time: callers count in Hi-Scan cycles (10,000 per ms); the ECU runs at
-//! `fcpu` (16 MHz assumed, see `docs/simk41-notes.md`). The ECU is powered
+//! `fcpu` (16 MHz assumed: the boot code's S0BG 0x2F is then 10,417 baud and
+//! the CAPCOM2 tick exactly 1 ms). The ECU is powered
 //! on lazily: at the tester's first wake-up it first runs `boot_ms` of its
 //! own time (past the immobiliser phase, which holds the shared UART for
 //! about 2.6 s when no immobiliser answers), then follows the caller's clock.

@@ -1,5 +1,6 @@
 //! ecuc167: an Infineon C167-class (C16x) disassembler and emulator, built
-//! to run the GK SIMK41 engine ECU dump offline (see `docs/simk41-notes.md`).
+//! to run a GK SIMK41 engine ECU dump offline. The dump is proprietary and
+//! not part of this repository.
 //!
 //! [`iface::Simk41`] puts the emulated ECU behind `cascade_iface::Interface`,
 //! so the Hi-Scan emulator and kdiag's `SimLine` can talk to the ECU's own

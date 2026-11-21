@@ -33,7 +33,7 @@ CELLS = {
     "injection_time": 19, "isc_duty": 20, "idle_speed_duty": 21, "ign_dwell": 17,
 }
 
-# ADC channels with an effect on the block (docs/simk41-notes.md)
+# ADC channels with an effect on the block (found by sweeping each channel)
 CHANNELS = {0: "MAP", 1: "ch1", 2: "O2 front", 3: "O2 rear", 4: "battery",
             10: "throttle", 11: "coolant", 14: "intake air"}
 VALUES = list(range(0, 0x400, 0x40)) + [0x3FF]
