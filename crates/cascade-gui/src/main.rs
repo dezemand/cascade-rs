@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 
+mod live;
+
 use cascade_core::Key;
 use cascade_core::lcd::{LCD_HEIGHT, LCD_WIDTH};
 use cascade_iface::KwpConfig;
@@ -99,9 +101,42 @@ fn kwp_engine() -> KwpConfig {
     cfg
 }
 
-const IFACES: [&str; 4] = ["Fake", "KWP", "None", "Adapter"];
-/// Index of "Adapter" in IFACES.
+const IFACES: [&str; 5] = ["Fake", "KWP", "None", "Port", "Replay"];
+/// Index of the serial adapter ("Port") in IFACES.
 const ADAPTER: usize = 3;
+/// Index of "Replay" (a `kdiag --trace` recording) in IFACES.
+const REPLAY: usize = 4;
+
+/// A loaded recording: file name, ECU configuration, one-line summary.
+struct Loaded {
+    name: String,
+    config: KwpConfig,
+    summary: String,
+}
+
+fn load_trace(path: &std::path::Path) -> Result<Loaded, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let rec = cascade_iface::replay::from_jsonl(&text)?;
+    let summary = format!(
+        "{} answers to {} requests, ECU {}{}",
+        rec.pairs(),
+        rec.sequences.len(),
+        rec.address.map_or("?".into(), |a| format!("{a:02X}")),
+        if rec.unanswered > 0 {
+            format!(", {} unanswered", rec.unanswered)
+        } else {
+            String::new()
+        }
+    );
+    Ok(Loaded {
+        name: path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into(),
+        ),
+        config: rec.config(),
+        summary,
+    })
+}
 
 /// A real K-line adapter on `path` (opened inside the emulator thread).
 fn adapter_iface(path: String, echo: bool) -> IfaceKind {
@@ -197,12 +232,35 @@ struct CascadeView {
     ports: Vec<String>,
     port: Option<String>,
     adapter_echo: bool,
+    /// The recording for "Replay", or why the last one failed to load.
+    replay: Option<Loaded>,
+    replay_err: Option<String>,
+    /// Show the native live-data table instead of the handset.
+    live_view: bool,
+    live: Option<live::Live>,
+    live_snap: live::LiveSnap,
+    /// Port for live data (None = simulator).
+    live_port: Option<String>,
     _refresh: Task<()>,
 }
 
 impl CascadeView {
-    fn new(rom: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let runner = Runner::spawn(rom, iface_kind(0));
+    fn new(
+        rom: Vec<u8>,
+        replay: Option<Result<Loaded, String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (replay, replay_err) = match replay {
+            Some(Ok(l)) => (Some(l), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
+        };
+        let first = match &replay {
+            Some(l) => IfaceKind::Kwp(l.config.clone()),
+            None => iface_kind(0),
+        };
+        let runner = Runner::spawn(rom, first);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         // poll the emulator about 60 times a second; redraw only on change
@@ -223,6 +281,11 @@ impl CascadeView {
                                 || s.iface != v.snap.iface
                         })
                         .unwrap_or(false);
+                    let live_changed = v.live.as_ref().is_some_and(|l| l.seq() != v.live_snap.seq);
+                    if live_changed && let Some(l) = &v.live {
+                        v.live_snap = l.snapshot();
+                        cx.notify();
+                    }
                     if changed {
                         v.snap = v.runner.snapshot();
                         cx.notify();
@@ -240,10 +303,20 @@ impl CascadeView {
             focus,
             pressed: Vec::new(),
             mouse_key: None,
-            iface_choice: 0,
+            iface_choice: if replay.is_some() || replay_err.is_some() {
+                REPLAY
+            } else {
+                0
+            },
             ports: Vec::new(),
             port: None,
             adapter_echo: true,
+            replay,
+            replay_err,
+            live_view: false,
+            live: None,
+            live_snap: live::LiveSnap::default(),
+            live_port: None,
             _refresh: refresh,
         }
     }
@@ -265,6 +338,10 @@ impl CascadeView {
         match (self.iface_choice, &self.port) {
             (ADAPTER, Some(p)) => adapter_iface(p.clone(), self.adapter_echo),
             (ADAPTER, None) => IfaceKind::Null,
+            (REPLAY, _) => match &self.replay {
+                Some(l) => IfaceKind::Kwp(l.config.clone()),
+                None => IfaceKind::Null,
+            },
             (i, _) => iface_kind(i),
         }
     }
@@ -275,6 +352,35 @@ impl CascadeView {
         self.port = Some(port);
         self.runner.send(Command::Speed(Speed::Real(1.0)));
         self.runner.send(Command::Restart(self.current_iface()));
+    }
+
+    /// Ask for a `kdiag --trace` file and power-cycle onto it.
+    fn open_trace(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Replay".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.first()
+            {
+                let loaded = load_trace(p);
+                let _ = this.update(cx, |v, cx| {
+                    match loaded {
+                        Ok(l) => {
+                            v.replay = Some(l);
+                            v.replay_err = None;
+                            v.runner.send(Command::Restart(v.current_iface()));
+                        }
+                        Err(e) => v.replay_err = Some(format!("{}: {e}", p.display())),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn cap_up(&mut self, cap: Cap) {
@@ -707,6 +813,195 @@ impl CascadeView {
             ))
     }
 
+    /// Recording and file button shown when "Replay" is selected.
+    fn replay_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let card = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .rounded(px(8.))
+            .bg(rgb(CARD))
+            .text_sm();
+        let card = match &self.replay {
+            Some(l) => card
+                .child(div().font_family("Menlo").child(l.name.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(TEXT_DIM))
+                        .child(l.summary.clone()),
+                ),
+            None => card.child(
+                div()
+                    .text_color(rgb(TEXT_DIM))
+                    .child("No recording loaded."),
+            ),
+        };
+        card.when_some(self.replay_err.clone(), |d, e| {
+            d.child(div().text_xs().text_color(rgb(WARN)).child(e))
+        })
+        .child(
+            Button::new("open-trace")
+                .icon(IconName::FolderOpen)
+                .label("Open kdiag trace…")
+                .ghost()
+                .on_click(cx.listener(|v, _, _, cx| v.open_trace(cx))),
+        )
+        .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+            "Answers each request with what the car answered, in recorded order, \
+             then from the start again. Requests never recorded get the ECU model's replies.",
+        ))
+    }
+
+    /// Native live data: engine `21 01` through kdiag's client, decoded with
+    /// the protocol CSV. Independent of the emulator.
+    fn live_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let s = &self.live_snap;
+        let running = self.live.is_some() && s.running;
+        let ports = cascade_diag::serial::list_ports();
+        let sources = std::iter::once(None)
+            .chain(ports.into_iter().map(Some))
+            .enumerate()
+            .fold(
+                div().flex().flex_row().flex_wrap().gap(px(4.)),
+                |d, (i, p)| {
+                    let label = p.as_deref().map_or("Simulator".to_string(), |p| {
+                        p.trim_start_matches("/dev/cu.").to_string()
+                    });
+                    let selected = self.live_port == p;
+                    let b = Button::new(SharedString::from(format!("live-src-{i}")))
+                        .label(label)
+                        .compact()
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            v.live_port = p.clone();
+                            v.live = None;
+                            cx.notify();
+                        }));
+                    d.child(if selected { b.primary() } else { b.ghost() })
+                },
+            );
+        let start = Button::new("live-start")
+            .icon(if running {
+                IconName::Pause
+            } else {
+                IconName::Play
+            })
+            .label(if running { "Stop" } else { "Start" })
+            .primary()
+            .on_click(cx.listener(move |v, _, _, cx| {
+                if running {
+                    v.live = None;
+                    v.live_snap.running = false;
+                    v.live_snap.status = "stopped".into();
+                } else {
+                    let src = match &v.live_port {
+                        None => live::Source::Sim,
+                        Some(p) => live::Source::Port {
+                            path: p.clone(),
+                            echo: v.adapter_echo,
+                        },
+                    };
+                    v.live = Some(live::Live::start(src));
+                }
+                cx.notify();
+            }));
+        let rows = s.rows.iter().fold(
+            div().flex().flex_col().w_full(),
+            |d, (name, value, unit)| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .px(px(12.))
+                        .py(px(5.))
+                        .border_b_1()
+                        .border_color(rgb(CARD_EDGE))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(name.replace('_', " ")),
+                        )
+                        .child(
+                            div()
+                                .w(px(110.))
+                                .text_right()
+                                .font_family("Menlo")
+                                .text_color(rgb(TEXT))
+                                .child(value.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(56.))
+                                .pl(px(8.))
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(unit.clone()),
+                        ),
+                )
+            },
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .w(px(560.))
+            .max_h_full()
+            .p(px(16.))
+            .rounded(px(16.))
+            .bg(rgb(CARD))
+            .border_1()
+            .border_color(rgb(CARD_EDGE))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Engine live data"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child("kdiag client, read-only. 21 01 every 150 ms."),
+                            ),
+                    )
+                    .child(start),
+            )
+            .child(sources)
+            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
+                "{}  ·  {} reads, {} errors",
+                if s.status.is_empty() {
+                    "idle"
+                } else {
+                    &s.status
+                },
+                s.reads,
+                s.errors
+            )))
+            .child(
+                div()
+                    .id("live-rows")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .rounded(px(8.))
+                    .bg(rgb(PANEL))
+                    .text_sm()
+                    .child(rows),
+            )
+    }
+
     fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let s = &self.snap;
         let paused = s.paused;
@@ -752,18 +1047,34 @@ impl CascadeView {
                 .bg(rgb(CARD)),
             |d, (i, name)| {
                 d.child(
-                    seg(format!("iface-{i}"), name, self.iface_choice == i).on_click(cx.listener(
-                        move |v, _, _, cx| {
-                            v.iface_choice = i;
-                            if i == ADAPTER {
-                                // pick a port first; nothing changes until then
-                                v.ports = cascade_diag::serial::list_ports();
+                    // five options: size to the label (basis auto) and share the rest
+                    {
+                        let b = Button::new(SharedString::from(format!("iface-{i}")))
+                            .label(*name)
+                            .compact()
+                            .flex_grow(1.);
+                        if self.iface_choice == i {
+                            b.primary()
+                        } else {
+                            b.ghost()
+                        }
+                    }
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        v.iface_choice = i;
+                        if i == ADAPTER {
+                            // pick a port first; nothing changes until then
+                            v.ports = cascade_diag::serial::list_ports();
+                        } else if i == REPLAY {
+                            if v.replay.is_some() {
+                                v.runner.send(Command::Restart(v.current_iface()));
                             } else {
-                                v.runner.send(Command::Restart(iface_kind(i)));
+                                v.open_trace(cx);
                             }
-                            cx.notify();
-                        },
-                    )),
+                        } else {
+                            v.runner.send(Command::Restart(iface_kind(i)));
+                        }
+                        cx.notify();
+                    })),
                 )
             },
         );
@@ -789,6 +1100,31 @@ impl CascadeView {
             .border_l_1()
             .border_color(rgb(CARD_EDGE))
             .text_color(rgb(TEXT))
+            .child(section("VIEW"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(4.))
+                    .p(px(3.))
+                    .rounded(px(8.))
+                    .bg(rgb(CARD))
+                    .child(seg("view-dev".into(), "Hi-Scan", !self.live_view).on_click(
+                        cx.listener(|v, _, _, cx| {
+                            v.live_view = false;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        seg("view-live".into(), "Live data", self.live_view).on_click(cx.listener(
+                            |v, _, _, cx| {
+                                v.live_view = true;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .child(div().h(px(4.)))
             .child(section("EMULATOR"))
             .child(
                 div()
@@ -823,6 +1159,9 @@ impl CascadeView {
             .child(line_row)
             .when(self.iface_choice == ADAPTER, |d| {
                 d.child(self.adapter_panel(cx))
+            })
+            .when(self.iface_choice == REPLAY, |d| {
+                d.child(self.replay_panel(cx))
             })
             .child(div().h(px(4.)))
             .child(section("STATUS"))
@@ -911,7 +1250,14 @@ impl Render for CascadeView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(self.device(g, cx)),
+                    .p(px(20.))
+                    .map(|d| {
+                        if self.live_view {
+                            d.child(self.live_panel(cx))
+                        } else {
+                            d.child(self.device(g, cx))
+                        }
+                    }),
             )
             .child(self.side(cx))
     }
@@ -922,7 +1268,7 @@ fn main() {
         .nth(1)
         .or_else(|| std::env::var("CASCADE_ROM").ok())
     else {
-        eprintln!("usage: cascade-gui ROM   (or set CASCADE_ROM)");
+        eprintln!("usage: cascade-gui ROM [--replay KDIAG.jsonl]   (or set CASCADE_ROM)");
         std::process::exit(2);
     };
     let rom = match std::fs::read(&path) {
@@ -932,6 +1278,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let args: Vec<String> = std::env::args().collect();
+    let replay = args
+        .iter()
+        .position(|a| a == "--replay")
+        .and_then(|i| args.get(i + 1))
+        .map(|p| {
+            let p = std::path::Path::new(p);
+            load_trace(p).map_err(|e| format!("{}: {e}", p.display()))
+        });
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
@@ -955,7 +1310,7 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| CascadeView::new(rom, window, cx))
+                cx.new(|cx| CascadeView::new(rom, replay, window, cx))
             })
             .expect("failed to open window");
             cx.on_window_closed(|cx, _| cx.quit()).detach();

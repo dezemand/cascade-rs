@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cpu;
+pub mod disasm;
 pub mod eeprom;
 pub mod glibc_rand;
 pub mod hsio;

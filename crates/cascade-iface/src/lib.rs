@@ -15,6 +15,7 @@ use std::rc::Rc;
 mod fake;
 pub mod iso14230;
 pub mod kwp;
+pub mod replay;
 
 pub use fake::Fake;
 pub use kwp::{KwpConfig, KwpEcu};

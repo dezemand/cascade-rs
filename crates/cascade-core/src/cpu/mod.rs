@@ -99,6 +99,9 @@ impl Default for Stats {
 
 pub struct Cpu {
     pub stats: Stats,
+    /// Physical ROM offsets read through the data window, with counts, while
+    /// recording is on ([`Cpu::record_rom_reads`]). Analysis aid.
+    rom_reads: std::cell::RefCell<Option<std::collections::BTreeMap<u32, u64>>>,
     rom: Vec<u8>,
     ram: Vec<u8>,
     mapped_ram: Vec<u8>,
@@ -165,6 +168,7 @@ impl Cpu {
             mapped_ram: vec![0; MAPPED_RAM_SIZE],
             code_win: 0,
             data_win: Window::Rom(0),
+            rom_reads: Default::default(),
             is_hiscan,
             pc: 0,
             psw: 0,
@@ -254,6 +258,35 @@ impl Cpu {
         self.cycles
     }
 
+    /// Code byte at virtual `addr` under the current code mapping, without
+    /// side effects (I/O registers read as 0xFF). For the disassembler.
+    pub fn peek_code(&self, addr: u16) -> u8 {
+        if addr >= 0xc000 {
+            let i = self.code_win as usize + (addr - 0xc000) as usize;
+            self.rom.get(i).copied().unwrap_or(0xff)
+        } else if addr < 0x18 || (0x200..0x300).contains(&addr) {
+            0xff
+        } else {
+            self.ram[addr as usize]
+        }
+    }
+
+    /// Physical ROM offset of virtual code address `addr` (>= 0xC000) under
+    /// the current code mapping.
+    pub fn code_phys(&self, addr: u16) -> Option<u32> {
+        (addr >= 0xc000).then(|| self.code_win + (addr - 0xc000) as u32)
+    }
+
+    /// Start (or restart) recording data-window ROM reads.
+    pub fn record_rom_reads(&self) {
+        *self.rom_reads.borrow_mut() = Some(Default::default());
+    }
+
+    /// Stop recording and return what was read: physical offset -> count.
+    pub fn take_rom_reads(&self) -> std::collections::BTreeMap<u32, u64> {
+        self.rom_reads.borrow_mut().take().unwrap_or_default()
+    }
+
     pub fn pc(&self) -> u16 {
         self.pc
     }
@@ -330,7 +363,12 @@ impl Cpu {
         let off = (addr - 0xc000) as usize;
         match self.data_win {
             Window::Rom(base) => match self.rom.get(base as usize + off) {
-                Some(b) => Ok(*b),
+                Some(b) => {
+                    if let Some(m) = self.rom_reads.borrow_mut().as_mut() {
+                        *m.entry(base + off as u32).or_default() += 1;
+                    }
+                    Ok(*b)
+                }
                 None => oob(format!(
                     "data window read past ROM at {:#x}",
                     base as usize + off

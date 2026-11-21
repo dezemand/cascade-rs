@@ -1,0 +1,12 @@
+[package]
+name = "ecuc167"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Infineon C167-class (C16x) disassembler and emulator for offline analysis of the GK SIMK41 engine ECU dump"
+
+[lints]
+workspace = true
+
+[dependencies]

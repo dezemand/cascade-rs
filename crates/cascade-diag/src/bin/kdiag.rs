@@ -137,25 +137,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// A plausible warm idle for the engine simulator: 800 rpm, 88 degC, 14.1 V.
-fn sim_engine_block() -> Vec<u8> {
-    let mut b = vec![0u8; 80];
-    b[0] = 139; // 14.1 V
-    b[3] = 181; // 87.75 degC
-    b[5] = 91; // 20.25 degC
-    b[7] = 2; // 0.9 deg
-    b[10] = 77; // 1504 mV
-    b[13..15].copy_from_slice(&4800u16.to_le_bytes()); // 5.8 psi
-    b[19..21].copy_from_slice(&800i16.to_le_bytes());
-    b[21..23].copy_from_slice(&800i16.to_le_bytes());
-    b[26..28].copy_from_slice(&92u16.to_le_bytes()); // 449 mV
-    b[30] = 168; // 9 deg BTDC
-    b[42..44].copy_from_slice(&700u16.to_le_bytes()); // 2.8 ms
-    b[73] = 0b0100; // closed throttle
-    b[74..76].copy_from_slice(&800u16.to_le_bytes()); // 3.2 ms
-    b
-}
-
 /// ABS simulator: standing still, 800 rpm, 14 V, brake pressed.
 fn sim_abs_block() -> Vec<u8> {
     let mut b = vec![0u8; 17];
@@ -176,7 +157,8 @@ fn sim_config(system: System) -> KwpConfig {
     match system {
         System::Engine => {
             cfg.dtcs = vec![(0x0130, 0x20)];
-            cfg.local_data.insert(0x01, sim_engine_block());
+            cfg.local_data
+                .insert(0x01, cascade_diag::sim::engine_idle_block());
         }
         System::Abs | System::Srs => {
             cfg.key_bytes = [0xea, 0x8f];

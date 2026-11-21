@@ -61,6 +61,11 @@ pub struct KwpConfig {
     /// Fixed responses for exact requests (service data, SID first),
     /// checked before the built-in services once a session is active.
     pub responses: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Recorded responses per exact request, served in order and then from
+    /// the start again (replay of a real session; see [`crate::replay`]).
+    /// Checked after `responses`. A recorded `81` answer replaces the key
+    /// bytes.
+    pub sequences: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
     /// Always use the separate length byte (`80 tgt src len ...`), even
     /// for short responses.
     pub length_byte: bool,
@@ -79,6 +84,7 @@ impl Default for KwpConfig {
             local_data: BTreeMap::new(),
             dtcs: Vec::new(),
             responses: BTreeMap::new(),
+            sequences: BTreeMap::new(),
             length_byte: false,
         }
     }
@@ -100,6 +106,7 @@ pub struct KwpEcu {
     /// Encoded response frame waiting for its P2 time.
     pending: Option<(Cycles, Vec<u8>)>,
     log: ExchangeLog,
+    cursors: BTreeMap<Vec<u8>, usize>,
 }
 
 impl KwpEcu {
@@ -112,6 +119,7 @@ impl KwpEcu {
             last_request_at: 0,
             pending: None,
             log: ExchangeLog::default(),
+            cursors: BTreeMap::new(),
         }
     }
 
@@ -130,6 +138,15 @@ impl KwpEcu {
         }
     }
 
+    /// Next recorded response for `req`, rotating through the recording.
+    fn next_recorded(&mut self, req: &[u8]) -> Option<Vec<u8>> {
+        let seq = self.config.sequences.get(req).filter(|s| !s.is_empty())?;
+        let i = self.cursors.entry(req.to_vec()).or_insert(0);
+        let r = seq[*i % seq.len()].clone();
+        *i = (*i + 1) % seq.len();
+        Some(r)
+    }
+
     fn negative(sid: u8, code: u8) -> Option<Vec<u8>> {
         Some(vec![0x7f, sid, code])
     }
@@ -139,6 +156,9 @@ impl KwpEcu {
         let sid = *req.first()?;
         if sid == 0x81 {
             self.active = true;
+            if let Some(r) = self.next_recorded(req) {
+                return Some(r);
+            }
             let [kb1, kb2] = self.config.key_bytes;
             return Some(vec![0xc1, kb1, kb2]);
         }
@@ -147,6 +167,9 @@ impl KwpEcu {
         }
         if let Some(r) = self.config.responses.get(req) {
             return Some(r.clone());
+        }
+        if let Some(r) = self.next_recorded(req) {
+            return Some(r);
         }
         match sid {
             0x82 => {

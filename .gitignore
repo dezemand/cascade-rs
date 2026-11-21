@@ -7,3 +7,4 @@ traces/
 *.DAT
 oracle/.ctx/
 __pycache__/
+*.bin

@@ -7,6 +7,7 @@ Usage: tools/screen.py ROM [options] KEY...
   --local ID=HEX      KwpEcu ReadDataByLocalIdentifier block (repeatable)
   --dtc CODE:STATUS   KwpEcu stored DTC (repeatable)
   --respond REQ=RESP  KwpEcu fixed response to an exact request (hex)
+  --replay F.jsonl    answer from a kdiag --trace recording
   --kwp-log FILE      write the decoded KWP exchange log
   --tail N            run N million cycles after the last key (default 60)
   --step N            million cycles between keys (default 30)
@@ -48,7 +49,7 @@ def main():
     for a in it:
         if a == "--path":
             keys += PATHS[next(it)]
-        elif a in ("--local", "--dtc", "--kwp-log", "--respond", "--line-log", "--kwp-addr", "--kwp-keybytes", "--png"):
+        elif a in ("--local", "--dtc", "--kwp-log", "--respond", "--line-log", "--kwp-addr", "--kwp-keybytes", "--png", "--replay", "--rom-reads", "--pcs"):
             extra += [a, next(it)]
         elif a == "--kwp-length-byte":
             extra.append(a)

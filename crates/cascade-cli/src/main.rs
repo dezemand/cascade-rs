@@ -17,7 +17,13 @@
 //!       --local ID=HEX sets its ReadDataByLocalIdentifier block;
 //!       --respond REQ=RESP (hex, SID first) answers one exact request;
 //!       --kwp-addr ADDR sets the ECU address (engine 0x11, ABS 0x28, SRS 0x58);
-//!       --kwp-keybytes HEX and --kwp-length-byte vary its StartComm reply; --stats prints
+//!       --kwp-keybytes HEX and --kwp-length-byte vary its StartComm reply;
+//!       --pcs CYCLE:FILE writes every executed code address (physical for
+//!       the code window) from CYCLE on, with counts;
+//!       --rom-reads CYCLE:FILE writes every ROM offset read through the
+//!       data window from CYCLE on, with counts;
+//!       --replay F.jsonl answers from a `kdiag --trace` recording (implies
+//!       --iface kwp; address, key bytes and framing come from the trace); --stats prints
 //!       coverage counters. Exit 0 at the cycle cap, 1 on any other stop,
 //!       3 when the firmware's endless-loop reset fires (unless
 //!       --continue-after-reset).
@@ -26,6 +32,10 @@
 //!       first divergence. Exit 0 if equal, 1 if they diverge, 2 on error.
 //!   cascade trace-stats <log>
 //!       Count records and distinct physical PCs.
+//!   cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]
+//!       Linear disassembly of N instructions (default 40) from virtual
+//!       ADDR. Below 0xC000 the ROM maps 1:1; 0xC000-0xFFFF is the code
+//!       window, whose physical start is --bank (default 0xC000).
 
 mod png;
 
@@ -115,7 +125,10 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut dtcs: Vec<(u16, u8)> = Vec::new();
     let mut local_data = std::collections::BTreeMap::new();
     let mut responses = std::collections::BTreeMap::new();
-    let mut kwp_addr = 0x11u8;
+    let mut kwp_addr: Option<u8> = None;
+    let mut replay = None;
+    let mut rom_reads: Option<(u64, String)> = None;
+    let mut pcs_out: Option<(u64, String)> = None;
     let mut kwp_kb: Option<[u8; 2]> = None;
     let mut kwp_len_byte = false;
     let mut stats = false;
@@ -154,7 +167,36 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                     .map_err(|e| format!("--local {v:?}: {e}"))?;
                 local_data.insert(parse_num(id)? as u8, bytes);
             }
-            "--kwp-addr" => kwp_addr = parse_num(val()?)? as u8,
+            "--kwp-addr" => kwp_addr = Some(parse_num(val()?)? as u8),
+            "--pcs" => {
+                let v = val()?;
+                let (from, file) = v
+                    .split_once(':')
+                    .ok_or_else(|| format!("bad --pcs {v:?}, want FROM_CYCLE:FILE"))?;
+                pcs_out = Some((parse_num(from)?, file.to_string()));
+            }
+            "--rom-reads" => {
+                let v = val()?;
+                let (from, file) = v
+                    .split_once(':')
+                    .ok_or_else(|| format!("bad --rom-reads {v:?}, want FROM_CYCLE:FILE"))?;
+                rom_reads = Some((parse_num(from)?, file.to_string()));
+            }
+            "--replay" => {
+                let p = val()?;
+                let text = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
+                let rec =
+                    cascade_iface::replay::from_jsonl(&text).map_err(|e| format!("{p}: {e}"))?;
+                eprintln!(
+                    "replay: {} answers to {} distinct requests from {p} (address {:02X?}, {} unanswered)",
+                    rec.pairs(),
+                    rec.sequences.len(),
+                    rec.address,
+                    rec.unanswered
+                );
+                replay = Some(rec);
+                iface_name = "kwp";
+            }
             "--kwp-keybytes" => {
                 let kb = parse_hex(val()?)?;
                 kwp_kb = Some(kb.try_into().map_err(|_| "--kwp-keybytes needs 2 bytes")?);
@@ -210,14 +252,15 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
         "fake" => Box::new(cascade_iface::Fake::default()),
         "null" => Box::new(cascade_iface::Null),
         "kwp" => {
+            let base = replay.as_ref().map(|r| r.config()).unwrap_or_default();
             let config = cascade_iface::KwpConfig {
                 dtcs: dtcs.clone(),
                 local_data: local_data.clone(),
                 responses: responses.clone(),
-                address: kwp_addr,
-                key_bytes: kwp_kb.unwrap_or([0xef, 0x8f]),
-                length_byte: kwp_len_byte,
-                ..Default::default()
+                address: kwp_addr.unwrap_or(base.address),
+                key_bytes: kwp_kb.unwrap_or(base.key_bytes),
+                length_byte: kwp_len_byte || base.length_byte,
+                ..base
             };
             let ecu = cascade_iface::KwpEcu::new(config);
             kwp_log = Some(ecu.log_handle());
@@ -252,7 +295,23 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     // Upstream resets the machine (cycles back to 0) on an endless loop, so
     // a cycle cap alone would never end the run. Stop there by default.
     let mut reset_seen = false;
+    let mut reads_on = false;
+    let mut pcs = std::collections::BTreeMap::<u32, u64>::new();
     let stop = loop {
+        if let Some((from, _)) = &rom_reads
+            && !reads_on
+            && cpu.cycles() >= *from
+        {
+            cpu.record_rom_reads();
+            reads_on = true;
+        }
+        if let Some((from, _)) = &pcs_out
+            && cpu.cycles() >= *from
+        {
+            let pc = cpu.pc();
+            *pcs.entry(cpu.code_phys(pc).unwrap_or(pc as u32))
+                .or_default() += 1;
+        }
         let t: Option<&mut dyn FnMut(&Record)> = if tracing { Some(&mut sink) } else { None };
         match cpu.step(t) {
             Ok(StepEvent::Executed) => {}
@@ -270,6 +329,17 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     };
     if let Some(mut w) = out {
         w.flush().map_err(|e| e.to_string())?;
+    }
+    if let Some((_, file)) = &pcs_out {
+        let text: String = pcs.iter().map(|(p, n)| format!("{p:06X} {n}\n")).collect();
+        std::fs::write(file, text).map_err(|e| format!("{file}: {e}"))?;
+    }
+    if let Some((_, file)) = &rom_reads {
+        let mut text = String::new();
+        for (phys, n) in cpu.take_rom_reads() {
+            text.push_str(&format!("{phys:06X} {n}\n"));
+        }
+        std::fs::write(file, text).map_err(|e| format!("{file}: {e}"))?;
     }
     if let Some(e) = write_err {
         return Err(format!("writing trace: {e}"));
@@ -364,6 +434,54 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     })
 }
 
+fn disasm(args: &[&str]) -> Result<ExitCode, String> {
+    use cascade_core::disasm::{Flow, decode};
+    let (mut rom_path, mut addr, mut n, mut bank) = (None, None, 40u64, 0xc000u64);
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        let mut val = || it.next().copied().ok_or(format!("{a} needs a value"));
+        match a {
+            "-n" => n = parse_num(val()?)?,
+            "--bank" => bank = parse_num(val()?)?,
+            _ if rom_path.is_none() => rom_path = Some(a),
+            _ if addr.is_none() => addr = Some(parse_num(a)? as u16),
+            _ => return Err(format!("unexpected argument {a:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("disasm needs a ROM path")?;
+    let mut pc = addr.ok_or("disasm needs an address")?;
+    let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let phys = |v: u16| -> usize {
+        if v >= 0xc000 {
+            bank as usize + (v - 0xc000) as usize
+        } else {
+            v as usize
+        }
+    };
+    for _ in 0..n {
+        let p = phys(pc);
+        let bytes: Vec<u8> = (0..6u16)
+            .map(|i| rom.get(phys(pc.wrapping_add(i))).copied().unwrap_or(0xff))
+            .collect();
+        let Some(insn) = decode(&bytes, pc) else {
+            break;
+        };
+        let hex: String = bytes[..insn.len as usize]
+            .iter()
+            .map(|b| format!("{b:02X} "))
+            .collect();
+        println!("{p:06X}  {pc:04X}  {hex:<18} {}", insn.text);
+        if matches!(
+            insn.flow,
+            Flow::Ret | Flow::Jump(_) | Flow::Indirect | Flow::Stop
+        ) {
+            println!();
+        }
+        pc = pc.wrapping_add(insn.len as u16);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -371,8 +489,9 @@ fn main() -> ExitCode {
         ["run", rest @ ..] => run(rest),
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--continue-after-reset]\n       \
-                  cascade trace-diff <left> <right>\n       cascade trace-stats <log>"
+        ["disasm", rest @ ..] => disasm(rest),
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
+                  cascade trace-diff <left> <right>\n       cascade trace-stats <log>\n       cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]"
             .into()),
     };
     result.unwrap_or_else(|e| {

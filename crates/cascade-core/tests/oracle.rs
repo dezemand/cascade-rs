@@ -154,3 +154,84 @@ fn kwp_fast_init_matches_oracle() {
         .collect();
     assert_eq!(tx, expected_tx);
 }
+
+/// The disassembler's lengths and targets agree with the executor on every
+/// instruction run from boot to the engine Current Data screen.
+#[test]
+fn disasm_lengths_match_execution() {
+    use cascade_core::disasm::{Flow, decode};
+    use cascade_core::{Cpu, Key, KeyEvent, StepEvent};
+    use cascade_iface::{KwpConfig, KwpEcu};
+    use std::collections::BTreeSet;
+
+    let Ok(rom) = std::env::var("CASCADE_ROM") else {
+        eprintln!("CASCADE_ROM not set; skipping");
+        return;
+    };
+    let mut cfg = KwpConfig::default();
+    cfg.local_data.insert(0x01, vec![0x40; 60]);
+    let mut cpu = Cpu::new(
+        std::fs::read(rom).expect("read ROM"),
+        Box::new(KwpEcu::new(cfg)),
+        false,
+    );
+    // screen.py's tiburon-l4 path, then 02 CURRENT DATA
+    let mut path = vec![Key::ENTER];
+    path.extend([Key::DOWN; 8]);
+    path.extend([
+        Key::ENTER,
+        Key::ENTER,
+        Key::DOWN,
+        Key::DOWN,
+        Key::DOWN,
+        Key::ENTER,
+    ]);
+    path.extend([Key::DOWN, Key::ENTER]);
+    let mut keys = vec![(59_899_906u64, Key::ENTER)];
+    keys.extend(
+        path.iter()
+            .enumerate()
+            .map(|(i, &k)| (300_000_000 + i as u64 * 30_000_000, k)),
+    );
+    for (at, key) in keys {
+        cpu.queue_key(KeyEvent {
+            at,
+            key,
+            down: true,
+        });
+        cpu.queue_key(KeyEvent {
+            at: at + 1_572_865,
+            key,
+            down: false,
+        });
+    }
+    let until = 300_000_000 + (path.len() as u64 + 3) * 30_000_000;
+    let mut seen = BTreeSet::new();
+    let mut checked = 0u64;
+    while cpu.cycles() < until {
+        let mut pc = 0;
+        let ev = cpu.step(Some(&mut |r: &cascade_core::trace::Record| pc = r.pc));
+        assert!(matches!(ev, Ok(StepEvent::Executed)), "{ev:?}");
+        // bytes as they were before the instruction ran (code does not
+        // modify itself here; RAM code would show up as a mismatch)
+        let bytes: Vec<u8> = (0..6).map(|i| cpu.peek_code(pc.wrapping_add(i))).collect();
+        let insn = decode(&bytes, pc).expect("decodes");
+        let next = pc.wrapping_add(insn.len as u16);
+        let now = cpu.pc();
+        let ok = match insn.flow {
+            Flow::Next => now == next,
+            Flow::Branch(t) => now == t || now == next,
+            Flow::Jump(t) | Flow::Call(t) => now == t,
+            Flow::Ret | Flow::Indirect => true,
+            Flow::Stop => false,
+        };
+        assert!(ok, "{pc:04X}: {bytes:02X?} {} -> pc {now:04X}", insn.text);
+        seen.insert(bytes[0]);
+        checked += 1;
+    }
+    eprintln!(
+        "{checked} instructions checked, {} distinct opcodes",
+        seen.len()
+    );
+    assert!(checked > 1_000_000);
+}
