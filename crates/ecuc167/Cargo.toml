@@ -10,3 +10,4 @@ description = "Infineon C167-class (C16x) disassembler and emulator for offline 
 workspace = true
 
 [dependencies]
+cascade-iface.workspace = true

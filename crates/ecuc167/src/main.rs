@@ -26,9 +26,7 @@
 //!   `--stop-at PC`, `--dump ADDR LEN` print memory at the end,
 //!   `--poke-at PC ADDR=HEX..` store bytes (physical) whenever PC is reached
 
-mod cpu;
-mod isa;
-mod line;
+use ecuc167::{cpu, isa};
 
 use cpu::{Cpu, Event};
 use std::collections::BTreeMap;

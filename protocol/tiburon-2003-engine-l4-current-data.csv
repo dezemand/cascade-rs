@@ -3,6 +3,8 @@
 # offset: byte index after "61 01" in an ISO 14230 long frame (80 F1 11 LEN 61 01 ...).
 # Multi-byte values are little-endian. value = raw * scale + add. Units as the Hi-Scan shows them.
 # Factors marked ~ were bracketed from boundary samples (see protocol/tiburon-2003-engine-l4.md).
+# Checked against the engine ECU's own code (GK-20 SIMK41 dump, tools/ecu_sweep.py): for 136
+# ECU-generated blocks this CSV reproduces all 2,128 Hi-Scan readings. The block has 78 data bytes.
 name,offset,size,signed,scale,add,unit,metric
 battery_voltage,0,1,no,0.1015625,0,V,
 coolant_temp,3,1,no,1.35,-54.4,degF,0.75 degC/bit - 48 degC

@@ -108,6 +108,33 @@ Machine-readable copy: `tiburon-2003-engine-l4-current-data.csv`.
 | 53–54 | s16 | LONG FUEL-PART | ≈0.00153 | 0 | % |
 | 67–68 | u16 | EVAP.PURGE VALVE | ≈0.0030518 (200/65536) | 0 | % |
 
+Checked against the ECU's own code **[verified in emulation, not on the car]**:
+the GK-20 SIMK41 dump (`docs/simk41-notes.md`) runs in `ecuc167` behind the
+Hi-Scan emulator and behind `kdiag --sim-ecu`.
+- StartCommunication answers key bytes EF 8F; `21 01` returns 78 data bytes
+  (the Hi-Scan reads up to offset 75).
+- `tools/ecu_sweep.py` swept eight ADC inputs (MAP, O2 front/rear, battery,
+  throttle, coolant, intake air, channel 1) over 17 levels each: 136 blocks,
+  and for every one the CSV decode matches the Hi-Scan's FULL screen (2,128
+  values, 0 mismatches, within display rounding). That covers the full
+  real range of each sensor, so the formulas are linear there with no kinks.
+  The ≈ factors stay bracketed: the screen cannot pin them closer.
+- Not exercised (constant in the emulator: no crank signal, no switch
+  inputs): vehicle and engine speed, ignition timing, injection, fuel trims,
+  purge, the flag bits.
+- Sensor behaviour seen in the ECU code:
+  - MAP pressure is linear in sensor voltage (about 24.7 kPa/V, about 0 at
+    0 V) and clamped to exactly 10.0 kPa (word 1206) and 115.0 kPa (word
+    13869). If those clamps are round kPa values, the exact factor is 1/120.6
+    kPa = 0.00120264 psi per bit, 0.04 % below the bracketed 0.00120317
+    **[assumed]**; the screen cannot tell them apart.
+  - TPS byte = ADC/4 − 64 (0 at 0.5 V and below); a full-scale (faulty)
+    sensor reads 0. Adapted TP stays at its default, 16384.
+  - O2 words are the raw 10-bit ADC values; battery is ADC/4.
+  - With ADC channel 1 at 0.6 V or less the ECU still answers StartComm and
+    some TesterPresents but not `21 01` (a supply or ignition sense input
+    **[assumed]**).
+
 How the scaling was found:
 - `tools/scale_sweep.py` sets all parameters to 10 raw values (one byte of the 16-bit ones at a time, which settles byte order).
 - It reads the screen exactly: `tools/lcdtext.py` matches LCD memory against the 8×16 font in the ROM pack.

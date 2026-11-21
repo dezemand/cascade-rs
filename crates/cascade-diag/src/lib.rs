@@ -6,11 +6,12 @@
 
 pub mod defs;
 pub mod guard;
-#[cfg(feature = "serial")]
+pub mod j2534;
+#[cfg(all(feature = "serial", unix))]
 pub mod kline_iface;
 pub mod kwp;
 pub mod line;
-#[cfg(feature = "serial")]
+#[cfg(all(feature = "serial", unix))]
 pub mod serial;
 pub mod sim;
 pub mod trace;

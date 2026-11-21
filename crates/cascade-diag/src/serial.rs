@@ -23,6 +23,29 @@ pub enum WakeMethod {
     ZeroByte,
 }
 
+/// Wait until `n` bytes just written have left the driver, then one more
+/// byte time for the last one to shift out. Bounded: tcdrain(3) (what
+/// `flush()` does) can block forever (seen on macOS pseudo-terminals in
+/// about 1 of 10 test runs), and a hang on the car is worse than an error.
+fn drain(port: &mut TTYPort, baud: u32, n: usize) -> io::Result<()> {
+    let deadline = Instant::now() + byte_time(baud) * n as u32 + Duration::from_millis(200);
+    loop {
+        match port.bytes_to_write() {
+            Ok(0) => break,
+            Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_micros(100)),
+            Ok(left) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("serial output did not drain ({left} bytes left)"),
+                ));
+            }
+            Err(e) => return Err(io::Error::from(e)),
+        }
+    }
+    precise_sleep(byte_time(baud));
+    Ok(())
+}
+
 pub struct SerialLine {
     port: TTYPort,
     start: Instant,
@@ -132,7 +155,7 @@ impl Line for SerialLine {
                 self.port.set_baud_rate(baud).map_err(io::Error::from)?;
                 let t0 = Instant::now();
                 self.port.write_all(&[0x00])?;
-                self.port.flush()?;
+                drain(&mut self.port, baud, 1)?;
                 // the stop bit already belongs to the high phase
                 let spent = t0.elapsed();
                 self.port.set_baud_rate(normal).map_err(io::Error::from)?;
@@ -147,7 +170,7 @@ impl Line for SerialLine {
 
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.port.write_all(data)?;
-        self.port.flush()?;
+        drain(&mut self.port, self.baud, data.len())?;
         if self.echo {
             let timeout = byte_time(self.baud) * data.len() as u32 + Duration::from_millis(50);
             let back = self.read_exact_timeout(data.len(), timeout)?;
@@ -257,7 +280,7 @@ pub fn selftest(line: &mut SerialLine) -> Vec<Check> {
     let echo = line
         .port
         .write_all(&pattern)
-        .and_then(|_| line.port.flush())
+        .and_then(|_| drain(&mut line.port, 10_400, pattern.len()))
         .and_then(|_| hear(line, pattern.len(), Duration::from_millis(300)));
     let echoes = match &echo {
         Ok(b) if b.as_slice() == pattern => {
@@ -301,7 +324,7 @@ pub fn selftest(line: &mut SerialLine) -> Vec<Check> {
             if line
                 .port
                 .write_all(&[0x5a])
-                .and_then(|_| line.port.flush())
+                .and_then(|_| drain(&mut line.port, 10_400, 1))
                 .is_err()
             {
                 break;
@@ -365,7 +388,7 @@ pub fn selftest(line: &mut SerialLine) -> Vec<Check> {
             .set_baud_rate(360)
             .and_then(|_| line.port.write_all(&[0x00]).map_err(Into::into))
             .map_err(io::Error::from)
-            .and_then(|_| line.port.flush());
+            .and_then(|_| drain(&mut line.port, 360, 1));
         let heard = hear(line, 1, Duration::from_millis(150)).unwrap_or_default();
         let _ = line.port.set_baud_rate(10_400);
         out.push(match (zero, heard.as_slice()) {
@@ -519,22 +542,36 @@ mod tests {
     /// echo and latency checks pass; baud and BREAK cannot pass on a pty.
     #[test]
     fn selftest_with_echoing_pty() {
-        let (a, mut b) = TTYPort::pair().expect("pty pair");
-        b.set_timeout(Duration::from_millis(5)).unwrap();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = stop.clone();
-        let echoer = std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Ok(n) = b.read(&mut buf) {
-                    let _ = b.write_all(&buf[..n]);
+        let run = || {
+            let (a, mut b) = TTYPort::pair().expect("pty pair");
+            b.set_timeout(Duration::from_millis(5)).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop2 = stop.clone();
+            let echoer = std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(n) = b.read(&mut buf) {
+                        let _ = b.write_all(&buf[..n]);
+                    }
                 }
+            });
+            let mut line = SerialLine::from_port(a, true);
+            let report = selftest(&mut line);
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            echoer.join().unwrap();
+            report
+        };
+        // A macOS pty occasionally stops passing bytes (output stuck in the
+        // queue although the far end reads). It used to hang in tcdrain; now
+        // `drain` reports it. That is the pty, not the code under test: retry.
+        let stalled = |r: &[Check]| r.iter().any(|c| c.detail.contains("did not drain"));
+        let mut report = run();
+        for _ in 0..2 {
+            if !stalled(&report) {
+                break;
             }
-        });
-        let mut line = SerialLine::from_port(a, true);
-        let report = selftest(&mut line);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        echoer.join().unwrap();
+            report = run();
+        }
         let get = |n: &str| report.iter().find(|c| c.name == n).map(|c| c.status);
         assert_eq!(get("echo"), Some(Status::Pass), "{report:#?}");
         assert_eq!(get("echo latency"), Some(Status::Pass), "{report:#?}");

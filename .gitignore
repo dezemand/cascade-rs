@@ -8,3 +8,4 @@ traces/
 oracle/.ctx/
 __pycache__/
 *.bin
+.DS_Store

@@ -1,0 +1,15 @@
+[package]
+name = "cascade-j2534"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "Minimal SAE J2534 PassThru access for ISO 14230 (K-line): a platform-neutral trait, and on Windows a vendor-DLL backend"
+
+# Not `workspace = true`: the Windows DLL backend needs `unsafe` (FFI), which
+# the workspace forbids. Only `src/dll.rs` uses it; the rest denies it.
+[lints.clippy]
+all = "warn"
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.9"

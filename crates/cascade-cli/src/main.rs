@@ -22,6 +22,9 @@
 //!       the code window) from CYCLE on, with counts;
 //!       --rom-reads CYCLE:FILE writes every ROM offset read through the
 //!       data window from CYCLE on, with counts;
+//!       --ecu-rom F runs a SIMK41 engine ECU dump (ecuc167) as the ECU
+//!       (implies --iface simk41); --ecu-adc CH=VAL sets its ADC inputs (hex
+//!       with 0x, 10 bit; default 0x200 = 2.5 V);
 //!       --replay F.jsonl answers from a `kdiag --trace` recording (implies
 //!       --iface kwp; address, key bytes and framing come from the trace); --stats prints
 //!       coverage counters. Exit 0 at the cycle cap, 1 on any other stop,
@@ -127,6 +130,8 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut responses = std::collections::BTreeMap::new();
     let mut kwp_addr: Option<u8> = None;
     let mut replay = None;
+    let mut ecu_rom: Option<String> = None;
+    let mut adc: Vec<(usize, u16)> = Vec::new();
     let mut rom_reads: Option<(u64, String)> = None;
     let mut pcs_out: Option<(u64, String)> = None;
     let mut kwp_kb: Option<[u8; 2]> = None;
@@ -181,6 +186,17 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                     .split_once(':')
                     .ok_or_else(|| format!("bad --rom-reads {v:?}, want FROM_CYCLE:FILE"))?;
                 rom_reads = Some((parse_num(from)?, file.to_string()));
+            }
+            "--ecu-rom" => {
+                ecu_rom = Some(val()?.to_string());
+                iface_name = "simk41";
+            }
+            "--ecu-adc" => {
+                let v = val()?;
+                let (ch, x) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("bad --ecu-adc {v:?}, want CH=VALUE"))?;
+                adc.push((parse_num(ch)? as usize, parse_num(x)? as u16));
             }
             "--replay" => {
                 let p = val()?;
@@ -266,7 +282,22 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             kwp_log = Some(ecu.log_handle());
             Box::new(ecu)
         }
-        other => return Err(format!("unknown --iface {other:?} (fake, null, kwp)")),
+        "simk41" => {
+            let p = ecu_rom
+                .as_deref()
+                .ok_or("--iface simk41 needs --ecu-rom PATH")?;
+            let rom = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+            let mut ecu = ecuc167::iface::Simk41::new(rom, 16_000_000);
+            for &(ch, v) in &adc {
+                ecu.set_adc(ch, v);
+            }
+            Box::new(ecu)
+        }
+        other => {
+            return Err(format!(
+                "unknown --iface {other:?} (fake, null, kwp, simk41)"
+            ));
+        }
     };
     let traced = cascade_iface::Traced::new(inner);
     let line_log = traced.log_handle();
@@ -490,7 +521,7 @@ fn main() -> ExitCode {
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
         ["disasm", rest @ ..] => disasm(rest),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
                   cascade trace-diff <left> <right>\n       cascade trace-stats <log>\n       cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]"
             .into()),
     };

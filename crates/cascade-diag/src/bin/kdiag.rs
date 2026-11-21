@@ -21,6 +21,14 @@
 //! exception and needs --allow-clear plus a typed confirmation (or --yes).
 //!
 //! --sim talks to the KwpEcu model in virtual time, with plausible values.
+//! J2534: --j2534 DLL|auto (Windows; a vendor PassThru DLL, `auto` = the
+//! first installed driver; build for i686-pc-windows-msvc for 32-bit DLLs)
+//! replaces --port: the adapter does the fast init, framing and timing.
+//! --j2534-mock (any OS) runs the same message-level path against --sim or
+//! --sim-ecu. `kdiag j2534-list` shows installed drivers (Windows).
+//!
+//! --sim-ecu ROM runs the engine ECU's own code instead (a SIMK41 dump, in the
+//! `ecuc167` emulator, virtual time; engine only). Sensors read mid-scale.
 //! `log` writes one CSV row per `21 01` response: time, decoded values from
 //! the embedded protocol definitions, and the raw block in hex, so logs can
 //! be re-decoded if the definitions change.
@@ -31,10 +39,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use cascade_diag::defs::{self, Value};
-use cascade_diag::kwp::{Client, dtc_name, hex};
+use cascade_diag::j2534::{J2534Link, MockPassThru};
+use cascade_diag::kwp::{Client, Link, dtc_name, hex};
 use cascade_diag::line::Line;
 use cascade_diag::sim::SimLine;
-use cascade_diag::trace::TracedLine;
+use cascade_diag::trace::{TracedLine, TracedLink};
 use cascade_iface::{KwpConfig, KwpEcu};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,9 +77,13 @@ impl System {
     }
 }
 
+#[derive(Clone)]
 struct Opts {
     sim: bool,
+    sim_ecu: Option<String>,
     port: Option<String>,
+    j2534: Option<String>,
+    j2534_mock: bool,
     out: Option<String>,
     trace: Option<String>,
     interval: Duration,
@@ -85,7 +98,10 @@ struct Opts {
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts {
         sim: false,
+        sim_ecu: None,
         port: None,
+        j2534: None,
+        j2534_mock: false,
         out: None,
         trace: None,
         interval: Duration::from_millis(170),
@@ -105,6 +121,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         };
         match a.as_str() {
             "--sim" => o.sim = true,
+            "--j2534" => o.j2534 = Some(val()?),
+            "--j2534-mock" => o.j2534_mock = true,
+            "--sim-ecu" => {
+                o.sim_ecu = Some(val()?);
+                o.sim = true;
+            }
             "--port" => o.port = Some(val()?),
             "--out" => o.out = Some(val()?),
             "--trace" => o.trace = Some(val()?),
@@ -131,8 +153,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             _ => return Err(format!("unexpected argument {a:?}")),
         }
     }
-    if o.sim == o.port.is_some() {
-        return Err("give exactly one of --sim or --port DEV".into());
+    let sources = o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8;
+    if sources != 1 {
+        return Err("give exactly one of --sim, --port DEV or --j2534 DLL|auto".into());
+    }
+    if o.j2534_mock && !o.sim {
+        return Err("--j2534-mock goes with --sim or --sim-ecu".into());
     }
     Ok(o)
 }
@@ -171,9 +197,92 @@ fn sim_config(system: System) -> KwpConfig {
     cfg
 }
 
+/// The diagnostic link: a byte-level line (simulated or serial), or a J2534
+/// device (real on Windows, or a mock in front of a simulated line).
+fn open_link(o: &Opts) -> Result<Box<dyn Link>, String> {
+    let traced = |l: Box<dyn Link>| -> Result<Box<dyn Link>, String> {
+        Ok(match &o.trace {
+            Some(p) => Box::new(TracedLink::new(
+                l,
+                File::create(p).map_err(|e| format!("{p}: {e}"))?,
+            )),
+            None => l,
+        })
+    };
+    if let Some(dll) = &o.j2534 {
+        return traced(open_j2534(dll)?);
+    }
+    if o.j2534_mock {
+        let inner = Opts {
+            trace: None,
+            ..o.clone()
+        };
+        let line = open_line(&inner)?;
+        return traced(Box::new(J2534Link::new(MockPassThru::new(line))));
+    }
+    Ok(Box::new(open_line(o)?))
+}
+
+#[cfg(windows)]
+fn open_j2534(dll: &str) -> Result<Box<dyn Link>, String> {
+    use cascade_j2534::PassThru;
+    let path = if dll == "auto" {
+        let d = cascade_j2534::drivers()
+            .map_err(|e| format!("reading the J2534 registry: {e}"))?
+            .into_iter()
+            .next()
+            .ok_or("no J2534 driver installed (see kdiag j2534-list)")?;
+        eprintln!("J2534 driver: {} ({})", d.name, d.library);
+        d.library
+    } else {
+        dll.to_string()
+    };
+    let mut pt = cascade_j2534::dll::DllPassThru::open(&path).map_err(|e| e.to_string())?;
+    match pt.battery_mv() {
+        Ok(mv) => eprintln!("adapter reads {:.1} V on pin 16", mv as f64 / 1000.0),
+        Err(e) => eprintln!("battery voltage not available: {e}"),
+    }
+    Ok(Box::new(J2534Link::new(pt)))
+}
+
+#[cfg(not(windows))]
+fn open_j2534(_dll: &str) -> Result<Box<dyn Link>, String> {
+    Err(
+        "--j2534 needs Windows and the vendor's J2534 DLL; on macOS use --port \
+         (K-line mode) or --j2534-mock with --sim to rehearse"
+            .into(),
+    )
+}
+
+#[cfg(windows)]
+fn j2534_list() -> Result<(), String> {
+    let ds = cascade_j2534::drivers().map_err(|e| e.to_string())?;
+    if ds.is_empty() {
+        println!("no J2534 04.04 drivers registered");
+    }
+    for d in ds {
+        println!("{}  {}", d.name, d.library);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn j2534_list() -> Result<(), String> {
+    Err("J2534 drivers are registered in the Windows registry; run this on Windows".into())
+}
+
 fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
     let line: Box<dyn Line> = if o.sim {
-        Box::new(SimLine::new(KwpEcu::new(sim_config(o.system))))
+        match &o.sim_ecu {
+            Some(rom_path) => {
+                if o.system != System::Engine {
+                    return Err("--sim-ecu runs the engine ECU only".into());
+                }
+                let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+                Box::new(SimLine::new(ecuc167::iface::Simk41::new(rom, 16_000_000)))
+            }
+            None => Box::new(SimLine::new(KwpEcu::new(sim_config(o.system)))),
+        }
     } else {
         open_serial(o)?
     };
@@ -186,7 +295,7 @@ fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
     })
 }
 
-#[cfg(feature = "serial")]
+#[cfg(all(feature = "serial", unix))]
 fn open_serial(o: &Opts) -> Result<Box<dyn Line>, String> {
     use cascade_diag::serial::{SerialLine, WakeMethod};
     let port = o.port.as_deref().unwrap_or_default();
@@ -199,13 +308,13 @@ fn open_serial(o: &Opts) -> Result<Box<dyn Line>, String> {
     Ok(Box::new(l))
 }
 
-#[cfg(not(feature = "serial"))]
+#[cfg(not(all(feature = "serial", unix)))]
 fn open_serial(_o: &Opts) -> Result<Box<dyn Line>, String> {
-    Err("built without the `serial` feature".into())
+    Err("the serial K-line backend is built for macOS/Unix with the `serial` feature; on Windows use --j2534".into())
 }
 
-fn connect(o: &Opts) -> Result<Client<Box<dyn Line>>, String> {
-    let mut c = Client::with_addresses(open_line(o)?, o.system.address(), 0xf1);
+fn connect(o: &Opts) -> Result<Client<Box<dyn Link>>, String> {
+    let mut c = Client::with_addresses(open_link(o)?, o.system.address(), 0xf1);
     c.length_byte = o.system.length_byte();
     let kb = c.start().map_err(|e| format!("start: {e}"))?;
     eprintln!("{:?} session up, key bytes {}", o.system, hex(&kb));
@@ -213,7 +322,7 @@ fn connect(o: &Opts) -> Result<Client<Box<dyn Line>>, String> {
 }
 
 /// Adapter self-test (no car session; see `cascade_diag::serial::selftest`).
-#[cfg(feature = "serial")]
+#[cfg(all(feature = "serial", unix))]
 fn selftest(port: &str) -> Result<(), String> {
     use cascade_diag::serial::{SerialLine, Status, selftest};
     let mut line = SerialLine::open(port, true).map_err(|e| {
@@ -243,9 +352,9 @@ fn selftest(port: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(feature = "serial"))]
+#[cfg(not(all(feature = "serial", unix)))]
 fn selftest(_port: &str) -> Result<(), String> {
-    Err("built without the `serial` feature".into())
+    Err("the serial K-line backend is built for macOS/Unix with the `serial` feature; on Windows use --j2534".into())
 }
 
 /// Clear stored fault codes, the way the Hi-Scan's ERAS key does.
@@ -380,11 +489,12 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "dtc" => parse(rest).and_then(|o| dtc(&o)),
         Some((cmd, rest)) if cmd == "log" => parse(rest).and_then(|o| log(&o)),
         Some((cmd, rest)) if cmd == "clear" => parse(rest).and_then(|o| clear(&o)),
+        Some((cmd, _)) if cmd == "j2534-list" => j2534_list(),
         Some((cmd, rest)) if cmd == "selftest" => match rest {
             [flag, dev] if flag == "--port" => selftest(dev),
             _ => Err("usage: kdiag selftest --port DEV".into()),
         },
-        _ => Err("usage: kdiag dtc|log|clear|selftest (--sim | --port DEV) [--system engine|abs|srs] [--out F] \
+        _ => Err("usage: kdiag dtc|log|clear|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --j2534 DLL|auto) [--system engine|abs|srs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };

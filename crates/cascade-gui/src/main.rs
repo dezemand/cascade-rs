@@ -101,11 +101,51 @@ fn kwp_engine() -> KwpConfig {
     cfg
 }
 
-const IFACES: [&str; 5] = ["Fake", "KWP", "None", "Port", "Replay"];
+const IFACES: [&str; 6] = ["Fake", "KWP", "ECU", "None", "Port", "Replay"];
+/// Index of "ECU" (the engine ECU's own code, a SIMK41 dump in ecuc167).
+const ECU: usize = 2;
 /// Index of the serial adapter ("Port") in IFACES.
-const ADAPTER: usize = 3;
+const ADAPTER: usize = 4;
 /// Index of "Replay" (a `kdiag --trace` recording) in IFACES.
-const REPLAY: usize = 4;
+const REPLAY: usize = 5;
+
+/// An engine ECU dump for the "ECU" line option. Proprietary; loaded from
+/// outside the repository at run time.
+#[derive(Clone)]
+struct EcuRom {
+    name: String,
+    data: std::sync::Arc<Vec<u8>>,
+}
+
+fn load_ecu(path: &std::path::Path) -> Result<EcuRom, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    if data.is_empty() || !data.len().is_power_of_two() {
+        return Err(format!("{} bytes: not a ROM dump", data.len()));
+    }
+    Ok(EcuRom {
+        name: path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into(),
+        ),
+        data: std::sync::Arc::new(data),
+    })
+}
+
+/// The SIMK41 code behind the line (built inside the emulator thread).
+fn ecu_iface(r: &EcuRom) -> IfaceKind {
+    let short: String = r.name.chars().take(8).collect();
+    let data = r.data.clone();
+    let make: cascade_runner::IfaceFactory = std::sync::Arc::new(move || {
+        Ok(
+            Box::new(ecuc167::iface::Simk41::new((*data).clone(), 16_000_000))
+                as Box<dyn cascade_iface::Interface>,
+        )
+    });
+    IfaceKind::Custom {
+        label: format!("SIMK41 ECU {short}"),
+        make,
+    }
+}
 
 /// A loaded recording: file name, ECU configuration, one-line summary.
 struct Loaded {
@@ -235,6 +275,9 @@ struct CascadeView {
     /// The recording for "Replay", or why the last one failed to load.
     replay: Option<Loaded>,
     replay_err: Option<String>,
+    /// The engine ECU dump for "ECU", or why the last one failed to load.
+    ecu: Option<EcuRom>,
+    ecu_err: Option<String>,
     /// Show the native live-data table instead of the handset.
     live_view: bool,
     live: Option<live::Live>,
@@ -248,6 +291,7 @@ impl CascadeView {
     fn new(
         rom: Vec<u8>,
         replay: Option<Result<Loaded, String>>,
+        ecu: (Option<Result<EcuRom, String>>, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -256,9 +300,16 @@ impl CascadeView {
             Some(Err(e)) => (None, Some(e)),
             None => (None, None),
         };
-        let first = match &replay {
-            Some(l) => IfaceKind::Kwp(l.config.clone()),
-            None => iface_kind(0),
+        let (ecu, ecu_first) = ecu;
+        let (ecu, ecu_err) = match ecu {
+            Some(Ok(r)) => (Some(r), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
+        };
+        let first = match (&replay, &ecu) {
+            (Some(l), _) => IfaceKind::Kwp(l.config.clone()),
+            (None, Some(r)) if ecu_first => ecu_iface(r),
+            _ => iface_kind(0),
         };
         let runner = Runner::spawn(rom, first);
         let focus = cx.focus_handle();
@@ -305,6 +356,8 @@ impl CascadeView {
             mouse_key: None,
             iface_choice: if replay.is_some() || replay_err.is_some() {
                 REPLAY
+            } else if ecu_first {
+                ECU
             } else {
                 0
             },
@@ -313,6 +366,8 @@ impl CascadeView {
             adapter_echo: true,
             replay,
             replay_err,
+            ecu,
+            ecu_err,
             live_view: false,
             live: None,
             live_snap: live::LiveSnap::default(),
@@ -338,6 +393,10 @@ impl CascadeView {
         match (self.iface_choice, &self.port) {
             (ADAPTER, Some(p)) => adapter_iface(p.clone(), self.adapter_echo),
             (ADAPTER, None) => IfaceKind::Null,
+            (ECU, _) => match &self.ecu {
+                Some(r) => ecu_iface(r),
+                None => IfaceKind::Null,
+            },
             (REPLAY, _) => match &self.replay {
                 Some(l) => IfaceKind::Kwp(l.config.clone()),
                 None => IfaceKind::Null,
@@ -375,6 +434,35 @@ impl CascadeView {
                             v.runner.send(Command::Restart(v.current_iface()));
                         }
                         Err(e) => v.replay_err = Some(format!("{}: {e}", p.display())),
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Ask for an engine ECU dump and power-cycle onto it.
+    fn open_ecu(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as ECU".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.first()
+            {
+                let loaded = load_ecu(p);
+                let _ = this.update(cx, |v, cx| {
+                    match loaded {
+                        Ok(r) => {
+                            v.ecu = Some(r);
+                            v.ecu_err = None;
+                            v.runner.send(Command::Restart(v.current_iface()));
+                        }
+                        Err(e) => v.ecu_err = Some(format!("{}: {e}", p.display())),
                     }
                     cx.notify();
                 });
@@ -813,6 +901,42 @@ impl CascadeView {
             ))
     }
 
+    /// ECU dump and file button shown when "ECU" is selected.
+    fn ecu_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let card = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .rounded(px(8.))
+            .bg(rgb(CARD))
+            .text_sm();
+        let card = match &self.ecu {
+            Some(r) => card
+                .child(div().font_family("Menlo").text_xs().child(r.name.clone()))
+                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
+                    "{} KB engine ECU dump (SIMK41, C167) at address 0x11",
+                    r.data.len() / 1024
+                ))),
+            None => card.child(div().text_color(rgb(TEXT_DIM)).child("No ECU dump loaded.")),
+        };
+        card.when_some(self.ecu_err.clone(), |d, e| {
+            d.child(div().text_xs().text_color(rgb(WARN)).child(e))
+        })
+        .child(
+            Button::new("open-ecu")
+                .icon(IconName::FolderOpen)
+                .label("Open ECU dump…")
+                .ghost()
+                .on_click(cx.listener(|v, _, _, cx| v.open_ecu(cx))),
+        )
+        .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
+            "The engine ECU's own code answers: use Tiburon / Engine L4 / 2003. Sensors \
+             read 2.5 V, no crank signal. It powers on at the first wake-up and needs \
+             about 3 s of ECU time to boot.",
+        ))
+    }
+
     /// Recording and file button shown when "Replay" is selected.
     fn replay_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let card = div()
@@ -1041,18 +1165,19 @@ impl CascadeView {
             div()
                 .flex()
                 .flex_row()
+                .flex_wrap()
                 .gap(px(4.))
                 .p(px(3.))
                 .rounded(px(8.))
                 .bg(rgb(CARD)),
             |d, (i, name)| {
                 d.child(
-                    // five options: size to the label (basis auto) and share the rest
+                    // six options as a 3 × 2 grid of equal buttons
                     {
                         let b = Button::new(SharedString::from(format!("iface-{i}")))
                             .label(*name)
                             .compact()
-                            .flex_grow(1.);
+                            .w(px((PANEL_W - 32.0 - 6.0 - 8.0) / 3.0 - 4.0));
                         if self.iface_choice == i {
                             b.primary()
                         } else {
@@ -1064,6 +1189,12 @@ impl CascadeView {
                         if i == ADAPTER {
                             // pick a port first; nothing changes until then
                             v.ports = cascade_diag::serial::list_ports();
+                        } else if i == ECU {
+                            if v.ecu.is_some() {
+                                v.runner.send(Command::Restart(v.current_iface()));
+                            } else {
+                                v.open_ecu(cx);
+                            }
                         } else if i == REPLAY {
                             if v.replay.is_some() {
                                 v.runner.send(Command::Restart(v.current_iface()));
@@ -1160,6 +1291,7 @@ impl CascadeView {
             .when(self.iface_choice == ADAPTER, |d| {
                 d.child(self.adapter_panel(cx))
             })
+            .when(self.iface_choice == ECU, |d| d.child(self.ecu_panel(cx)))
             .when(self.iface_choice == REPLAY, |d| {
                 d.child(self.replay_panel(cx))
             })
@@ -1268,7 +1400,9 @@ fn main() {
         .nth(1)
         .or_else(|| std::env::var("CASCADE_ROM").ok())
     else {
-        eprintln!("usage: cascade-gui ROM [--replay KDIAG.jsonl]   (or set CASCADE_ROM)");
+        eprintln!(
+            "usage: cascade-gui ROM [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_ECU_ROM)"
+        );
         std::process::exit(2);
     };
     let rom = match std::fs::read(&path) {
@@ -1286,6 +1420,19 @@ fn main() {
         .map(|p| {
             let p = std::path::Path::new(p);
             load_trace(p).map_err(|e| format!("{}: {e}", p.display()))
+        });
+    // --ecu-rom selects the ECU line at start; CASCADE_ECU_ROM only preloads it
+    let ecu_arg = args
+        .iter()
+        .position(|a| a == "--ecu-rom")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let ecu_first = ecu_arg.is_some();
+    let ecu = ecu_arg
+        .or_else(|| std::env::var("CASCADE_ECU_ROM").ok())
+        .map(|p| {
+            let p = std::path::Path::new(&p);
+            load_ecu(p).map_err(|e| format!("{}: {e}", p.display()))
         });
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
@@ -1310,7 +1457,7 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| CascadeView::new(rom, replay, window, cx))
+                cx.new(|cx| CascadeView::new(rom, replay, (ecu, ecu_first), window, cx))
             })
             .expect("failed to open window");
             cx.on_window_closed(|cx, _| cx.quit()).detach();

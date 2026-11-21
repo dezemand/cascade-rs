@@ -2,7 +2,7 @@
 //! runner -> SerialKLine -> pseudo-terminal -> bus thread (echo + KwpEcu in
 //! wall-clock time). Needs CASCADE_ROM; takes ~10 s.
 
-#![cfg(feature = "serial")]
+#![cfg(all(feature = "serial", unix))]
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,4 +1,7 @@
-//! KWP2000 (ISO 14230) client over a [`Line`].
+//! KWP2000 (ISO 14230) client over a [`Link`]: whole frames. Every byte-level
+//! [`Line`] is a `Link` (this module frames the bytes and times the init);
+//! a J2534 PassThru adapter is another (`crate::j2534`), where the adapter
+//! does the wake-up, framing and timing itself.
 
 use std::fmt;
 use std::io;
@@ -85,7 +88,95 @@ pub fn hex(b: &[u8]) -> String {
         .join(" ")
 }
 
-pub struct Client<L: Line> {
+/// A diagnostic link that moves whole ISO 14230 frames. Frames are always
+/// complete: header, data and checksum.
+pub trait Link {
+    /// Time since the link was opened (virtual for simulated links).
+    fn elapsed(&self) -> Duration;
+
+    /// Wait without traffic.
+    fn idle(&mut self, d: Duration);
+
+    /// Wake the bus (ISO 14230 fast init, 10,400 baud) and send
+    /// `start_frame` (StartCommunication); returns the ECU's first frame.
+    fn fast_init(&mut self, start_frame: &[u8], timing: &Timing) -> Result<Vec<u8>, Error>;
+
+    /// Send one frame.
+    fn send(&mut self, frame: &[u8]) -> Result<(), Error>;
+
+    /// The next frame from the ECU: it must start within `first`, and its
+    /// bytes may be at most `p1` apart.
+    fn recv(&mut self, first: Duration, p1: Duration) -> Result<Vec<u8>, Error>;
+
+    /// Drop anything already received.
+    fn flush_input(&mut self) -> Result<(), Error>;
+}
+
+impl<L: Line> Link for L {
+    fn elapsed(&self) -> Duration {
+        Line::elapsed(self)
+    }
+
+    fn idle(&mut self, d: Duration) {
+        Line::idle(self, d)
+    }
+
+    fn fast_init(&mut self, start_frame: &[u8], timing: &Timing) -> Result<Vec<u8>, Error> {
+        self.set_baud(10_400)?;
+        // the bus must be idle (high) before the wake-up pattern
+        Line::idle(self, Duration::from_millis(300));
+        Line::flush_input(self)?;
+        self.wake_up(timing.wake_low, timing.wake_high)?;
+        self.write(start_frame)?;
+        Link::recv(self, timing.p2_max, timing.p1_max)
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
+        Ok(self.write(frame)?)
+    }
+
+    fn recv(&mut self, first: Duration, p1: Duration) -> Result<Vec<u8>, Error> {
+        let mut frame = Vec::new();
+        let mut timeout = first;
+        loop {
+            match self.read_byte(timeout)? {
+                Some(b) => frame.push(b),
+                None => return Err(Error::Timeout(frame)),
+            }
+            if iso14230::expected_len(&frame) == Some(frame.len()) {
+                return Ok(frame);
+            }
+            timeout = p1;
+        }
+    }
+
+    fn flush_input(&mut self) -> Result<(), Error> {
+        Ok(Line::flush_input(self)?)
+    }
+}
+
+impl Link for Box<dyn Link> {
+    fn elapsed(&self) -> Duration {
+        (**self).elapsed()
+    }
+    fn idle(&mut self, d: Duration) {
+        (**self).idle(d)
+    }
+    fn fast_init(&mut self, start_frame: &[u8], timing: &Timing) -> Result<Vec<u8>, Error> {
+        (**self).fast_init(start_frame, timing)
+    }
+    fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
+        (**self).send(frame)
+    }
+    fn recv(&mut self, first: Duration, p1: Duration) -> Result<Vec<u8>, Error> {
+        (**self).recv(first, p1)
+    }
+    fn flush_input(&mut self) -> Result<(), Error> {
+        (**self).flush_input()
+    }
+}
+
+pub struct Client<L: Link> {
     pub line: L,
     pub target: u8,
     pub source: u8,
@@ -98,7 +189,7 @@ pub struct Client<L: Line> {
     last_rx_end: Duration,
 }
 
-impl<L: Line> Client<L> {
+impl<L: Link> Client<L> {
     /// Client for the engine ECU (0x11) as tester F1, the addresses the
     /// Hi-Scan uses for the Tiburon engine.
     pub fn new(line: L) -> Self {
@@ -119,13 +210,10 @@ impl<L: Line> Client<L> {
 
     /// Fast init at 10,400 baud plus StartCommunication. Returns key bytes.
     pub fn start(&mut self) -> Result<[u8; 2], Error> {
-        self.line.set_baud(10_400)?;
-        // the bus must be idle (high) before the wake-up pattern
-        self.line.idle(Duration::from_millis(300));
-        self.line.flush_input()?;
-        self.line
-            .wake_up(self.timing.wake_low, self.timing.wake_high)?;
-        let r = self.exchange(&[0x81])?;
+        crate::guard::check(&[0x81], self.allow_clear).map_err(Error::Blocked)?;
+        let frame = self.encode(&[0x81]);
+        let first = self.line.fast_init(&frame, &self.timing)?;
+        let r = self.response(0x81, Some(first))?;
         match r.as_slice() {
             [0xc1, kb1, kb2] => Ok([*kb1, *kb2]),
             _ => Err(Error::Unexpected(r)),
@@ -146,18 +234,31 @@ impl<L: Line> Client<L> {
         }
         let sid = data[0];
         self.line.flush_input()?;
-        let frame = if self.length_byte {
+        let frame = self.encode(data);
+        self.line.send(&frame)?;
+        self.response(sid, None)
+    }
+
+    fn encode(&self, data: &[u8]) -> Vec<u8> {
+        if self.length_byte {
             let mut f = vec![0x80, self.target, self.source, data.len() as u8];
             f.extend_from_slice(data);
             f.push(iso14230::checksum(&f));
             f
         } else {
             iso14230::encode(self.target, self.source, data)
-        };
-        self.line.write(&frame)?;
+        }
+    }
+
+    /// Wait for the answer to `sid` (after any "response pending"); `first`
+    /// is a frame already received.
+    fn response(&mut self, sid: u8, mut first: Option<Vec<u8>>) -> Result<Vec<u8>, Error> {
         let mut wait = self.timing.p2_max;
         loop {
-            let frame = self.read_frame(wait)?;
+            let frame = match first.take() {
+                Some(f) => f,
+                None => self.line.recv(wait, self.timing.p1_max)?,
+            };
             self.last_rx_end = self.line.elapsed();
             let f = iso14230::parse(&frame).ok_or_else(|| Error::BadFrame(frame.clone()))?;
             if f.target != self.source || f.source != self.target {
@@ -169,21 +270,6 @@ impl<L: Line> Client<L> {
                 [r, ..] if *r == sid.wrapping_add(0x40) => return Ok(f.data),
                 _ => return Err(Error::Unexpected(f.data)),
             }
-        }
-    }
-
-    fn read_frame(&mut self, first_byte_timeout: Duration) -> Result<Vec<u8>, Error> {
-        let mut frame = Vec::new();
-        let mut timeout = first_byte_timeout;
-        loop {
-            match self.line.read_byte(timeout)? {
-                Some(b) => frame.push(b),
-                None => return Err(Error::Timeout(frame)),
-            }
-            if iso14230::expected_len(&frame) == Some(frame.len()) {
-                return Ok(frame);
-            }
-            timeout = self.timing.p1_max;
         }
     }
 
@@ -312,7 +398,7 @@ mod tests {
             })
         ));
         // P3max: after 6 s of silence the session is gone
-        c.line.idle(Duration::from_secs(6));
+        Link::idle(&mut c.line, Duration::from_secs(6));
         assert!(matches!(c.tester_present(), Err(Error::Timeout(_))));
     }
 
@@ -345,10 +431,10 @@ mod tests {
             ..Default::default()
         });
         c.start().unwrap();
-        let t = c.line.elapsed();
+        let t = Link::elapsed(&c.line);
         assert!(matches!(c.request(&[0x11, 0x01]), Err(Error::Blocked(_))));
         assert!(matches!(c.clear_dtcs(0xff00), Err(Error::Blocked(_))));
-        assert_eq!(c.line.elapsed(), t, "nothing was sent");
+        assert_eq!(Link::elapsed(&c.line), t, "nothing was sent");
         assert_eq!(c.read_dtcs().unwrap().len(), 1, "codes still stored");
         c.allow_clear = true;
         c.clear_dtcs(0xff00).unwrap();
@@ -359,10 +445,10 @@ mod tests {
     fn requests_respect_p3_min() {
         let mut c = client(KwpConfig::default());
         c.start().unwrap();
-        let t0 = c.line.elapsed();
+        let t0 = Link::elapsed(&c.line);
         c.tester_present().unwrap();
         c.tester_present().unwrap();
         // two exchanges: each at least P3min + frame times + P2 (25 ms in the model)
-        assert!(c.line.elapsed() - t0 >= Duration::from_millis(2 * (55 + 25)));
+        assert!(Link::elapsed(&c.line) - t0 >= Duration::from_millis(2 * (55 + 25)));
     }
 }
