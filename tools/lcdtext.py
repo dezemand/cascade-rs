@@ -11,6 +11,9 @@ Usage: tools/lcdtext.py ROM LCDDUMP
 import sys
 
 FONT_BASE = 0x168004  # glyph for code c at FONT_BASE + 16 * c (verified for '0'..'9')
+# Compare only the top rows: glyph ink ends by row 11, and the inverse-video
+# bar of a highlighted line stops before row 16.
+ROWS = 12
 LAYER2 = 0x2580
 COLS, LINES = 40, 12
 
@@ -18,7 +21,7 @@ COLS, LINES = 40, 12
 def load_font(rom):
     glyphs = {}
     for code in range(0x20, 0x100):
-        g = rom[FONT_BASE + 16 * code: FONT_BASE + 16 * code + 16]
+        g = rom[FONT_BASE + 16 * code: FONT_BASE + 16 * code + ROWS]
         glyphs.setdefault(bytes(g), code)
         glyphs.setdefault(bytes(b ^ 0xFF for b in g), code)  # inverse video
     return glyphs
@@ -33,11 +36,11 @@ def screen_lines(rom, mem):
         # the glyph's first row sits a few pixels below the line start
         for shift in range(0, 6):
             top = 20 * line + shift
-            if top + 16 > 240:
+            if top + ROWS > 240:
                 continue
             chars, hits = [], 0
             for c in range(COLS):
-                cell = bytes(px(top + i, c) for i in range(16))
+                cell = bytes(px(top + i, c) for i in range(ROWS))
                 code = glyphs.get(cell)
                 if code is None:
                     chars.append("?")

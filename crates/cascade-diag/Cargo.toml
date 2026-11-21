@@ -1,0 +1,23 @@
+[package]
+name = "cascade-diag"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "Native KWP2000 K-line diagnostics and logging, using protocol data learned with cascade-rs"
+publish.workspace = true
+
+[[bin]]
+name = "kdiag"
+path = "src/bin/kdiag.rs"
+
+[dependencies]
+cascade-iface.workspace = true
+serialport = { version = "4.10.1", default-features = false, optional = true }
+
+[lints]
+workspace = true
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport"]

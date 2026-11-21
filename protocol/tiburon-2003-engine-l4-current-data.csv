@@ -20,9 +20,14 @@ injection_time,42,2,no,0.004,0,ms,4 us/bit
 isc_duty,57,2,no,~0.00153,0,%,
 idle_speed_duty,59,2,yes,~0.00153,0,%,
 ign_dwell,74,2,no,0.004,0,ms,4 us/bit
-transmission_range,24,bit0,no,,,flag,shown as P,N when set; other bits not checked
+o2_rear,28,2,no,~4.87797,0,mV,same scale as o2_front_b1
+lt_fuel_trim_idle,51,2,yes,0.004,0,ms,4 us/bit
+lt_fuel_trim_part,53,2,yes,~0.00153,0,%,
+evap_purge_duty,67,2,no,~0.0030518,0,%,200/65536
+transmission_range,24,bit0,no,,,flag,set = DRIVE; clear = P,N; other bits unused on screen
 ac_switch,25,bit0,no,,,flag,
 ac_relay,25,bit2,no,,,flag,
 cranking_signal,73,bit1,no,,,flag,
 closed_throttle,73,bit2,no,,,flag,
 part_load,73,bit3,no,,,flag,
+closed_loop,46,bit0,no,,,flag,A/F CLOSE LOOP

@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 cascade-core = { path = "crates/cascade-core" }
 cascade-iface = { path = "crates/cascade-iface" }
+cascade-diag = { path = "crates/cascade-diag" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,0 +1,27 @@
+# Tiburon ABS (address 0x28), KWP2000 ReadDataByLocalIdentifier 0x01 (request 21 01).
+# Emulator-derived from the Hi-Scan firmware (HP 701 USA, 09910-61000); not yet seen on the car.
+# offset: byte index after "61 01". Multi-byte values little-endian. value = raw * scale + add.
+# Flags come in bit pairs: the listed bit is the state, the bit above it means "not available"
+# (both set shows NOT SUPP.). Scales from 3-4 sample points each.
+name,offset,size,signed,scale,add,unit,metric
+engine_speed,0,2,no,0.25,0,rpm,
+vehicle_speed,2,1,no,0.621371,0,mph,1 km/h/bit
+tps,3,1,no,0.392157,0,%,100/255
+battery_voltage,5,1,no,0.0625,0,V,1/16
+ref_5v,6,1,no,0.0234375,0,V,6/256
+wheel_speed_fl,7,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_fr,8,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_rl,9,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_rr,10,1,no,0.621371,0,mph,1 km/h/bit
+long_g,12,1,no,0.0156863,-2,g,4/255 - 2
+lat_g,13,1,no,0.0156863,-2,g,4/255 - 2
+steer_sensor_1,11,bit0,no,,,flag,set = HIGH; bit1 = not available
+steer_sensor_2,11,bit2,no,,,flag,set = HIGH; bit3 = not available
+steer_sensor_3,11,bit4,no,,,flag,set = HIGH; bit5 = not available
+abs_warning_lamp,14,bit0,no,,,flag,bit1 = not available
+ebd_warning_lamp,14,bit2,no,,,flag,bit3 = not available
+tcs_esp_lamp,14,bit4,no,,,flag,bit5 = not available
+tcs_esp_off_lamp,14,bit6,no,,,flag,bit7 = not available
+tcs_esp_switch,15,bit0,no,,,flag,bit1 = not available
+brake_switch,15,bit2,no,,,flag,bit3 = not available
+motor_relay,16,bit0,no,,,flag,bit1 = not available

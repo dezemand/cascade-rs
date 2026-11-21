@@ -318,6 +318,7 @@ impl Serial {
 
     pub fn set_comm_line(&mut self, now: u64, line: i32) {
         if line != self.comm_line {
+            self.iface.select_line(now, line);
             self.check_input(now);
             self.rx_buf.flush();
         }

@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use crate::iso14230;
 use crate::{Cycles, Interface, RxBuf};
 
 /// Emulated cycles per millisecond.
@@ -57,6 +58,12 @@ pub struct KwpConfig {
     pub local_data: BTreeMap<u8, Vec<u8>>,
     /// Stored DTCs as (code, status) for ReadDTCsByStatus (0x18).
     pub dtcs: Vec<(u16, u8)>,
+    /// Fixed responses for exact requests (service data, SID first),
+    /// checked before the built-in services once a session is active.
+    pub responses: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Always use the separate length byte (`80 tgt src len ...`), even
+    /// for short responses.
+    pub length_byte: bool,
 }
 
 impl Default for KwpConfig {
@@ -71,6 +78,8 @@ impl Default for KwpConfig {
             ecu_ident: BTreeMap::new(),
             local_data: BTreeMap::new(),
             dtcs: Vec::new(),
+            responses: BTreeMap::new(),
+            length_byte: false,
         }
     }
 }
@@ -110,50 +119,15 @@ impl KwpEcu {
         self.log.clone()
     }
 
-    /// Total frame length implied by the bytes received so far, if known.
-    fn expected_len(frame: &[u8]) -> Option<usize> {
-        let fmt = *frame.first()?;
-        let has_addr = fmt & 0xc0 != 0;
-        let hdr = 1 + if has_addr { 2 } else { 0 };
-        let len = (fmt & 0x3f) as usize;
-        if len != 0 {
-            Some(hdr + len + 1)
-        } else {
-            let l = *frame.get(hdr)? as usize;
-            Some(hdr + 1 + l + 1)
-        }
-    }
-
-    /// Split a complete frame into (target, source, data); None if the
-    /// checksum is wrong or the frame is malformed.
-    fn parse(frame: &[u8]) -> Option<(u8, u8, Vec<u8>)> {
-        let (body, cs) = frame.split_at(frame.len() - 1);
-        if body.iter().fold(0u8, |a, &b| a.wrapping_add(b)) != cs[0] {
-            return None;
-        }
-        let fmt = body[0];
-        if fmt & 0xc0 == 0 {
-            return None; // no addresses: not addressed to anyone we model
-        }
-        let (target, source) = (body[1], body[2]);
-        let data = if fmt & 0x3f != 0 {
-            &body[3..]
-        } else {
-            &body[4..]
-        };
-        Some((target, source, data.to_vec()))
-    }
-
     fn encode(&self, target: u8, data: &[u8]) -> Vec<u8> {
-        let mut f = if data.len() < 64 {
-            vec![0x80 | data.len() as u8, target, self.config.address]
+        if self.config.length_byte {
+            let mut f = vec![0x80, target, self.config.address, data.len() as u8];
+            f.extend_from_slice(data);
+            f.push(iso14230::checksum(&f));
+            f
         } else {
-            vec![0x80, target, self.config.address, data.len() as u8]
-        };
-        f.extend_from_slice(data);
-        let cs = f.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-        f.push(cs);
-        f
+            iso14230::encode(target, self.config.address, data)
+        }
     }
 
     fn negative(sid: u8, code: u8) -> Option<Vec<u8>> {
@@ -170,6 +144,9 @@ impl KwpEcu {
         }
         if !self.active {
             return None; // a real ECU ignores requests before StartCommunication
+        }
+        if let Some(r) = self.config.responses.get(req) {
+            return Some(r.clone());
         }
         match sid {
             0x82 => {
@@ -228,7 +205,12 @@ impl KwpEcu {
 
     fn frame_complete(&mut self, now: Cycles) {
         let frame = std::mem::take(&mut self.rx_frame);
-        let Some((target, source, data)) = Self::parse(&frame) else {
+        let Some(iso14230::Frame {
+            target,
+            source,
+            data,
+        }) = iso14230::parse(&frame)
+        else {
             return;
         };
         if target != self.config.address {
@@ -265,7 +247,7 @@ impl Interface for KwpEcu {
         }
         self.last_byte_at = now;
         self.rx_frame.push(byte);
-        if Self::expected_len(&self.rx_frame) == Some(self.rx_frame.len()) {
+        if iso14230::expected_len(&self.rx_frame) == Some(self.rx_frame.len()) {
             self.frame_complete(now);
         }
     }

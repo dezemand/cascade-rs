@@ -25,6 +25,42 @@ checking them on the real ECU.
   `58 02 03 01 E0 01 30 20` shows "P0301 CYL.NO.1,MISFIRE DETECTED" and
   "P0130 O2 SNSR CIRCUIT-MAL(B1/S1)". Status bits: not yet investigated.
 
+### DTC detail (DTAL key on the DTC screen) [emulator-derived]
+
+- Request `17 hi lo` (ReadStatusOfDTC for one code, e.g. `17 03 01`).
+- Response `57 01 hi lo status` + record. The firmware reads:
+  - status bit 7: MIL on; bit 6: pending; bit 5: history; both bits 5 and 6
+    (as in `E0`): present; bit 4: readiness not complete. Bits 0-3: unused.
+  - record byte +5 (counting from the byte after status): statistic counter.
+  - +7..8, +9..10, +11..12: **big-endian** 16-bit counters in 6-minute units:
+    time stamp at detection, time stamp at erasure, and the current counter.
+    Shown "op. hour after detection" = (current − detection stamp) × 6 min,
+    "after erasure" = (current − erasure stamp) × 6 min, wrapped to signed 16 bit.
+- So the status byte in the `58` list response uses the same bits.
+
+## Readiness test [emulator-derived]
+
+- Request `01 01`: OBD-II mode 01 PID 01 carried over KWP2000. Response
+  `41 01 A B C D` decoded exactly as SAE J1979 (A: MIL bit 7 + DTC count;
+  B: misfire/fuel/component supported bits 0-2, incomplete bits 4-6;
+  C: supported catalyst, heated catalyst, EVAP, secondary air, A/C, O2,
+  O2 heater, EGR in bits 0-7; D: the same bits, set = not complete).
+
+## Freeze frame [emulator-derived]
+
+- Request `12 00 00`. Response `52 00` followed by J1979-style values:
+  rpm (big-endian, ÷ 4), vehicle speed (km/h), calculated load (× 100/255),
+  coolant (A − 40 °C), fuel system status bank 1, one unused byte, short-term
+  fuel trim (A − 128) × 100/128, one unused byte, long-term trim (same).
+  Example `52 00 0C 80 ...` shows 800 rpm.
+
+## Identification check [emulator-derived]
+
+- Request `1A 8E` (ReadEcuIdentification option 0x8E). The firmware accepts
+  `5A 8E` + ASCII but showed nothing further; not explored.
+- Function 11 VERSION CONFIGURATION writes a configuration into the ECM and
+  10 RESETTING ADAPTIVE VALUES resets the ECU: not explored, not to be used.
+
 ## Current Data [emulator-derived]
 
 - Request `21 01` (ReadDataByLocalIdentifier 0x01), about every 0.17 s.
@@ -51,7 +87,7 @@ Machine-readable copy: `tiburon-2003-engine-l4-current-data.csv`.
 | 18 | u8 | VEHIC.SPD | 0.621371 (1 km/h) | 0 | MPH |
 | 19–20 | s16 | ENGINE SPD | 1 | 0 | rpm |
 | 21–22 | s16 | TAR.IDLE | 1 | 0 | rpm |
-| 24 bit 0 | flag | TRAN.RANG. (P,N) | | | |
+| 24 bit 0 | flag | TRAN.RANG. (set = DRIVE, clear = P,N) | | | |
 | 25 bit 0 | flag | A/C SWITCH | | | |
 | 25 bit 2 | flag | A/C RELAY | | | |
 | 26–27 | u16 | FR O2S-B1 | ≈4.87797 | 0 | mV |
@@ -63,6 +99,11 @@ Machine-readable copy: `tiburon-2003-engine-l4-current-data.csv`.
 | 73 bit 2 | flag | CLOSED TP | | | |
 | 73 bit 3 | flag | PART LOAD | | | |
 | 74–75 | u16 | IGN DWELL | 0.004 (4 µs) | 0 | ms |
+| 28–29 | u16 | RR OXYGEN SENSOR | ≈4.87797 | 0 | mV |
+| 46 bit 0 | flag | A/F CLOSE LOOP | | | |
+| 51–52 | s16 | LONG FUEL-IDLE | 0.004 | 0 | ms |
+| 53–54 | s16 | LONG FUEL-PART | ≈0.00153 | 0 | % |
+| 67–68 | u16 | EVAP.PURGE VALVE | ≈0.0030518 (200/65536) | 0 | % |
 
 How the scaling was found:
 - `tools/scale_sweep.py` sets all parameters to 10 raw values (one byte of the 16-bit ones at a time, which settles byte order).
@@ -81,8 +122,7 @@ Limits:
 - Signedness of engine speed, target idle and idle-speed duty comes from 0xC800 showing as negative.
 
 Open:
-- Status bits of DTCs; the remaining bits of the flag bytes.
-- The 5 of 27 parameters that are not on the FULL page.
 - The true block length and the bytes no parameter on this page uses.
-- Other screens: Flight Record, Readiness, Freeze Frame, Simu-Scan.
-  Actuation Test is not to be driven (project rules).
+- Flight Record reuses `21 01`; Simu-Scan and Symptom Analysis not explored.
+  Actuation Test, EVAP leakage test, adaptive reset and version
+  configuration act on the car and are not to be driven (project rules).

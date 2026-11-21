@@ -14,7 +14,10 @@
 //!       its emulated cycle; --iface kwp attaches a KWP2000 engine ECU
 //!       model and --kwp-log FILE writes its decoded request/response log;
 //!       --dtc CODE:STATUS (repeatable, hex with 0x) stores a DTC in it;
-//!       --local ID=HEX sets its ReadDataByLocalIdentifier block; --stats prints
+//!       --local ID=HEX sets its ReadDataByLocalIdentifier block;
+//!       --respond REQ=RESP (hex, SID first) answers one exact request;
+//!       --kwp-addr ADDR sets the ECU address (engine 0x11, ABS 0x28, SRS 0x58);
+//!       --kwp-keybytes HEX and --kwp-length-byte vary its StartComm reply; --stats prints
 //!       coverage counters. Exit 0 at the cycle cap, 1 on any other stop,
 //!       3 when the firmware's endless-loop reset fires (unless
 //!       --continue-after-reset).
@@ -88,6 +91,17 @@ fn parse_num(s: &str) -> Result<u64, String> {
     r.map_err(|e| format!("{s:?}: {e}"))
 }
 
+fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
+    let h: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if !h.len().is_multiple_of(2) {
+        return Err(format!("odd hex length in {s:?}"));
+    }
+    (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| format!("{s:?}: {e}")))
+        .collect()
+}
+
 fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut rom_path = None;
     let mut max = u64::MAX;
@@ -100,6 +114,10 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut kwp_log_path = None;
     let mut dtcs: Vec<(u16, u8)> = Vec::new();
     let mut local_data = std::collections::BTreeMap::new();
+    let mut responses = std::collections::BTreeMap::new();
+    let mut kwp_addr = 0x11u8;
+    let mut kwp_kb: Option<[u8; 2]> = None;
+    let mut kwp_len_byte = false;
     let mut stats = false;
     let mut continue_after_reset = false;
     let mut iface_name = "fake";
@@ -135,6 +153,19 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                     .collect::<Result<Vec<u8>, _>>()
                     .map_err(|e| format!("--local {v:?}: {e}"))?;
                 local_data.insert(parse_num(id)? as u8, bytes);
+            }
+            "--kwp-addr" => kwp_addr = parse_num(val()?)? as u8,
+            "--kwp-keybytes" => {
+                let kb = parse_hex(val()?)?;
+                kwp_kb = Some(kb.try_into().map_err(|_| "--kwp-keybytes needs 2 bytes")?);
+            }
+            "--kwp-length-byte" => kwp_len_byte = true,
+            "--respond" => {
+                let v = val()?;
+                let (req, resp) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("bad --respond {v:?}, want REQHEX=RESPHEX"))?;
+                responses.insert(parse_hex(req)?, parse_hex(resp)?);
             }
             "--dtc" => {
                 let v = val()?;
@@ -182,6 +213,10 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             let config = cascade_iface::KwpConfig {
                 dtcs: dtcs.clone(),
                 local_data: local_data.clone(),
+                responses: responses.clone(),
+                address: kwp_addr,
+                key_bytes: kwp_kb.unwrap_or([0xef, 0x8f]),
+                length_byte: kwp_len_byte,
                 ..Default::default()
             };
             let ecu = cascade_iface::KwpEcu::new(config);
@@ -336,7 +371,7 @@ fn main() -> ExitCode {
         ["run", rest @ ..] => run(rest),
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--continue-after-reset]\n       \
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--continue-after-reset]\n       \
                   cascade trace-diff <left> <right>\n       cascade trace-stats <log>"
             .into()),
     };

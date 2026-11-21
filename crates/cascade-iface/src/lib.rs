@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 mod fake;
+pub mod iso14230;
 pub mod kwp;
 
 pub use fake::Fake;
@@ -50,6 +51,10 @@ pub enum Event {
     L(bool),
     /// CAN mode on or off.
     Can(bool),
+    /// Diagnostic line selected by the firmware (I/O 0x250): OBD pin
+    /// number as upstream decodes it (7 = K, 8 = ABS/TCS, 12 = SRS, ...;
+    /// 42 = CAN; negative = unknown, -(~value)).
+    Line(i32),
 }
 
 /// A timestamped [`Event`].
@@ -83,6 +88,10 @@ pub trait Interface {
 
     fn set_can(&mut self, _now: Cycles, _on: bool, _rx: &mut dyn RxBuf) {}
 
+    /// The firmware switched the diagnostic line (not in upstream's
+    /// interface; upstream only shows it in the UI).
+    fn select_line(&mut self, _now: Cycles, _line: i32) {}
+
     /// Instantaneous RX line level, if the backend can sample it.
     fn rx_state(&mut self, _now: Cycles) -> Option<bool> {
         None
@@ -115,6 +124,9 @@ impl<T: Interface + ?Sized> Interface for Box<T> {
     }
     fn set_can(&mut self, now: Cycles, on: bool, rx: &mut dyn RxBuf) {
         (**self).set_can(now, on, rx)
+    }
+    fn select_line(&mut self, now: Cycles, line: i32) {
+        (**self).select_line(now, line)
     }
     fn rx_state(&mut self, now: Cycles) -> Option<bool> {
         (**self).rx_state(now)
@@ -238,6 +250,11 @@ impl<I: Interface> Interface for Traced<I> {
     fn set_can(&mut self, now: Cycles, on: bool, rx: &mut dyn RxBuf) {
         self.log(now, Event::Can(on));
         self.inner.set_can(now, on, recording!(self, now, rx));
+    }
+
+    fn select_line(&mut self, now: Cycles, line: i32) {
+        self.log(now, Event::Line(line));
+        self.inner.select_line(now, line);
     }
 
     fn rx_state(&mut self, now: Cycles) -> Option<bool> {
