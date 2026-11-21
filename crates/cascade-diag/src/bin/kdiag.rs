@@ -1,6 +1,8 @@
 //! kdiag: K-line diagnostics for the 2002 Hyundai Coupe (Tiburon GK).
 //!
 //!   kdiag dtc  (--sim | --port DEV) [--system engine|abs|srs] [line options]
+//!   kdiag selftest --port DEV   (adapter checks, no ECU session)
+//!   kdiag clear (--sim | --port DEV) [--system engine|abs] --allow-clear [--yes]
 //!   kdiag log  (--sim | --port DEV) [--system engine|abs] [--out FILE.csv]
 //!              [--interval-ms N] [--duration-s N] [line options]
 //!
@@ -13,6 +15,10 @@
 //!   engine  0x11 on the K line (OBD pin 7)
 //!   abs     0x28 on OBD pin 8: the cable must connect pin 8 to K
 //!   srs     0x58 on OBD pin 12: the cable must connect pin 12 to K
+//!
+//! Read-only by default: every request passes `cascade_diag::guard`, which
+//! refuses anything but session handling and reads. `clear` is the one
+//! exception and needs --allow-clear plus a typed confirmation (or --yes).
 //!
 //! --sim talks to the KwpEcu model in virtual time, with plausible values.
 //! `log` writes one CSV row per `21 01` response: time, decoded values from
@@ -72,6 +78,8 @@ struct Opts {
     echo: bool,
     wake: String,
     system: System,
+    allow_clear: bool,
+    yes: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -85,6 +93,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         echo: true,
         wake: "break".into(),
         system: System::Engine,
+        allow_clear: false,
+        yes: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -100,6 +110,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--trace" => o.trace = Some(val()?),
             "--no-echo" => o.echo = false,
             "--wake" => o.wake = val()?,
+            "--allow-clear" => o.allow_clear = true,
+            "--yes" => o.yes = true,
             "--system" => {
                 o.system = match val()?.as_str() {
                     "engine" => System::Engine,
@@ -218,6 +230,74 @@ fn connect(o: &Opts) -> Result<Client<Box<dyn Line>>, String> {
     Ok(c)
 }
 
+/// Adapter self-test (no car session; see `cascade_diag::serial::selftest`).
+#[cfg(feature = "serial")]
+fn selftest(port: &str) -> Result<(), String> {
+    use cascade_diag::serial::{SerialLine, Status, selftest};
+    let mut line = SerialLine::open(port, true).map_err(|e| {
+        let ports: Vec<String> = serialport::available_ports()
+            .map(|v| {
+                v.into_iter()
+                    .map(|p| p.port_name)
+                    .filter(|n| n.starts_with("/dev/cu."))
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!("{port}: {e}\navailable ports: {}", ports.join(", "))
+    })?;
+    println!("Adapter self-test on {port}");
+    println!("Needs 12 V on OBD pin 16 (car with ignition OFF, or a bench supply).\n");
+    let report = selftest(&mut line);
+    for c in &report {
+        let tag = match c.status {
+            Status::Pass => "PASS",
+            Status::Warn => "WARN",
+            Status::Fail => "FAIL",
+            Status::Info => "INFO",
+        };
+        println!("{tag}  {:<15} {}", c.name, c.detail);
+    }
+    if report.iter().any(|c| c.status == Status::Fail) {
+        return Err("adapter self-test failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "serial"))]
+fn selftest(_port: &str) -> Result<(), String> {
+    Err("built without the `serial` feature".into())
+}
+
+/// Clear stored fault codes, the way the Hi-Scan's ERAS key does.
+fn clear(o: &Opts) -> Result<(), String> {
+    let group = match o.system {
+        System::Engine => 0xff00, // Hi-Scan sends 14 FF 00
+        System::Abs => 0x4000,    // Hi-Scan sends 14 40 00
+        System::Srs => {
+            return Err("clearing SRS codes is not supported (request not observed)".into());
+        }
+    };
+    if !o.allow_clear {
+        return Err("clearing fault codes changes the ECU; rerun with --allow-clear".into());
+    }
+    if !o.yes {
+        eprint!("Clear all stored {:?} fault codes? Type yes: ", o.system);
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if answer.trim() != "yes" {
+            return Err("not confirmed; nothing sent".into());
+        }
+    }
+    let mut c = connect(o)?;
+    c.allow_clear = true;
+    c.clear_dtcs(group).map_err(|e| format!("clear: {e}"))?;
+    println!("fault codes cleared");
+    let _ = c.stop();
+    Ok(())
+}
+
 fn dtc(o: &Opts) -> Result<(), String> {
     let mut c = connect(o)?;
     let list: Vec<String> = match o.system {
@@ -321,7 +401,12 @@ fn main() -> ExitCode {
     let r = match args.split_first() {
         Some((cmd, rest)) if cmd == "dtc" => parse(rest).and_then(|o| dtc(&o)),
         Some((cmd, rest)) if cmd == "log" => parse(rest).and_then(|o| log(&o)),
-        _ => Err("usage: kdiag dtc|log (--sim | --port DEV) [--system engine|abs|srs] [--out F] \
+        Some((cmd, rest)) if cmd == "clear" => parse(rest).and_then(|o| clear(&o)),
+        Some((cmd, rest)) if cmd == "selftest" => match rest {
+            [flag, dev] if flag == "--port" => selftest(dev),
+            _ => Err("usage: kdiag selftest --port DEV".into()),
+        },
+        _ => Err("usage: kdiag dtc|log|clear|selftest (--sim | --port DEV) [--system engine|abs|srs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };

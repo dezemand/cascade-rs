@@ -166,6 +166,230 @@ impl Line for SerialLine {
     }
 }
 
+/// Outcome of one self-test check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Pass,
+    Warn,
+    Fail,
+    Info,
+}
+
+/// One line of the self-test report.
+#[derive(Clone, Debug)]
+pub struct Check {
+    pub status: Status,
+    pub name: &'static str,
+    pub detail: String,
+}
+
+fn check(status: Status, name: &'static str, detail: impl Into<String>) -> Check {
+    Check {
+        status,
+        name,
+        detail: detail.into(),
+    }
+}
+
+/// Bytes the adapter heard within `timeout`, stopping early once `n` arrived.
+fn hear(line: &mut SerialLine, n: usize, timeout: Duration) -> io::Result<Vec<u8>> {
+    line.read_exact_timeout(n, timeout)
+}
+
+/// Adapter self-test: what the Phase 3 checklist asks of a K-line adapter.
+///
+/// Sends only bytes that are not valid KWP2000 frames, and wake-up pulses
+/// without a StartCommunication, so a connected ECU ignores it. Run it with
+/// 12 V on OBD pin 16 (car with ignition off, or a bench supply): without
+/// that most adapters' K-line transceivers are dead and nothing echoes.
+pub fn selftest(line: &mut SerialLine) -> Vec<Check> {
+    let mut out = Vec::new();
+
+    // 1. baud rates
+    match line.port.set_baud_rate(10_400) {
+        Ok(()) => out.push(check(
+            Status::Pass,
+            "10,400 baud",
+            "accepted by the driver (IOSSIOSPEED)",
+        )),
+        Err(e) => out.push(check(
+            Status::Fail,
+            "10,400 baud",
+            format!("refused: {e}. KWP2000 on K-line needs it."),
+        )),
+    }
+    let slow = line.port.set_baud_rate(360);
+    out.push(match slow {
+        Ok(()) => check(
+            Status::Pass,
+            "360 baud",
+            "accepted (needed for --wake zero)",
+        ),
+        Err(e) => check(
+            Status::Warn,
+            "360 baud",
+            format!("refused: {e}. --wake zero will not work; BREAK must."),
+        ),
+    });
+    let _ = line.port.set_baud_rate(10_400);
+    line.baud = 10_400;
+
+    // 2. echo
+    let pattern = [0x55u8, 0xaa, 0x0f, 0xf0, 0x00, 0xff];
+    let _ = line.flush_input();
+    let echo = line
+        .port
+        .write_all(&pattern)
+        .and_then(|_| line.port.flush())
+        .and_then(|_| hear(line, pattern.len(), Duration::from_millis(300)));
+    let echoes = match &echo {
+        Ok(b) if b.as_slice() == pattern => {
+            out.push(check(
+                Status::Pass,
+                "echo",
+                "the adapter hears its own bytes: transceiver powered, wiring sane",
+            ));
+            true
+        }
+        Ok(b) if b.is_empty() => {
+            out.push(check(
+                Status::Warn,
+                "echo",
+                "nothing heard. Either the adapter has no 12 V on OBD pin 16 (most K-line \
+                 transceivers need it), or it filters the echo (then use --no-echo). \
+                 The remaining line checks need an echo and are skipped.",
+            ));
+            false
+        }
+        Ok(b) => {
+            out.push(check(
+                Status::Fail,
+                "echo",
+                format!("sent {pattern:02X?}, heard {b:02X?}: wrong baud rate, a noisy line, or another tester on the bus"),
+            ));
+            false
+        }
+        Err(e) => {
+            out.push(check(Status::Fail, "echo", format!("I/O error: {e}")));
+            false
+        }
+    };
+
+    if echoes {
+        // 3. echo latency: one byte out, its echo back
+        let mut rtts = Vec::new();
+        for _ in 0..10 {
+            let _ = line.flush_input();
+            let t = Instant::now();
+            if line
+                .port
+                .write_all(&[0x5a])
+                .and_then(|_| line.port.flush())
+                .is_err()
+            {
+                break;
+            }
+            if let Ok(b) = hear(line, 1, Duration::from_millis(200))
+                && b == [0x5a]
+            {
+                rtts.push(t.elapsed());
+            }
+            precise_sleep(Duration::from_millis(20));
+        }
+        rtts.sort();
+        if let (Some(min), Some(max)) = (rtts.first(), rtts.last()) {
+            let med = rtts[rtts.len() / 2];
+            let status = if med < Duration::from_millis(8) {
+                Status::Pass
+            } else {
+                Status::Warn
+            };
+            out.push(check(
+                status,
+                "echo latency",
+                format!(
+                    "{} of 10 bytes, median {:.1} ms (min {:.1}, max {:.1}); one byte takes 0.96 ms on the wire. \
+                     Above ~8 ms, USB latency eats into the ECU's 25-50 ms reply window.",
+                    rtts.len(),
+                    med.as_secs_f64() * 1e3,
+                    min.as_secs_f64() * 1e3,
+                    max.as_secs_f64() * 1e3
+                ),
+            ));
+        }
+
+        // 4. BREAK: the line should be pulled low, which the receiver reads
+        // as 0x00 bytes (with framing errors) at 10,400 baud
+        let _ = line.flush_input();
+        let brk = line
+            .port
+            .set_break()
+            .map(|_| precise_sleep(Duration::from_millis(25)))
+            .and_then(|_| line.port.clear_break());
+        let heard = hear(line, 8, Duration::from_millis(60)).unwrap_or_default();
+        out.push(match (brk, heard.contains(&0)) {
+            (Err(e), _) => check(Status::Fail, "BREAK", format!("driver refused: {e}. Use --wake zero.")),
+            (Ok(()), true) => check(
+                Status::Pass,
+                "BREAK",
+                format!("line went low (heard {heard:02X?}); --wake break (default) should work"),
+            ),
+            (Ok(()), false) => check(
+                Status::Warn,
+                "BREAK",
+                "accepted by the driver but not seen on the line; the adapter may ignore BREAK. Try --wake zero.",
+            ),
+        });
+
+        // 5. zero-byte wake-up: 0x00 at 360 baud is ~25 ms low
+        let _ = line.flush_input();
+        let zero = line
+            .port
+            .set_baud_rate(360)
+            .and_then(|_| line.port.write_all(&[0x00]).map_err(Into::into))
+            .map_err(io::Error::from)
+            .and_then(|_| line.port.flush());
+        let heard = hear(line, 1, Duration::from_millis(150)).unwrap_or_default();
+        let _ = line.port.set_baud_rate(10_400);
+        out.push(match (zero, heard.as_slice()) {
+            (Err(e), _) => check(
+                Status::Warn,
+                "zero-byte wake",
+                format!("could not send: {e}"),
+            ),
+            (Ok(()), [0x00]) => check(
+                Status::Pass,
+                "zero-byte wake",
+                "0x00 at 360 baud echoed; --wake zero works",
+            ),
+            (Ok(()), h) => check(
+                Status::Warn,
+                "zero-byte wake",
+                format!("heard {h:02X?} instead of 00"),
+            ),
+        });
+    }
+
+    // 6. host timing of a 25 ms pulse (what we control on our side)
+    let mut errs = Vec::new();
+    for _ in 0..10 {
+        let t = Instant::now();
+        precise_sleep(Duration::from_millis(25));
+        errs.push(t.elapsed().as_secs_f64() * 1e3 - 25.0);
+    }
+    let worst = errs.iter().cloned().fold(0.0f64, f64::max);
+    out.push(check(
+        if worst < 1.0 {
+            Status::Pass
+        } else {
+            Status::Warn
+        },
+        "host timing",
+        format!("25 ms pulse overshoots by at most {worst:.2} ms (ISO 14230 allows 24-26 ms)"),
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +496,63 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
         result.expect("session over pty");
+    }
+
+    /// Self-test against a pty whose far end echoes everything back: the
+    /// echo and latency checks pass; baud and BREAK cannot pass on a pty.
+    #[test]
+    fn selftest_with_echoing_pty() {
+        let (a, mut b) = TTYPort::pair().expect("pty pair");
+        b.set_timeout(Duration::from_millis(5)).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let echoer = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(n) = b.read(&mut buf) {
+                    let _ = b.write_all(&buf[..n]);
+                }
+            }
+        });
+        let mut line = SerialLine::from_port(a, true);
+        let report = selftest(&mut line);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        echoer.join().unwrap();
+        let get = |n: &str| report.iter().find(|c| c.name == n).map(|c| c.status);
+        assert_eq!(get("echo"), Some(Status::Pass), "{report:#?}");
+        assert_eq!(get("echo latency"), Some(Status::Pass), "{report:#?}");
+        assert_eq!(
+            get("10,400 baud"),
+            Some(Status::Fail),
+            "a pty cannot set baud rates"
+        );
+        assert!(get("host timing").is_some());
+    }
+
+    #[test]
+    fn selftest_without_echo_warns_and_skips() {
+        // the far end reads and discards (an adapter that does not echo);
+        // without a reader, tcdrain on a pty blocks forever
+        let (a, mut b) = TTYPort::pair().expect("pty pair");
+        b.set_timeout(Duration::from_millis(5)).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let sink = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = b.read(&mut buf);
+            }
+        });
+        let mut line = SerialLine::from_port(a, true);
+        let report = selftest(&mut line);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sink.join().unwrap();
+        let echo = report.iter().find(|c| c.name == "echo").unwrap();
+        assert_eq!(echo.status, Status::Warn);
+        assert!(
+            report.iter().all(|c| c.name != "BREAK"),
+            "line checks need an echo"
+        );
     }
 
     #[test]

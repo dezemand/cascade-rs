@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod defs;
+pub mod guard;
 pub mod kwp;
 pub mod line;
 #[cfg(feature = "serial")]

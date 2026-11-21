@@ -51,12 +51,15 @@ pub enum Error {
     },
     /// Response does not belong to the request.
     Unexpected(Vec<u8>),
+    /// Refused by the read-only guard before anything was sent.
+    Blocked(crate::guard::Blocked),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "I/O: {e}"),
+            Error::Blocked(b) => write!(f, "{b}"),
             Error::Timeout(b) => write!(f, "timeout (received {})", hex(b)),
             Error::BadFrame(b) => write!(f, "bad frame {}", hex(b)),
             Error::Negative { sid, code } => {
@@ -90,6 +93,8 @@ pub struct Client<L: Line> {
     /// Always send the separate length byte (`80 tgt src len ...`), as
     /// the Hi-Scan does for ABS and SRS.
     pub length_byte: bool,
+    /// Let ClearDiagnosticInformation through the read-only guard.
+    pub allow_clear: bool,
     last_rx_end: Duration,
 }
 
@@ -107,6 +112,7 @@ impl<L: Line> Client<L> {
             source,
             timing: Timing::default(),
             length_byte: false,
+            allow_clear: false,
             last_rx_end: Duration::ZERO,
         }
     }
@@ -132,6 +138,8 @@ impl<L: Line> Client<L> {
     }
 
     fn exchange(&mut self, data: &[u8]) -> Result<Vec<u8>, Error> {
+        // nothing reaches the line without passing the read-only guard
+        crate::guard::check(data, self.allow_clear).map_err(Error::Blocked)?;
         let since = self.line.elapsed().saturating_sub(self.last_rx_end);
         if since < self.timing.p3_min {
             self.line.idle(self.timing.p3_min - since);
@@ -241,6 +249,17 @@ impl<L: Line> Client<L> {
         }
     }
 
+    /// ClearDiagnosticInformation for a group, as the Hi-Scan sends it
+    /// (engine `14 FF 00`, ABS `14 40 00`, both observed in the emulator).
+    /// Refused unless `allow_clear` is set.
+    pub fn clear_dtcs(&mut self, group: u16) -> Result<(), Error> {
+        let r = self.exchange(&[0x14, (group >> 8) as u8, group as u8])?;
+        match r.as_slice() {
+            [0x54, ..] => Ok(()),
+            _ => Err(Error::Unexpected(r)),
+        }
+    }
+
     pub fn stop(&mut self) -> Result<(), Error> {
         self.exchange(&[0x82]).map(|_| ())
     }
@@ -317,6 +336,23 @@ mod tests {
             codes.iter().map(|&c| dtc_name(c)).collect::<Vec<_>>(),
             ["C101F", "C0015"]
         );
+    }
+
+    #[test]
+    fn guard_blocks_before_sending() {
+        let mut c = client(KwpConfig {
+            dtcs: vec![(0x0301, 0xe0)],
+            ..Default::default()
+        });
+        c.start().unwrap();
+        let t = c.line.elapsed();
+        assert!(matches!(c.request(&[0x11, 0x01]), Err(Error::Blocked(_))));
+        assert!(matches!(c.clear_dtcs(0xff00), Err(Error::Blocked(_))));
+        assert_eq!(c.line.elapsed(), t, "nothing was sent");
+        assert_eq!(c.read_dtcs().unwrap().len(), 1, "codes still stored");
+        c.allow_clear = true;
+        c.clear_dtcs(0xff00).unwrap();
+        assert!(c.read_dtcs().unwrap().is_empty());
     }
 
     #[test]
