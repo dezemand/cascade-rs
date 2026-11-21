@@ -13,6 +13,9 @@ dependencies = [
 [[package]]
 name = "cascade-core"
 version = "0.1.0"
+dependencies = [
+ "cascade-iface",
+]
 
 [[package]]
 name = "cascade-iface"
