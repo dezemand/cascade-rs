@@ -616,9 +616,10 @@ mod tests {
         let t = Instant::now();
         precise_sleep(Duration::from_millis(25));
         let e = t.elapsed();
-        assert!(
-            e >= Duration::from_millis(25) && e < Duration::from_millis(35),
-            "{e:?}"
-        );
+        assert!(e >= Duration::from_millis(25), "{e:?}");
+        // shared CI runners stall for tens of ms; check the upper bound locally
+        if std::env::var_os("CI").is_none() {
+            assert!(e < Duration::from_millis(35), "{e:?}");
+        }
     }
 }

@@ -31,9 +31,8 @@ K-line: engine, ABS and airbag fault codes, and live engine data.
 | `ecuc167` | Infineon C167 disassembler and emulator for running an engine ECU dump offline behind the same interface. |
 | `ecu8051` | Siemens 80C517-class 8051 emulator, used to analyse an older engine ECU ROM. |
 
-Also: `oracle/` (a container build of the original C++ CASCADE, used as the
-reference), `protocol/` (what the Hi-Scan firmware asks the car and how it
-scales the answers), `tools/` (stdlib-only Python helpers for driving the
+Also: `protocol/` (what the Hi-Scan firmware asks the car and how it scales
+the answers), `tools/` (stdlib-only Python helpers for driving the
 emulator and reading its screen).
 
 ## You need your own software
@@ -105,18 +104,6 @@ original firmware shows the car's data:
 python3 -I tools/screen.py roms/hyundai.his.dat --path tiburon-l4 down enter wait --replay log.jsonl
 ```
 
-## The reference oracle
-
-`oracle/` builds the original C++ CASCADE (Qt 4, Debian buster) in a Linux
-container, with two small patches, one of them a real emulation fix. It
-expects a clone of upstream in `upstream/uli-cascade` (git-ignored) and uses
-Apple's `container` tool; any OCI builder works with small changes.
-
-```sh
-git clone https://github.com/uli/cascade upstream/uli-cascade
-oracle/build.sh
-```
-
 ## Safety
 
 - `kdiag` is **read-only**. Every request passes an allowlist (session
@@ -132,7 +119,8 @@ oracle/build.sh
 
 ## How it was verified
 
-- The CPU core matches the C++ original instruction for instruction (916,040
+- The CPU core matches the original C++ CASCADE (debug build, with the ROM
+  bank fix from `NOTICE.md`) instruction for instruction (916,040
   trace records from boot), and RAM/ROM dumps match at the main menu and
   along a full diagnosis menu path.
 - The disassembler's lengths and branch targets are checked against 145

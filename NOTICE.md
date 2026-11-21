@@ -28,8 +28,7 @@ All dated 2026-11-21 (the first published version).
   `phys` only when `phys <= rom_size - 0xc000`; this port uses
   `phys + 0x4000 <= rom_size`. Upstream redirects the last two 16 KB banks to
   offset 0, so the Hyundai pack's self-check fails and the firmware resets.
-  The same fix is applied to the reference build in
-  `oracle/patches/0002-rom-data-window-bound.patch`.
+  The same fix was applied to the C++ build used as the reference.
 - Undefined behaviour in upstream (out-of-bounds data/code pointers, EEPROM
   words ≥ 128, a bad HSO software-timer index) stops the emulator with an
   error instead of reading or writing out of bounds.

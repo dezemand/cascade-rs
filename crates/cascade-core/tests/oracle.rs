@@ -1,4 +1,5 @@
-//! Tests against traces produced by the C++ oracle (`oracle/`).
+//! Tests against traces produced by the original C++ CASCADE (debug build,
+//! run separately with the Hyundai pack; not part of this repository).
 //!
 //! Gated: they run only when `CASCADE_ORACLE_TRACE` points at an
 //! uncompressed oracle log (`zstd -d traces/boot-5m.trace.zst`), so the

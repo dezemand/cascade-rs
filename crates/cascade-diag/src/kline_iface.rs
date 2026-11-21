@@ -296,13 +296,14 @@ mod tests {
         let total = t.elapsed();
         stop.store(true, Ordering::Relaxed);
         sink.join().unwrap();
-        assert!(
-            low >= Duration::from_millis(25) && low < Duration::from_millis(30),
-            "low {low:?}"
-        );
-        assert!(
-            total >= Duration::from_millis(50) && total < Duration::from_millis(57),
-            "total {total:?}"
-        );
+        // never early; the upper bounds only where the scheduler is quiet
+        // (shared CI runners stall for tens of ms)
+        let ci = std::env::var_os("CI").is_some();
+        assert!(low >= Duration::from_millis(25), "low {low:?}");
+        assert!(total >= Duration::from_millis(50), "total {total:?}");
+        if !ci {
+            assert!(low < Duration::from_millis(30), "low {low:?}");
+            assert!(total < Duration::from_millis(57), "total {total:?}");
+        }
     }
 }

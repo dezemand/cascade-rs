@@ -5,7 +5,6 @@ traces/
 *.his.dat
 *.HIS_EN.DAT
 *.DAT
-oracle/.ctx/
 __pycache__/
 *.bin
 .DS_Store
