@@ -282,6 +282,14 @@ impl Cpu {
         self.keys.insert(pos, ev);
     }
 
+    /// Drop all queued key events and release every key now. Not an upstream
+    /// operation; front ends use it when the cycle counter restarts (reset),
+    /// since queued events are stamped with cycles.
+    pub fn release_all_keys(&mut self) {
+        self.keys.clear();
+        self.keypad = Keypad::default();
+    }
+
     // ---- address translation -------------------------------------------
 
     /// Upstream `virtToPhysSlow` for an address in 0xC000..=0xFFFF.

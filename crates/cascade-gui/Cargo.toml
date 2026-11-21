@@ -1,0 +1,21 @@
+[package]
+name = "cascade-gui"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "Desktop front end for the cascade-rs Hi-Scan emulator (GPUI via gpui-kit)"
+publish.workspace = true
+
+[[bin]]
+name = "cascade-gui"
+path = "src/main.rs"
+
+[dependencies]
+cascade-core.workspace = true
+cascade-iface.workspace = true
+cascade-runner.workspace = true
+gpui-kit = "0.10.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "cascade-runner"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "Runs the cascade-rs emulator on its own thread in real time, for front ends"
+publish.workspace = true
+
+[dependencies]
+cascade-core.workspace = true
+cascade-iface.workspace = true
+
+[lints]
+workspace = true

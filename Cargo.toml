@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# cascade-gui pulls in GPUI (~520 crates); build it explicitly with -p cascade-gui
+default-members = ["crates/cascade-core", "crates/cascade-iface", "crates/cascade-cli", "crates/cascade-diag", "crates/cascade-runner"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +16,7 @@ publish = false
 cascade-core = { path = "crates/cascade-core" }
 cascade-iface = { path = "crates/cascade-iface" }
 cascade-diag = { path = "crates/cascade-diag" }
+cascade-runner = { path = "crates/cascade-runner" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
