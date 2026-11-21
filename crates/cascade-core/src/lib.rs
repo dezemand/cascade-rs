@@ -15,6 +15,6 @@ pub mod serial;
 pub mod stop;
 pub mod trace;
 
-pub use cpu::{Cpu, KeyEvent, StepEvent};
+pub use cpu::{Cpu, KeyEvent, Stats, StepEvent};
 pub use keypad::Key;
 pub use stop::Stop;

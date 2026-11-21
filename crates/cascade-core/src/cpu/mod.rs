@@ -70,7 +70,35 @@ pub struct KeyEvent {
     pub down: bool,
 }
 
+/// Counters for coverage reporting; they do not affect emulation.
+#[derive(Clone, Debug)]
+pub struct Stats {
+    /// Executions per first opcode byte.
+    pub opcodes: [u64; 256],
+    /// Executions per FE-prefixed second byte.
+    pub fe_opcodes: [u64; 256],
+    /// HSO software-timer interrupts taken.
+    pub swt_interrupts: u64,
+    /// Reads of the `rand()`-backed ports 0x201 and 0x236.
+    pub rand_reads: u64,
+    /// Bytes written to the UART (SBUF TX).
+    pub uart_tx: u64,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            opcodes: [0; 256],
+            fe_opcodes: [0; 256],
+            swt_interrupts: 0,
+            rand_reads: 0,
+            uart_tx: 0,
+        }
+    }
+}
+
 pub struct Cpu {
+    pub stats: Stats,
     rom: Vec<u8>,
     ram: Vec<u8>,
     mapped_ram: Vec<u8>,
@@ -131,6 +159,7 @@ impl Cpu {
         ram[..n].copy_from_slice(&rom[..n]);
         let is_hiscan = !upstream_contains(&rom, b"CARMAN");
         let mut cpu = Self {
+            stats: Stats::default(),
             rom,
             ram,
             mapped_ram: vec![0; MAPPED_RAM_SIZE],
@@ -518,6 +547,7 @@ impl Cpu {
                 let old = old.wrapping_add(self.timer1_offset);
                 let new = self.timer1();
                 if self.hsio.swt_interrupt(old, new, i) {
+                    self.stats.swt_interrupts += 1;
                     self.ios1 |= 1 << i;
                     self.push16(self.pc)?;
                     self.pc = self.rd16(0x200a)?;

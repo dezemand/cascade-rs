@@ -6,3 +6,4 @@ traces/
 *.HIS_EN.DAT
 *.DAT
 oracle/.ctx/
+__pycache__/

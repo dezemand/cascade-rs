@@ -3,16 +3,28 @@
 //! Commands:
 //!   cascade run <rom> [-m CYCLES] [--trace FILE] [--dump DIR]
 //!               [--key CYCLE:NAME[:HOLD]]... [--screen]
-//!       Run the emulator headless with nothing on the diagnostic line.
+//!       Run the emulator headless. The diagnostic line is upstream's fake
+//!       ECU by default (as in the oracle's debug build); --iface null for
+//!       nothing attached.
 //!       Stops after CYCLES (like the oracle's -m). --trace writes the
 //!       oracle trace format; --dump writes `dump` and `dump.ram` like the
 //!       oracle; --key presses NAME at CYCLE for HOLD cycles (default 3M);
-//!       --screen prints the LCD as ASCII at the end.
+//!       --screen prints the LCD as ASCII at the end; --png FILE saves it;
+//!       --line-log FILE writes every line event (TX/RX/baud/init) with
+//!       its emulated cycle; --iface kwp attaches a KWP2000 engine ECU
+//!       model and --kwp-log FILE writes its decoded request/response log;
+//!       --dtc CODE:STATUS (repeatable, hex with 0x) stores a DTC in it;
+//!       --local ID=HEX sets its ReadDataByLocalIdentifier block; --stats prints
+//!       coverage counters. Exit 0 at the cycle cap, 1 on any other stop,
+//!       3 when the firmware's endless-loop reset fires (unless
+//!       --continue-after-reset).
 //!   cascade trace-diff <left.log> <right.log>
 //!       Compare two oracle-format traces by machine state and report the
 //!       first divergence. Exit 0 if equal, 1 if they diverge, 2 on error.
 //!   cascade trace-stats <log>
 //!       Count records and distinct physical PCs.
+
+mod png;
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -82,6 +94,15 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut trace_path = None;
     let mut dump_dir = None;
     let mut screen = false;
+    let mut png_path = None;
+    let mut lcd_dump_path = None;
+    let mut line_log_path = None;
+    let mut kwp_log_path = None;
+    let mut dtcs: Vec<(u16, u8)> = Vec::new();
+    let mut local_data = std::collections::BTreeMap::new();
+    let mut stats = false;
+    let mut continue_after_reset = false;
+    let mut iface_name = "fake";
     let mut keys = Vec::new();
     let mut it = args.iter();
     while let Some(&a) = it.next() {
@@ -95,6 +116,36 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             "--trace" => trace_path = Some(val()?),
             "--dump" => dump_dir = Some(val()?),
             "--screen" => screen = true,
+            "--png" => png_path = Some(val()?),
+            "--lcd-dump" => lcd_dump_path = Some(val()?),
+            "--line-log" => line_log_path = Some(val()?),
+            "--kwp-log" => kwp_log_path = Some(val()?),
+            "--local" => {
+                let v = val()?;
+                let (id, hex) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("bad --local {v:?}, want ID=HEX"))?;
+                let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+                if !hex.len().is_multiple_of(2) {
+                    return Err(format!("odd hex length in --local {v:?}"));
+                }
+                let bytes = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                    .collect::<Result<Vec<u8>, _>>()
+                    .map_err(|e| format!("--local {v:?}: {e}"))?;
+                local_data.insert(parse_num(id)? as u8, bytes);
+            }
+            "--dtc" => {
+                let v = val()?;
+                let (c, st) = v
+                    .split_once(':')
+                    .ok_or_else(|| format!("bad --dtc {v:?}, want CODE:STATUS"))?;
+                dtcs.push((parse_num(c)? as u16, parse_num(st)? as u8));
+            }
+            "--stats" => stats = true,
+            "--iface" => iface_name = val()?,
+            "--continue-after-reset" => continue_after_reset = true,
             "--key" => {
                 let v = val()?;
                 let parts: Vec<&str> = v.split(':').collect();
@@ -123,7 +174,26 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let rom_path = rom_path.ok_or("run needs a ROM path")?;
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
-    let mut cpu = Cpu::with_null_interface(rom);
+    let mut kwp_log = None;
+    let inner: Box<dyn cascade_iface::Interface> = match iface_name {
+        "fake" => Box::new(cascade_iface::Fake::default()),
+        "null" => Box::new(cascade_iface::Null),
+        "kwp" => {
+            let config = cascade_iface::KwpConfig {
+                dtcs: dtcs.clone(),
+                local_data: local_data.clone(),
+                ..Default::default()
+            };
+            let ecu = cascade_iface::KwpEcu::new(config);
+            kwp_log = Some(ecu.log_handle());
+            Box::new(ecu)
+        }
+        other => return Err(format!("unknown --iface {other:?} (fake, null, kwp)")),
+    };
+    let traced = cascade_iface::Traced::new(inner);
+    let line_log = traced.log_handle();
+    let iface: Box<dyn cascade_iface::Interface> = Box::new(traced);
+    let mut cpu = Cpu::new(rom, iface, false);
     cpu.max_cycles = max;
     for k in keys {
         cpu.queue_key(k);
@@ -143,16 +213,26 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             write_err.get_or_insert(e);
         }
     };
-    let trace: Option<&mut dyn FnMut(&Record)> = if trace_path.is_some() {
-        Some(&mut sink)
-    } else {
-        None
-    };
-    let stop = cpu.run(trace, |ev| {
-        if let StepEvent::EndlessLoopReset { pc, phys, cycles } = ev {
-            eprintln!("ENDLESS LOOP at {pc:04X} ({phys:08X}) at {cycles} cycles! (reset)");
+    let tracing = trace_path.is_some();
+    // Upstream resets the machine (cycles back to 0) on an endless loop, so
+    // a cycle cap alone would never end the run. Stop there by default.
+    let mut reset_seen = false;
+    let stop = loop {
+        let t: Option<&mut dyn FnMut(&Record)> = if tracing { Some(&mut sink) } else { None };
+        match cpu.step(t) {
+            Ok(StepEvent::Executed) => {}
+            Ok(StepEvent::EndlessLoopReset { pc, phys, cycles }) => {
+                eprintln!(
+                    "ENDLESS LOOP at {pc:04X} ({phys:08X}) at {cycles} cycles! (machine reset)"
+                );
+                if !continue_after_reset {
+                    reset_seen = true;
+                    break None;
+                }
+            }
+            Err(stop) => break Some(stop),
         }
-    });
+    };
     if let Some(mut w) = out {
         w.flush().map_err(|e| e.to_string())?;
     }
@@ -160,19 +240,92 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
         return Err(format!("writing trace: {e}"));
     }
 
-    eprintln!("{stop} at {} cycles, PC {:04X}", cpu.cycles(), cpu.pc());
+    match &stop {
+        Some(stop) => eprintln!("{stop} at {} cycles, PC {:04X}", cpu.cycles(), cpu.pc()),
+        None => eprintln!("stopped after firmware reset"),
+    }
+    if stats {
+        let st = &cpu.stats;
+        let used: Vec<String> = (0..256)
+            .filter(|&o| st.opcodes[o] > 0 && o != 0xfe)
+            .map(|o| format!("{o:02X}"))
+            .chain(
+                (0..256)
+                    .filter(|&o| st.fe_opcodes[o] > 0)
+                    .map(|o| format!("FE{o:02X}")),
+            )
+            .collect();
+        let total: u64 = st.opcodes.iter().sum();
+        eprintln!("instructions: {total}");
+        eprintln!(
+            "distinct opcodes executed: {} [{}]",
+            used.len(),
+            used.join(" ")
+        );
+        eprintln!(
+            "SWT interrupts: {}, rand() port reads: {}, UART TX bytes: {}",
+            st.swt_interrupts, st.rand_reads, st.uart_tx
+        );
+    }
     if let Some(dir) = dump_dir {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         std::fs::write(format!("{dir}/dump"), cpu.ram()).map_err(|e| e.to_string())?;
         std::fs::write(format!("{dir}/dump.ram"), cpu.mapped_ram()).map_err(|e| e.to_string())?;
     }
+    if let Some(p) = line_log_path {
+        let mut w = BufWriter::new(File::create(p).map_err(|e| format!("{p}: {e}"))?);
+        for e in line_log.borrow().iter() {
+            writeln!(w, "{} {:?}", e.at, e.event).map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+    }
+    if let Some(p) = kwp_log_path {
+        let log = kwp_log.ok_or("--kwp-log needs --iface kwp")?;
+        let mut w = BufWriter::new(File::create(p).map_err(|e| format!("{p}: {e}"))?);
+        let hex = |b: &[u8]| {
+            b.iter()
+                .map(|x| format!("{x:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for e in log.borrow().iter() {
+            let resp = e
+                .response
+                .as_deref()
+                .map_or("(no response)".to_string(), hex);
+            writeln!(
+                w,
+                "{} {:02X}->{:02X} {} => {}",
+                e.at,
+                e.source,
+                e.target,
+                hex(&e.request),
+                resp
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
+    }
+    if let Some(p) = lcd_dump_path {
+        std::fs::write(p, cpu.lcd.memory()).map_err(|e| format!("{p}: {e}"))?;
+    }
+    if let Some(p) = png_path {
+        let lcd = &cpu.lcd;
+        let img = png::encode(
+            cascade_core::lcd::LCD_WIDTH,
+            cascade_core::lcd::LCD_HEIGHT,
+            2,
+            |x, y| lcd.pixel(x, y),
+        );
+        std::fs::write(p, img).map_err(|e| format!("{p}: {e}"))?;
+    }
     if screen {
         print!("{}", cpu.lcd.render_ascii(2, 4));
     }
-    Ok(if stop == Stop::MaxCycles {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
+    Ok(match stop {
+        Some(Stop::MaxCycles) => ExitCode::SUCCESS,
+        _ if reset_seen => ExitCode::from(3),
+        _ => ExitCode::from(1),
     })
 }
 
@@ -183,7 +336,7 @@ fn main() -> ExitCode {
         ["run", rest @ ..] => run(rest),
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen]\n       \
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--continue-after-reset]\n       \
                   cascade trace-diff <left> <right>\n       cascade trace-stats <log>"
             .into()),
     };

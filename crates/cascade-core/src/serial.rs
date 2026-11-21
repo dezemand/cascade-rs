@@ -4,10 +4,19 @@
 //! port, determinism comes from cycle-stamped input instead. UI and hint
 //! calls are dropped; wall-clock `sync()` calls are dropped.
 
-use cascade_iface::Interface;
+use cascade_iface::{Interface, RxBuf};
 
 use crate::ring::Ring;
 use crate::stop::{R, unimp};
+
+impl RxBuf for Ring<u8, 256> {
+    fn push(&mut self, byte: u8) {
+        self.add(byte);
+    }
+    fn flush(&mut self) {
+        Ring::flush(self);
+    }
+}
 
 const SERSTAT_OE: u8 = 1 << 2;
 const SERSTAT_TXE: u8 = 1 << 3;
@@ -133,7 +142,7 @@ impl Serial {
                 self.baudrate = ((clock / 2 / self.fixed_baudrate as u32 / 8) | 0x8000) as u16;
             }
             self.iface
-                .set_baud_divisor(now, (self.baudrate & 0x7fff) as u32);
+                .set_baud_divisor(now, (self.baudrate & 0x7fff) as u32, &mut self.rx_buf);
         }
     }
 
@@ -163,8 +172,7 @@ impl Serial {
     }
 
     fn check_input(&mut self, now: u64) {
-        let buf = &mut self.rx_buf;
-        self.iface.poll_input(now, &mut |b| buf.add(b));
+        self.iface.poll_input(now, &mut self.rx_buf);
     }
 
     pub fn read_stat(&mut self, now: u64) -> u8 {
@@ -224,7 +232,7 @@ impl Serial {
             self.rx_buf.flush();
         }
         self.stat &= !(SERSTAT_TXE | SERSTAT_TI);
-        self.iface.send_byte(now, data);
+        self.iface.send_byte(now, data, &mut self.rx_buf);
         if self.enable_echo {
             self.rx_buf.prepend(self.ti_set_byte);
         }
@@ -241,12 +249,15 @@ impl Serial {
             self.force_baud_rate = true;
             self.baudrate = FORCED_BAUD_RATES[self.forced_baud_rate_no];
             self.iface
-                .set_baud_divisor(now, (self.baudrate & 0x7fff) as u32);
+                .set_baud_divisor(now, (self.baudrate & 0x7fff) as u32, &mut self.rx_buf);
             self.forced_baud_rate_no = (self.forced_baud_rate_no + 1) % FORCED_BAUD_RATES.len();
         }
         self.bitbang_reads_after_slow_init = 0;
         self.last_slow_init = now;
-        if self.iface.send_slow_init_bitwise(now, bit != 0) {
+        if self
+            .iface
+            .send_slow_init_bitwise(now, bit != 0, &mut self.rx_buf)
+        {
             return;
         }
         if self.si_state != SlowInit::Iso {
@@ -256,7 +267,7 @@ impl Serial {
             self.si_state = SlowInit::Iso;
             self.slow_init_count = 0;
             self.slow_init_target = 0;
-            self.iface.slow_init_imminent(now);
+            self.iface.slow_init_imminent(now, &mut self.rx_buf);
         } else if self.slow_init_count < 8 {
             self.slow_init_target = (self.slow_init_target >> 1) | if bit != 0 { 0x80 } else { 0 };
             self.slow_init_count += 1;
@@ -266,7 +277,8 @@ impl Serial {
                 return;
             }
             self.rx_buf.flush();
-            self.iface.send_slow_init(now, self.slow_init_target);
+            self.iface
+                .send_slow_init(now, self.slow_init_target, &mut self.rx_buf);
             self.si_state = SlowInit::Normal;
         }
     }
@@ -310,7 +322,7 @@ impl Serial {
             self.rx_buf.flush();
         }
         if line != self.comm_line && (line == 42 || self.comm_line == 42) {
-            self.iface.set_can(now, line == 42);
+            self.iface.set_can(now, line == 42, &mut self.rx_buf);
         }
         self.comm_line = line;
     }

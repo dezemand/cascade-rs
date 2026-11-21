@@ -138,6 +138,7 @@ impl Cpu {
     pub(super) fn execute(&mut self) -> R<StepEvent> {
         let opc = self.pc;
         let opcode = self.fetch()?;
+        self.stats.opcodes[opcode as usize] += 1;
         let psw_c = |s: &Self| s.psw & PSW_C != 0;
         match opcode {
             0x00 => {
@@ -1585,6 +1586,7 @@ impl Cpu {
             }
             0xfe => {
                 let e = self.fetch()?;
+                self.stats.fe_opcodes[e as usize] += 1;
                 match e {
                     0x8c | 0x8d | 0x8f => {
                         // div (signed)

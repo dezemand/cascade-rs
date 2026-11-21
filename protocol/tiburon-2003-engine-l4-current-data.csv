@@ -1,0 +1,28 @@
+# Tiburon 2003 Engine L4, KWP2000 ReadDataByLocalIdentifier 0x01 (request 21 01).
+# Emulator-derived from the Hi-Scan firmware (HP 701 USA, 09910-61000); not yet seen on the car.
+# offset: byte index after "61 01" in an ISO 14230 long frame (80 F1 11 LEN 61 01 ...).
+# Multi-byte values are little-endian. value = raw * scale + add. Units as the Hi-Scan shows them.
+# Factors marked ~ were bracketed from boundary samples (see protocol/tiburon-2003-engine-l4.md).
+name,offset,size,signed,scale,add,unit,metric
+battery_voltage,0,1,no,0.1015625,0,V,
+coolant_temp,3,1,no,1.35,-54.4,degF,0.75 degC/bit - 48 degC
+intake_air_temp,5,1,no,1.35,-54.4,degF,0.75 degC/bit - 48 degC
+tps,7,1,no,0.46875,0,deg,
+adapted_tps,8,2,no,~0.0018254,0,deg,
+map_voltage,10,1,no,~19.5294,0,mV,4980 mV at 255
+map_pressure,13,2,no,~0.00120317,0,psi,~8.295 Pa/bit
+vehicle_speed,18,1,no,0.621371,0,mph,1 km/h/bit
+engine_speed,19,2,yes,1,0,rpm,
+target_idle,21,2,yes,1,0,rpm,
+o2_front_b1,26,2,no,~4.87797,0,mV,
+ignition_timing,30,1,no,-0.375,72,deg,
+injection_time,42,2,no,0.004,0,ms,4 us/bit
+isc_duty,57,2,no,~0.00153,0,%,
+idle_speed_duty,59,2,yes,~0.00153,0,%,
+ign_dwell,74,2,no,0.004,0,ms,4 us/bit
+transmission_range,24,bit0,no,,,flag,shown as P,N when set; other bits not checked
+ac_switch,25,bit0,no,,,flag,
+ac_relay,25,bit2,no,,,flag,
+cranking_signal,73,bit1,no,,,flag,
+closed_throttle,73,bit2,no,,,flag,
+part_load,73,bit3,no,,,flag,

@@ -132,8 +132,14 @@ impl Cpu {
                 0xec => self.keypad.line(3),
                 _ => 0x7f,
             },
-            0x236 => ((self.rand.rand() % 0xff) & 0xef) as u8,
-            0x201 => ((self.rand.rand() % 0xff) | 0x08) as u8,
+            0x236 => {
+                self.stats.rand_reads += 1;
+                ((self.rand.rand() % 0xff) & 0xef) as u8
+            }
+            0x201 => {
+                self.stats.rand_reads += 1;
+                ((self.rand.rand() % 0xff) | 0x08) as u8
+            }
             0x240 => {
                 let r = EXTINT_QUEUE[self.extint_pos];
                 self.extint_pos = (self.extint_pos + 1) % 8;
@@ -194,7 +200,10 @@ impl Cpu {
                 _ => return self.io_fail("write", addr),
             },
             0x07 => match wsr {
-                0 => self.serial.write_data(now, value),
+                0 => {
+                    self.stats.uart_tx += 1;
+                    self.serial.write_data(now, value)
+                }
                 1 => self.ptssrv = (self.ptssrv & 0xff) | ((value as u16) << 8),
                 15 => {}
                 _ => return self.io_fail("write", addr),
