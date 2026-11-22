@@ -765,7 +765,11 @@ mod tests {
         }
         assert_eq!(p.engine, Engine::Running);
         assert!((p.rpm - 830.0).abs() < 40.0, "idles near target: {}", p.rpm);
-        assert!((p.lambda - 1.0).abs() < 0.05, "stoichiometric: {}", p.lambda);
+        assert!(
+            (p.lambda - 1.0).abs() < 0.05,
+            "stoichiometric: {}",
+            p.lambda
+        );
         // no fuel: it stalls
         for _ in 0..3000 {
             let o = ecu(&p, &mut isc);
