@@ -152,6 +152,21 @@ Or headless: `ecusim serve --rom ROM`, then `ecusim set ignition on`,
   ROM. The engine model itself is open loop and invented: engine speed
   follows the starter and the throttle, not the ECU's injection and ignition,
   which are not decoded yet.
+- Fault codes: the panel (or `ecusim set fault.coolant_open on`) injects
+  wiring faults on sensors and the cam signal; the ECU's own code detects
+  them and stores its code, which the Hi-Scan reads and erases (ERAS, with
+  key on and engine off) like on the car. Codes stay through key cycles; a
+  battery disconnect wipes them, since the ECU is modelled as powered from
+  the battery (its own non-volatile store is not emulated). The panel shows
+  what the ECU itself holds, read from its memory: its stored codes
+  (present now or stored) and its own engine speed, road speed, coolant and
+  battery readings. STOP ENGINE stalls the engine with the key on, the
+  state the Hi-Scan asks for before erasing. Faults and the
+  codes this dump stores for them: MAP P0107/P0108, coolant P0117/P0118,
+  throttle P0122/P0123, front/rear O2 P0132/P0138, EVAP pressure
+  P0452/P0453, battery sense P0560, wheel-speed line P1502, cam signal
+  P0340. Faults can also set follow-on codes (an open coolant sensor with a
+  cold engine model also gave P0130).
 - On the Hi-Scan use TIBURON → ENGINE L4 → **2003**: that is the data
   layout this ECU sends. Other model years expect another layout and show
   nonsense (a negative engine speed, for example).

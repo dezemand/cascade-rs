@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use ecuc167::cpu::{Cam, Cpu, Event, Pin, Wheel};
 
-use crate::plant::{Controls, Plant};
+use crate::ecu_view;
+use crate::plant::{Controls, Fault, Plant};
 use crate::proto::{ToClient, ToServer};
 
 /// CPU clock (the dump's UART and 1 ms tick fit 16 MHz).
@@ -40,8 +41,10 @@ fn wheels() -> Vec<Wheel> {
     );
     crank.cam = Some(Cam {
         targets: vec![Pin::Cc { unit: 0, ch: 14 }],
-        fall: 100,
-        rise: 110,
+        // low for half the cycle: the pattern checked to set no cam code
+        // (low only around one gap sets P0340)
+        fall: 30,
+        rise: 90,
     });
     let vss_cc30 = Wheel::new(vec![Pin::Cc { unit: 1, ch: 14 }], 1, 0);
     let vss_cc13 = Wheel::new(vec![Pin::Cc { unit: 0, ch: 13 }], 1, 0);
@@ -207,6 +210,14 @@ impl Server {
             ToServer::Watch => c.watch = true,
             ToServer::KLine => c.kline = true,
             ToServer::Baud(b) => c.baud = b.max(1),
+            ToServer::Tx { .. } | ToServer::Low { .. } | ToServer::High { .. }
+                if !self.controls.ignition =>
+            {
+                // key off: the ECU's K-line interface is unpowered
+                if let Some(e) = &mut self.ecu {
+                    e.hold = None;
+                }
+            }
             ToServer::Tx { us, bytes } => {
                 let t = c.ecu_time(us, now);
                 let bit = FCPU / c.baud.max(1) as u64;
@@ -236,7 +247,11 @@ impl Server {
     /// One pass of the ECU loop, `dt` seconds after the previous one.
     fn tick(&mut self, dt: f64) {
         self.plant.step(&self.controls, dt);
-        match (self.controls.ignition, self.ecu.is_some()) {
+        self.controls.stop_request = false;
+        // the ECU lives on the battery (KL30): it keeps its memory, fault
+        // codes included, across key cycles [assumed: stands in for the
+        // dump's non-volatile store, which is not emulated]
+        match (self.controls.battery_connected, self.ecu.is_some()) {
             (true, false) => self.ecu = Some(Ecu::new(&self.rom)),
             (false, true) => self.ecu = None,
             _ => {}
@@ -249,6 +264,14 @@ impl Server {
             e.cpu.adc[ch] = v;
         }
         e.cpu.wheels[0].rpm = self.plant.rpm;
+        let cam_lost = self.controls.faults.contains(&Fault::CamMissing);
+        if cam_lost != e.cpu.wheels[0].cam.is_none() {
+            e.cpu.wheels[0].cam = if cam_lost {
+                None
+            } else {
+                wheels().remove(0).cam
+            };
+        }
         let input = speed_input(&e.cpu);
         let kmh = self.controls.vehicle_kmh;
         e.cpu.wheels[1].rpm = if input == Some("cc30") {
@@ -267,7 +290,8 @@ impl Server {
             e.hold = None;
         }
         let rx = e.run(FCPU / 50);
-        if !rx.is_empty() {
+        // with the key off the ECU does not answer on the K-line
+        if !rx.is_empty() && self.controls.ignition {
             let m = ToClient::Rx(rx);
             for c in self.clients.values_mut().filter(|c| c.kline) {
                 c.send(&m);
@@ -281,6 +305,19 @@ impl Server {
         let on = |b: bool| if b { "on" } else { "off" }.to_string();
         let mut kv: Vec<(String, String)> = vec![
             ("ignition".into(), on(c.ignition)),
+            ("battery_connected".into(), on(c.battery_connected)),
+            (
+                "faults".into(),
+                if c.faults.is_empty() {
+                    "none".into()
+                } else {
+                    c.faults
+                        .iter()
+                        .map(|f| f.name())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+            ),
             ("starter".into(), on(c.starter)),
             ("engine".into(), self.plant.engine.name().into()),
             ("rpm".into(), format!("{:.0}", self.plant.rpm)),
@@ -328,6 +365,25 @@ impl Server {
                 ));
                 kv.push(("inj_hz".into(), format!("{:.0}", e.inj as f64 / period_s)));
                 kv.push(("rx_bytes".into(), e.rx_bytes.to_string()));
+                // what the ECU itself holds
+                let (rpm, kmh, coolant, battery) = ecu_view::readings(&e.cpu);
+                kv.push(("ecu_rpm".into(), rpm.to_string()));
+                kv.push(("ecu_speed".into(), kmh.to_string()));
+                kv.push(("ecu_coolant".into(), format!("{coolant:.1}")));
+                kv.push(("ecu_battery".into(), format!("{battery:.1}")));
+                let codes = ecu_view::stored_codes(&e.cpu);
+                kv.push((
+                    "dtcs".into(),
+                    if codes.is_empty() {
+                        "none".into()
+                    } else {
+                        codes
+                            .iter()
+                            .map(|c| format!("{}:{:02X}", c.code, c.status))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    },
+                ));
                 kv.push((
                     "speed_input".into(),
                     speed_input(&e.cpu).unwrap_or("none").into(),

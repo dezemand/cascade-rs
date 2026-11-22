@@ -9,7 +9,8 @@
 //! The sensor curves are measured: each ADC channel was swept through the
 //! ROM in the emulator and the value the ROM reports in its `21 01` block
 //! read back (non-immobiliser GK 2.0 dump). Channels: 0 MAP, 2 front O2,
-//! 3 rear O2, 4 battery, 10 throttle, 11 coolant, 14 intake air.
+//! 3 rear O2, 4 battery, 8 EVAP pressure, 10 throttle, 11 coolant, 12 a
+//! wheel-speed signal line, 14 intake air. [`Fault`]s override them.
 
 /// What the user controls.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,6 +28,132 @@ pub struct Controls {
     pub idle_rpm: f64,
     /// Fixed engine speed, overriding the model (0 = model).
     pub rpm_override: f64,
+    /// The ECU's battery supply (KL30). Off wipes its memory, fault codes
+    /// included; the ignition only switches the engine and the K-line.
+    pub battery_connected: bool,
+    /// Injected faults (wiring faults on sensors).
+    pub faults: std::collections::BTreeSet<Fault>,
+    /// Stop the engine with the key left on (`SET engine stop`); taken by the
+    /// next model step.
+    pub stop_request: bool,
+}
+
+/// A wiring fault the ECU can detect. The codes are what the
+/// non-immobiliser GK 2.0 dump stores for each (emulator-derived, read with
+/// `18 00 00 00` after 30 s with the engine idling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fault {
+    MapShort,
+    MapOpen,
+    CoolantShort,
+    CoolantOpen,
+    ThrottleShort,
+    ThrottleOpen,
+    O2FrontOpen,
+    O2RearOpen,
+    EvapShort,
+    EvapOpen,
+    BatteryLow,
+    WheelSpeedCircuit,
+    CamMissing,
+}
+
+impl Fault {
+    pub const ALL: [Fault; 13] = [
+        Fault::MapShort,
+        Fault::MapOpen,
+        Fault::CoolantShort,
+        Fault::CoolantOpen,
+        Fault::ThrottleShort,
+        Fault::ThrottleOpen,
+        Fault::O2FrontOpen,
+        Fault::O2RearOpen,
+        Fault::EvapShort,
+        Fault::EvapOpen,
+        Fault::BatteryLow,
+        Fault::WheelSpeedCircuit,
+        Fault::CamMissing,
+    ];
+
+    /// Name used on the socket (`SET fault.NAME on`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Fault::MapShort => "map_short",
+            Fault::MapOpen => "map_open",
+            Fault::CoolantShort => "coolant_short",
+            Fault::CoolantOpen => "coolant_open",
+            Fault::ThrottleShort => "throttle_short",
+            Fault::ThrottleOpen => "throttle_open",
+            Fault::O2FrontOpen => "o2_front_open",
+            Fault::O2RearOpen => "o2_rear_open",
+            Fault::EvapShort => "evap_short",
+            Fault::EvapOpen => "evap_open",
+            Fault::BatteryLow => "battery_low",
+            Fault::WheelSpeedCircuit => "wheel_speed_circuit",
+            Fault::CamMissing => "cam_missing",
+        }
+    }
+
+    pub fn from_name(n: &str) -> Option<Fault> {
+        Fault::ALL.into_iter().find(|f| f.name() == n)
+    }
+
+    /// What is wrong, for people.
+    pub fn label(self) -> &'static str {
+        match self {
+            Fault::MapShort => "MAP sensor shorted to ground",
+            Fault::MapOpen => "MAP sensor open circuit",
+            Fault::CoolantShort => "Coolant sensor shorted",
+            Fault::CoolantOpen => "Coolant sensor open circuit",
+            Fault::ThrottleShort => "Throttle sensor shorted",
+            Fault::ThrottleOpen => "Throttle sensor open circuit",
+            Fault::O2FrontOpen => "Front O2 sensor open circuit",
+            Fault::O2RearOpen => "Rear O2 sensor open circuit",
+            Fault::EvapShort => "EVAP pressure sensor shorted",
+            Fault::EvapOpen => "EVAP pressure sensor open circuit",
+            Fault::BatteryLow => "Battery sense line at 0 V",
+            Fault::WheelSpeedCircuit => "Wheel speed signal line (ADC 12) open",
+            Fault::CamMissing => "Cam sensor signal missing",
+        }
+    }
+
+    /// The code the ECU stores for it (emulator-derived).
+    pub fn code(self) -> &'static str {
+        match self {
+            Fault::MapShort => "P0107",
+            Fault::MapOpen => "P0108",
+            Fault::CoolantShort => "P0117",
+            Fault::CoolantOpen => "P0118",
+            Fault::ThrottleShort => "P0122",
+            Fault::ThrottleOpen => "P0123",
+            Fault::O2FrontOpen => "P0132",
+            Fault::O2RearOpen => "P0138",
+            Fault::EvapShort => "P0452",
+            Fault::EvapOpen => "P0453",
+            Fault::BatteryLow => "P0560",
+            Fault::WheelSpeedCircuit => "P1502",
+            Fault::CamMissing => "P0340",
+        }
+    }
+
+    /// The ADC override (channel, value) for a wiring fault on a sensor.
+    pub fn adc(self) -> Option<(usize, u16)> {
+        Some(match self {
+            Fault::MapShort => (0, 0),
+            Fault::MapOpen => (0, 0x3FF),
+            Fault::CoolantShort => (11, 0),
+            Fault::CoolantOpen => (11, 0x3FF),
+            Fault::ThrottleShort => (10, 0),
+            Fault::ThrottleOpen => (10, 0x3FF),
+            Fault::O2FrontOpen => (2, 0x3FF),
+            Fault::O2RearOpen => (3, 0x3FF),
+            Fault::EvapShort => (8, 0),
+            Fault::EvapOpen => (8, 0x3FF),
+            Fault::BatteryLow => (4, 0),
+            Fault::WheelSpeedCircuit => (12, 0x3FF),
+            Fault::CamMissing => return None,
+        })
+    }
 }
 
 impl Default for Controls {
@@ -41,6 +168,9 @@ impl Default for Controls {
             vehicle_kmh: 0.0,
             idle_rpm: 800.0,
             rpm_override: 0.0,
+            battery_connected: true,
+            faults: Default::default(),
+            stop_request: false,
         }
     }
 }
@@ -71,6 +201,20 @@ impl Controls {
             "speed" => self.vehicle_kmh = num(0.0, 250.0)?,
             "idle" => self.idle_rpm = num(500.0, 2000.0)?,
             "rpm" => self.rpm_override = num(0.0, 7000.0)?,
+            "battery_connected" => self.battery_connected = on()?,
+            "engine" if value == "stop" => self.stop_request = true,
+            "engine" => return Err(format!("engine: only `stop`, got {value:?}")),
+            n if n.starts_with("fault.") => {
+                let f = Fault::from_name(&n[6..]).ok_or_else(|| {
+                    let all: Vec<&str> = Fault::ALL.iter().map(|f| f.name()).collect();
+                    format!("unknown fault {:?} ({})", &n[6..], all.join(", "))
+                })?;
+                if on()? {
+                    self.faults.insert(f);
+                } else {
+                    self.faults.remove(&f);
+                }
+            }
             n => return Err(format!("unknown control {n:?}")),
         }
         Ok(())
@@ -135,6 +279,11 @@ impl Plant {
     /// Advance by `dt` seconds.
     pub fn step(&mut self, c: &Controls, dt: f64) {
         self.t += dt;
+        if c.stop_request && !c.starter {
+            // stalled with the key on: it stays off until cranked again
+            self.engine = Engine::Off;
+            self.cranked_s = 0.0;
+        }
         self.engine = match (self.engine, c.ignition, c.starter) {
             (_, false, _) => Engine::Off,
             (Engine::Running, true, _) => Engine::Running,
@@ -200,7 +349,19 @@ impl Plant {
             (10, adc_throttle(throttle_deg)),
             (11, adc_ntc(c.coolant_c)),
             (14, adc_ntc(c.intake_c)),
+            // EVAP pressure and the wheel-speed signal line: mid-scale is
+            // within range for the ECU (nothing else known about them)
+            (8, 0x200),
+            (12, 0x200),
         ];
+        let mut adc = adc;
+        for f in &c.faults {
+            if let Some((ch, v)) = f.adc()
+                && let Some(slot) = adc.iter_mut().find(|(c, _)| *c == ch)
+            {
+                slot.1 = v;
+            }
+        }
         Sensors {
             battery_v,
             map_kpa,
@@ -310,6 +471,44 @@ mod tests {
             p.step(&c, 0.1);
         }
         assert_eq!((p.engine, p.rpm), (Engine::Off, 0.0));
+    }
+
+    #[test]
+    fn faults_override_their_sensor() {
+        let mut c = Controls::default();
+        c.set("fault.coolant_open", "on").unwrap();
+        let s = Plant::default().sensors(&c);
+        assert!(s.adc.contains(&(11, 0x3FF)));
+        c.set("fault.coolant_open", "off").unwrap();
+        assert!(!Plant::default().sensors(&c).adc.contains(&(11, 0x3FF)));
+        assert!(c.set("fault.nonsense", "on").is_err());
+        for f in Fault::ALL {
+            assert_eq!(Fault::from_name(f.name()), Some(f));
+        }
+    }
+
+    #[test]
+    fn engine_stops_with_the_key_on() {
+        let mut p = Plant::default();
+        let mut c = Controls {
+            ignition: true,
+            starter: true,
+            ..Default::default()
+        };
+        for _ in 0..10 {
+            p.step(&c, 0.1);
+        }
+        c.starter = false;
+        p.step(&c, 0.1);
+        assert_eq!(p.engine, Engine::Running);
+        c.set("engine", "stop").unwrap();
+        p.step(&c, 0.1);
+        c.stop_request = false;
+        for _ in 0..30 {
+            p.step(&c, 0.1);
+        }
+        assert_eq!((p.engine, p.rpm), (Engine::Off, 0.0));
+        assert!(c.ignition, "key still on");
     }
 
     #[test]

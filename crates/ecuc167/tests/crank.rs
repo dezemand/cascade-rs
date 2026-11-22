@@ -27,7 +27,11 @@ fn engine_speed_tracks_the_crank_without_dropouts() {
         return;
     };
     let mut c = Cpu::new(rom, FCPU);
-    let mut crank = Wheel::new(vec![Pin::Cc { unit: 0, ch: 15 }, Pin::T7In, Pin::CapIn], 60, 2);
+    let mut crank = Wheel::new(
+        vec![Pin::Cc { unit: 0, ch: 15 }, Pin::T7In, Pin::CapIn],
+        60,
+        2,
+    );
     crank.cam = Some(Cam {
         targets: vec![Pin::Cc { unit: 0, ch: 14 }],
         fall: 30,
@@ -44,7 +48,10 @@ fn engine_speed_tracks_the_crank_without_dropouts() {
             t += 50;
             run_to(&mut c, t);
             let got = c.peek16(ENGINE_SPEED) as f64;
-            assert!((got - rpm).abs() <= rpm * 0.01 + 2.0, "{rpm} rpm: ECU says {got} at {t} ms");
+            assert!(
+                (got - rpm).abs() <= rpm * 0.01 + 2.0,
+                "{rpm} rpm: ECU says {got} at {t} ms"
+            );
         }
     }
     c.wheels[0].rpm = 0.0;

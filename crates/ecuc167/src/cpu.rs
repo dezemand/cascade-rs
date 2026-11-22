@@ -157,6 +157,8 @@ pub struct Cpu {
     // SSC
     ssc_done: Option<(u64, u8)>,
     pub ssc_log: Vec<(u64, u8)>,
+    /// (cycle, P6 latch, SSCCON, word) per SSC transmit, when enabled.
+    pub ssc_trace: Option<Vec<(u64, u16, u16, u16)>>,
     /// Reads of flash-mapped addresses that look like stores (ignored).
     pub flash_writes: u64,
     pub trace: bool,
@@ -307,6 +309,7 @@ impl Cpu {
             echo: true,
             ssc_done: None,
             ssc_log: Vec::new(),
+            ssc_trace: None,
             flash_writes: 0,
             trace: false,
             prof: None,
@@ -453,6 +456,11 @@ impl Cpu {
                 // Loopback-free dumb slave: answers 0xFF (no EEPROM fitted
                 // in the model) after 8 bit times at the SSC rate.
                 self.ssc_log.push((self.cycles, v as u8));
+                let p6 = self.peek16(0xFFCC);
+                let con = self.peek16(0xFFB2);
+                if let Some(t) = &mut self.ssc_trace {
+                    t.push((self.cycles, p6, con, v));
+                }
                 self.ssc_done = Some((self.cycles + 200, 0xFF));
             }
             _ => {}

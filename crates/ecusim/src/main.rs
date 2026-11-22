@@ -9,7 +9,11 @@
 //!
 //! Controls: ignition on|off, starter on|off, throttle 0-100 (%), coolant and
 //! intake (°C), battery (V, engine off), speed (km/h), idle (rpm), rpm (fixed
-//! engine speed; 0 = engine model). The socket defaults to `$TMPDIR/ecusim.sock`.
+//! engine speed; 0 = engine model), battery_connected on|off (off wipes the
+//! ECU's memory), fault.NAME on|off (wiring faults: map_short, map_open,
+//! coolant_short, coolant_open, throttle_short, throttle_open, o2_front_open,
+//! o2_rear_open, evap_short, evap_open, battery_low, wheel_speed_circuit,
+//! cam_missing). The socket defaults to `$TMPDIR/ecusim.sock`.
 //! Testers connect to the same socket: the Hi-Scan GUI's line option "ECU
 //! process", `kdiag --ecusim`.
 

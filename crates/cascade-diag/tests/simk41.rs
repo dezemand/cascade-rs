@@ -127,3 +127,38 @@ fn j2534_link_against_simk41() {
     assert_eq!(c.read_dtcs().expect("18 00 00 00"), vec![]);
     c.stop().expect("82");
 }
+
+/// The ECU sets a fault code by itself and clears it on `14 FF 00`. Needs a
+/// dump without immobiliser: CASCADE_ECU_ROM_NOIMMO.
+#[test]
+fn ecu_sets_and_clears_a_fault_code() {
+    let Ok(p) = std::env::var("CASCADE_ECU_ROM_NOIMMO") else {
+        eprintln!("CASCADE_ECU_ROM_NOIMMO not set; skipping");
+        return;
+    };
+    let mut ecu = Simk41::new(std::fs::read(p).expect("read ECU ROM"), 16_000_000);
+    // plausible temperatures and battery, then the coolant sensor open
+    ecu.set_adc(4, 0x22B);
+    ecu.set_adc(14, 0x2F0);
+    ecu.set_adc(11, 0x3FF);
+    let mut c = Client::new(SimLine::new(ecu));
+    c.start().expect("StartCommunication");
+    assert_eq!(
+        c.read_dtcs().expect("18 00 00 00"),
+        vec![],
+        "not yet detected"
+    );
+    // let the ECU see the fault for a while (the session times out meanwhile)
+    cascade_diag::line::Line::idle(&mut c.line, std::time::Duration::from_secs(15));
+    c.start().expect("StartCommunication again");
+    let codes = c.read_dtcs().expect("18 00 00 00");
+    assert!(
+        codes.iter().any(|&(code, _)| code == 0x0118),
+        "P0118 (coolant sensor high) expected, got {codes:04X?}"
+    );
+    // repaired, then cleared
+    c.line.ecu.set_adc(11, 0x103);
+    c.allow_clear = true;
+    c.clear_dtcs(0xff00).expect("14 FF 00");
+    assert_eq!(c.read_dtcs().expect("18 00 00 00"), vec![], "cleared");
+}

@@ -26,9 +26,16 @@
 //! - `--cam PINS:FALL:RISE` a cam level locked to the last wheel: low from
 //!   crank tooth position FALL to RISE over 720 degrees (0..2 x teeth)
 //! - `--compares` print every CAPCOM compare match
+//! - `--ram-in FILE@ADDR` / `--ram-out FILE@ADDR:LEN` load memory before
+//!   reset / save it at the end (keep-alive RAM across power cycles)
+//! - `--watch-from MS` start the `--watch` log at that time (the printed log
+//!   is limited to 200,000 entries)
+//! - `--ssc-trace` print every SSC byte sent, with the P6 latch (chip selects)
 //! - `--p2-in HEX` levels of undriven P2 input pins (default 0)
 //! - `--no-compare-on-write` compare matches only on timer counts, not when
 //!   software writes a CAPCOM timer
+//! - `--adc-at MS:CH=VAL` set an ADC input from that time on (later entries
+//!   for the same channel win once their time is reached)
 //! - `--rpm-at MS=RPM` change the first wheel's speed at that time
 //! - `--trace-from MS --trace-n N` instruction trace, `--prof` hot spots,
 //!   `--watch LO-HI` log accesses to a physical address range (`--watch-w`:
@@ -254,6 +261,11 @@ struct RunOpts {
     rpm_at: Vec<(f64, f64)>,
     p2_in: Option<u16>,
     cmp_wr: bool,
+    ssc_trace: bool,
+    watch_from: f64,
+    adc_at: Vec<(f64, usize, u16)>,
+    ram_in: Vec<(String, u32)>,
+    ram_out: Vec<(String, u32, u32)>,
     echo: bool,
     trace_from: Option<f64>,
     trace_n: u64,
@@ -284,6 +296,11 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
         rpm_at: Vec::new(),
         p2_in: None,
         cmp_wr: true,
+        ssc_trace: false,
+        watch_from: 0.0,
+        adc_at: Vec::new(),
+        ram_in: Vec::new(),
+        ram_out: Vec::new(),
         echo: true,
         trace_from: None,
         trace_n: 2000,
@@ -335,6 +352,37 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
                 o.watch.push((hexnum(l)?, hexnum(h)?));
             }
             "--compares" => o.compares = true,
+            "--watch-from" => {
+                o.watch_from = v()?
+                    .parse::<f64>()
+                    .map_err(|e| format!("--watch-from: {e}"))?
+            }
+            "--adc-at" => {
+                // MS:CH=VAL: change an ADC input at that time
+                let a = v()?;
+                let (t, r) = a.split_once(':').ok_or("--adc-at MS:CH=VAL")?;
+                let (ch, val) = r.split_once('=').ok_or("--adc-at MS:CH=VAL")?;
+                o.adc_at.push((
+                    t.parse::<f64>().map_err(|e| format!("--adc-at {t}: {e}"))?,
+                    ch.parse::<usize>()
+                        .map_err(|e| format!("--adc-at {ch}: {e}"))?,
+                    hexnum(val)? as u16,
+                ));
+            }
+            "--ram-in" => {
+                // FILE@ADDR: load memory before reset (keep-alive RAM)
+                let a = v()?;
+                let (f, addr) = a.split_once('@').ok_or("--ram-in FILE@ADDR")?;
+                o.ram_in.push((f.to_string(), hexnum(addr)?));
+            }
+            "--ram-out" => {
+                // FILE@ADDR:LEN: save memory at the end
+                let a = v()?;
+                let (f, r) = a.split_once('@').ok_or("--ram-out FILE@ADDR:LEN")?;
+                let (addr, len) = r.split_once(':').ok_or("--ram-out FILE@ADDR:LEN")?;
+                o.ram_out.push((f.to_string(), hexnum(addr)?, hexnum(len)?));
+            }
+            "--ssc-trace" => o.ssc_trace = true,
             "--no-compare-on-write" => o.cmp_wr = false,
             "--p2-in" => o.p2_in = Some(hexnum(&v()?)? as u16),
             "--rpm-at" => {
@@ -418,10 +466,21 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
     c.wheels = o.wheels.clone();
     c.log_compares = o.compares;
     c.compare_on_write = o.cmp_wr;
+    for (f, a) in &o.ram_in {
+        let data = std::fs::read(f).map_err(|e| format!("{f}: {e}"))?;
+        c.mem[*a as usize..*a as usize + data.len()].copy_from_slice(&data);
+    }
+    if o.ssc_trace {
+        c.ssc_trace = Some(Vec::new());
+    }
     if let Some(p) = o.p2_in {
         c.p2_in = p;
     }
-    c.watch = o.watch.clone();
+    c.watch = if o.watch_from > 0.0 {
+        Vec::new()
+    } else {
+        o.watch.clone()
+    };
     c.watch_writes_only = o.watch_w;
     if o.prof {
         c.prof = Some(Default::default());
@@ -479,6 +538,14 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
             && t >= 0.0
         {
             w.rpm = r;
+        }
+        if o.watch_from > 0.0 && c.watch.is_empty() && ms(c.cycles) >= o.watch_from {
+            c.watch = o.watch.clone();
+        }
+        for &(t, ch, val) in &o.adc_at {
+            if ms(c.cycles) >= t {
+                c.adc[ch & 15] = val;
+            }
         }
         if let Err(e) = c.step() {
             stop = Some(e);
@@ -595,6 +662,15 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
         c.flash_writes,
         c.ssc_log.len()
     );
+    for (f, a, n) in &o.ram_out {
+        std::fs::write(f, &c.mem[*a as usize..(*a + *n) as usize])
+            .map_err(|e| format!("{f}: {e}"))?;
+    }
+    if let Some(t) = &c.ssc_trace {
+        for (at, p6, con, w) in t {
+            println!("{:9.3} ms  SSC P6={p6:04X} CON={con:04X} {w:04X}", ms(*at));
+        }
+    }
     for (i, w) in c.wheels.iter().enumerate() {
         println!(
             "           wheel {i}: {} edges, {} rpm at the end",
@@ -608,7 +684,7 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
             println!("{n:10}  {}", line(&c, **pc).1);
         }
     }
-    for (t, pc, a, v, w) in c.watch_log.iter().take(5000) {
+    for (t, pc, a, v, w) in c.watch_log.iter().take(200_000) {
         println!(
             "{:9.3} ms  {pc:06X}  {} {a:06X} = {v:04X}",
             ms(*t),
