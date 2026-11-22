@@ -273,5 +273,8 @@ licence. Changes relative to the original are listed in
 
 Thanks to the CASCADE forks that carried it forward, to
 [GKFlasher / gkbus](https://github.com/Dante383/GKFlasher) for its ISO 14230
-implementation notes, and to the [OpenGK](https://opengk.org) project for
+implementation notes and for what it learned about real K-line adapters,
+which kdiag's fast init follows (what cables return after the wake-up,
+retrying it 2 ms longer or shorter, a 60 ms P3, resetting the cable with
+DTR/RTS, USB latency), and to the [OpenGK](https://opengk.org) project for
 documenting the GK platform.
