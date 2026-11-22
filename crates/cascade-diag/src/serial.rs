@@ -68,7 +68,25 @@ impl SerialLine {
             .timeout(Duration::from_millis(100))
             .open_native()
             .map_err(io::Error::from)?;
-        Ok(Self::from_port(port, echo))
+        let mut line = Self::from_port(port, echo);
+        line.kkl_mode();
+        Ok(line)
+    }
+
+    /// Reset the adapter and put it in K-line (KKL) mode: DTR on and off,
+    /// then DTR and RTS low, 100 ms each. Some knock-off adapters do no
+    /// fast init without it (as found by gkbus). Ports without modem
+    /// lines (pseudo-terminals) are left alone.
+    fn kkl_mode(&mut self) {
+        let pause = || std::thread::sleep(Duration::from_millis(100));
+        if self.port.write_data_terminal_ready(true).is_err() {
+            return;
+        }
+        pause();
+        let _ = self.port.write_data_terminal_ready(false);
+        pause();
+        let _ = self.port.write_request_to_send(false);
+        pause();
     }
 
     pub fn from_port(port: TTYPort, echo: bool) -> Self {
@@ -188,6 +206,11 @@ impl Line for SerialLine {
         }
         // a break can leave 00 bytes in the receive buffer
         self.port.clear(ClearBuffer::Input).map_err(io::Error::from)
+    }
+
+    fn write_unchecked(&mut self, data: &[u8]) -> io::Result<()> {
+        self.port.write_all(data)?;
+        drain(&mut self.port, self.baud, data.len())
     }
 
     fn write(&mut self, data: &[u8]) -> io::Result<()> {

@@ -33,7 +33,9 @@ impl Default for Timing {
             p2_max: Duration::from_millis(50),
             p2_ext: Duration::from_millis(5000),
             p1_max: Duration::from_millis(20),
-            p3_min: Duration::from_millis(55),
+            // ISO 14230 says 55; the SIMK43 drops requests that come
+            // 55 ms after its answer at fast baud rates (gkbus), so 60
+            p3_min: Duration::from_millis(60),
             wake_low: Duration::from_millis(25),
             wake_high: Duration::from_millis(25),
         }
@@ -112,6 +114,101 @@ pub trait Link {
     fn flush_input(&mut self) -> Result<(), Error>;
 }
 
+/// Extra time on top of P1/P2 when reading through a serial adapter: USB
+/// serial chips hold received bytes back (an FTDI's latency timer is 16 ms
+/// by default), so bytes the ECU sent in time can reach us late.
+pub const ADAPTER_SLACK: Duration = Duration::from_millis(40);
+
+/// How long fast init listens for the StartCommunication answer.
+pub const FAST_INIT_LISTEN: Duration = Duration::from_millis(400);
+
+/// Wake-up low/high time changes tried in turn when no answer is found
+/// (cheap adapters' BREAK timing is not exact; values from gkbus).
+pub const FAST_INIT_OFFSETS_MS: [i64; 3] = [0, 2, -2];
+
+/// The ECU's StartCommunication answer somewhere in `heard`: adapters may
+/// put a 00 (from the BREAK) and the request's echo before it, or none of
+/// them, or lose bytes.
+fn find_start_answer(heard: &[u8], tester: u8, ecu: u8) -> Option<Vec<u8>> {
+    (0..heard.len()).find_map(|off| {
+        let s = &heard[off..];
+        let n = iso14230::expected_len(s)?;
+        let f = iso14230::parse(s.get(..n)?)?;
+        (f.target == tester && f.source == ecu && f.data.first() == Some(&0xc1))
+            .then(|| s[..n].to_vec())
+    })
+}
+
+fn shifted(d: Duration, ms: i64) -> Duration {
+    if ms >= 0 {
+        d + Duration::from_millis(ms as u64)
+    } else {
+        d.saturating_sub(Duration::from_millis((-ms) as u64))
+    }
+}
+
+/// Fast init on a byte-level line, tolerant of adapters: see
+/// [`Link::fast_init`] for `impl Link for Line`.
+fn line_fast_init<L: Line>(
+    l: &mut L,
+    start_frame: &[u8],
+    timing: &Timing,
+) -> Result<Vec<u8>, Error> {
+    let req = iso14230::parse(start_frame).ok_or_else(|| Error::BadFrame(start_frame.to_vec()))?;
+    let (tester, ecu) = (req.source, req.target);
+    l.set_baud(10_400)?;
+    let mut last = Vec::new();
+    for offset in FAST_INIT_OFFSETS_MS {
+        // the bus must be idle (high) before the wake-up pattern
+        Line::idle(l, Duration::from_millis(300));
+        Line::flush_input(l)?;
+        l.wake_up(
+            shifted(timing.wake_low, offset),
+            shifted(timing.wake_high, offset),
+        )?;
+        l.write_unchecked(start_frame)?;
+        let deadline = l.elapsed() + FAST_INIT_LISTEN;
+        let mut heard = Vec::new();
+        while let Some(left) = deadline.checked_sub(l.elapsed()).filter(|d| !d.is_zero()) {
+            let Some(b) = l.read_byte(left)? else {
+                break;
+            };
+            heard.push(b);
+            if let Some(f) = find_start_answer(&heard, tester, ecu) {
+                return Ok(f);
+            }
+        }
+        if !heard.is_empty() {
+            last = heard;
+        }
+    }
+    if last.is_empty() {
+        return Err(Error::Timeout(last));
+    }
+    // Something answered, but not a readable StartCommunication answer
+    // (some adapters mangle it). Whether the session is up, the next
+    // request tells: TesterPresent, as the client would send it.
+    let mut probe = if start_frame[0] == 0x80 {
+        vec![0x80, ecu, tester, 2, 0x3e, 0x01]
+    } else {
+        vec![0x82, ecu, tester, 0x3e, 0x01]
+    };
+    probe.push(iso14230::checksum(&probe));
+    Line::idle(l, timing.p3_min);
+    Line::flush_input(l)?;
+    l.write(&probe)?;
+    let r = Link::recv(l, timing.p2_max, timing.p1_max)?;
+    match iso14230::parse(&r) {
+        Some(f) if f.target == tester && f.source == ecu && f.data.first() == Some(&0x7e) => {
+            // the session is up; the key bytes were lost (reported as 00 00)
+            let mut ok = vec![0x83, tester, ecu, 0xc1, 0x00, 0x00];
+            ok.push(iso14230::checksum(&ok));
+            Ok(ok)
+        }
+        _ => Err(Error::BadFrame(last)),
+    }
+}
+
 impl<L: Line> Link for L {
     fn elapsed(&self) -> Duration {
         Line::elapsed(self)
@@ -121,14 +218,13 @@ impl<L: Line> Link for L {
         Line::idle(self, d)
     }
 
+    /// Wake-up, StartCommunication, then listen up to 400 ms and pick the
+    /// ECU's answer out of whatever the adapter delivers (a 00 from the
+    /// BREAK, the echo, or neither). Without an answer the wake-up is tried
+    /// again 2 ms longer, then 2 ms shorter. If only unreadable bytes come
+    /// back, a TesterPresent decides whether the session is up.
     fn fast_init(&mut self, start_frame: &[u8], timing: &Timing) -> Result<Vec<u8>, Error> {
-        self.set_baud(10_400)?;
-        // the bus must be idle (high) before the wake-up pattern
-        Line::idle(self, Duration::from_millis(300));
-        Line::flush_input(self)?;
-        self.wake_up(timing.wake_low, timing.wake_high)?;
-        self.write(start_frame)?;
-        Link::recv(self, timing.p2_max, timing.p1_max)
+        line_fast_init(self, start_frame, timing)
     }
 
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
@@ -137,7 +233,8 @@ impl<L: Line> Link for L {
 
     fn recv(&mut self, first: Duration, p1: Duration) -> Result<Vec<u8>, Error> {
         let mut frame = Vec::new();
-        let mut timeout = first;
+        let mut timeout = first + ADAPTER_SLACK;
+        let p1 = p1 + ADAPTER_SLACK;
         loop {
             match self.read_byte(timeout)? {
                 Some(b) => frame.push(b),
@@ -382,6 +479,147 @@ mod tests {
         assert_eq!(dtc_name(d[0].0), "P0301");
         assert_eq!(c.read_local(0x01).unwrap(), vec![7; 80]); // long frame
         c.stop().unwrap();
+    }
+
+    /// What a cheap K-line adapter does around a fast init.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Quirk {
+        /// a 00 from the BREAK, then the request's echo, then the answer
+        ZeroAndEcho,
+        /// the first `n` bytes after the first wake-up are lost
+        LoseFirst(usize),
+        /// the StartCommunication answer arrives with a bad checksum
+        Mangled,
+        /// the ECU only wakes for a low phase of 27 ms or more
+        WantsLongerLow,
+    }
+
+    struct Adapter {
+        inner: SimLine<KwpEcu>,
+        quirk: Quirk,
+        injected: std::collections::VecDeque<u8>,
+        drop: usize,
+        mangle: bool,
+        asleep: bool,
+        wakes: Vec<Duration>,
+    }
+
+    impl Adapter {
+        fn new(quirk: Quirk) -> Self {
+            Self {
+                inner: SimLine::new(KwpEcu::new(KwpConfig::default())),
+                quirk,
+                injected: Default::default(),
+                drop: 0,
+                mangle: false,
+                asleep: false,
+                wakes: Vec::new(),
+            }
+        }
+    }
+
+    impl Line for Adapter {
+        fn elapsed(&self) -> Duration {
+            Line::elapsed(&self.inner)
+        }
+        fn set_baud(&mut self, baud: u32) -> io::Result<()> {
+            self.inner.set_baud(baud)
+        }
+        fn wake_up(&mut self, low: Duration, high: Duration) -> io::Result<()> {
+            self.wakes.push(low);
+            self.asleep = self.quirk == Quirk::WantsLongerLow && low < Duration::from_millis(27);
+            if self.asleep {
+                Line::idle(&mut self.inner, low + high);
+                return Ok(());
+            }
+            match self.quirk {
+                Quirk::LoseFirst(n) if self.wakes.len() == 1 => self.drop = n,
+                Quirk::Mangled => self.mangle = true,
+                _ => {}
+            }
+            self.inner.wake_up(low, high)
+        }
+        fn write(&mut self, data: &[u8]) -> io::Result<()> {
+            self.inner.write(data)
+        }
+        fn write_unchecked(&mut self, data: &[u8]) -> io::Result<()> {
+            if self.asleep {
+                return Ok(());
+            }
+            if self.quirk == Quirk::ZeroAndEcho {
+                self.injected.push_back(0x00);
+                self.injected.extend(data);
+            }
+            self.inner.write(data)
+        }
+        fn read_byte(&mut self, timeout: Duration) -> io::Result<Option<u8>> {
+            if let Some(b) = self.injected.pop_front() {
+                return Ok(Some(b));
+            }
+            loop {
+                let Some(mut b) = self.inner.read_byte(timeout)? else {
+                    return Ok(None);
+                };
+                if self.drop > 0 {
+                    self.drop -= 1;
+                    continue;
+                }
+                if self.mangle {
+                    // corrupt the first answer's key byte
+                    if b == 0xef {
+                        b = 0x55;
+                        self.mangle = false;
+                    }
+                }
+                return Ok(Some(b));
+            }
+        }
+        fn flush_input(&mut self) -> io::Result<()> {
+            self.injected.clear();
+            Line::flush_input(&mut self.inner)
+        }
+        fn idle(&mut self, d: Duration) {
+            Line::idle(&mut self.inner, d)
+        }
+    }
+
+    #[test]
+    fn fast_init_survives_adapter_quirks() {
+        // 00 and echo before the answer (genuine FTDI)
+        let mut c = Client::new(Adapter::new(Quirk::ZeroAndEcho));
+        assert_eq!(c.start().unwrap(), [0xef, 0x8f]);
+        c.tester_present().unwrap();
+        assert_eq!(c.line.wakes.len(), 1);
+
+        // the answer's first byte lost on the first try: wake-up again
+        let mut c = Client::new(Adapter::new(Quirk::LoseFirst(1)));
+        assert_eq!(c.start().unwrap(), [0xef, 0x8f]);
+        assert_eq!(c.line.wakes.len(), 2);
+        c.tester_present().unwrap();
+
+        // unreadable answer: TesterPresent shows the session is up
+        let mut c = Client::new(Adapter::new(Quirk::Mangled));
+        assert_eq!(c.start().unwrap(), [0x00, 0x00]);
+        c.tester_present().unwrap();
+
+        // retried 2 ms longer
+        let mut c = Client::new(Adapter::new(Quirk::WantsLongerLow));
+        assert_eq!(c.start().unwrap(), [0xef, 0x8f]);
+        assert_eq!(
+            c.line.wakes,
+            [Duration::from_millis(25), Duration::from_millis(27)]
+        );
+    }
+
+    #[test]
+    fn fast_init_gives_up_when_nothing_answers() {
+        // the request goes to 0x11: nobody answers
+        let cfg = KwpConfig {
+            address: 0x28,
+            ..Default::default()
+        };
+        let mut c = Client::new(SimLine::new(KwpEcu::new(cfg)));
+        assert!(matches!(c.start(), Err(Error::Timeout(_))));
     }
 
     #[test]

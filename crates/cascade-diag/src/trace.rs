@@ -54,6 +54,11 @@ impl<L: Line, W: Write> Line for TracedLine<L, W> {
         self.inner.write(data)
     }
 
+    fn write_unchecked(&mut self, data: &[u8]) -> io::Result<()> {
+        self.event(&format!("\"ev\":\"tx\",\"data\":\"{}\"", hex(data)));
+        self.inner.write_unchecked(data)
+    }
+
     fn read_byte(&mut self, timeout: Duration) -> io::Result<Option<u8>> {
         let r = self.inner.read_byte(timeout)?;
         match r {
@@ -87,6 +92,9 @@ impl<T: Line + ?Sized> Line for Box<T> {
     }
     fn five_baud(&mut self, addr: u8) -> io::Result<()> {
         (**self).five_baud(addr)
+    }
+    fn write_unchecked(&mut self, data: &[u8]) -> io::Result<()> {
+        (**self).write_unchecked(data)
     }
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         (**self).write(data)

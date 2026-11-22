@@ -30,6 +30,13 @@ pub trait Line {
     /// implementation consumes that echo before returning.
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
 
+    /// Send bytes without checking the echo: whatever the adapter hears
+    /// stays in the input. For the fast-init request, after which adapters
+    /// differ (a 00 from the BREAK, no echo, lost bytes).
+    fn write_unchecked(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write(data)
+    }
+
     /// Next received byte, or `None` after `timeout` without one.
     fn read_byte(&mut self, timeout: Duration) -> io::Result<Option<u8>>;
 
