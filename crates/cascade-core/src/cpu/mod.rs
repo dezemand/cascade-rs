@@ -299,6 +299,11 @@ impl Cpu {
         self.exrom = Some(image);
     }
 
+    /// CPU clock in Hz.
+    pub fn clock(&self) -> u32 {
+        self.clock
+    }
+
     pub fn pc(&self) -> u16 {
         self.pc
     }

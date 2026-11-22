@@ -834,6 +834,7 @@ dependencies = [
  "cascade-diag",
  "cascade-iface",
  "cascade-runner",
+ "cascade-theme",
  "clap",
  "ecuc167",
  "ecusim",
@@ -857,6 +858,13 @@ version = "0.1.0"
 dependencies = [
  "cascade-core",
  "cascade-iface",
+]
+
+[[package]]
+name = "cascade-theme"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
 ]
 
 [[package]]
@@ -1522,6 +1530,7 @@ dependencies = [
 name = "ecusim-gui"
 version = "0.1.0"
 dependencies = [
+ "cascade-theme",
  "clap",
  "ecusim",
  "gpui-kit",

@@ -19,6 +19,7 @@ cascade-iface = { path = "crates/cascade-iface" }
 cascade-diag = { path = "crates/cascade-diag" }
 cascade-runner = { path = "crates/cascade-runner" }
 clap = { version = "4.6", features = ["derive"] }
+cascade-theme = { path = "crates/cascade-theme" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

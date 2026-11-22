@@ -21,6 +21,7 @@ cascade-diag.workspace = true
 ecuc167 = { path = "../ecuc167" }
 ecusim = { path = "../ecusim" }
 gpui-kit = "0.10.0"
+cascade-theme.workspace = true
 
 [lints]
 workspace = true
