@@ -33,6 +33,16 @@
 //! --j2534-mock (any OS) runs the same message-level path against --sim or
 //! --sim-ecu. `kdiag j2534-list` shows installed drivers (Windows).
 //!
+//! CAN (OBD-II on ISO 15765-4 cars; the Tiburon GK itself has no CAN
+//! diagnostics): --can IFACE uses a Linux SocketCAN interface (`can0`,
+//! `vcan0`; bring it up first with `ip link`), --can sim an in-memory bus
+//! with a simulated OBD-II ECU (any OS). dtc, ident, log, clear and elm then
+//! use OBD-II modes 03/07, 09, 01 and 04. --can-ids TX:RX (default 7E0:7E8;
+//! 7DF:7E8 for a functional request), --can-pad XX|none (default AA).
+//!   kdiag can-ecu --can IFACE [--sim | --port DEV | --ecusim auto]
+//!              answer on CAN as an engine ECU: the simulated one, or a
+//!              K-line ECU behind the read-only guard (a CAN gateway)
+//!
 //! --ecusim SOCKET|auto talks to `ecusim serve` (the ECU dump running in
 //! real time as its own process; `auto` = its default socket), in wall time.
 //! --sim-ecu ROM runs the engine ECU's own code instead (a SIMK41 dump, in the
@@ -109,9 +119,20 @@ struct Opts {
     ecusim: Option<String>,
     /// `elm`: where to serve ELM327 clients.
     listen: String,
+    /// SocketCAN interface, or `sim` (in-memory bus, simulated ECU).
+    can: Option<String>,
+    /// ISO-TP request and response identifiers.
+    can_ids: (u32, u32),
+    can_pad: Option<u8>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
+    parse_opts(args, false)
+}
+
+/// `can_ecu`: --can is the bus to answer on, and the other source (if any)
+/// is the K-line ECU behind it.
+fn parse_opts(args: &[String], can_ecu: bool) -> Result<Opts, String> {
     let mut o = Opts {
         sim: false,
         sim_ecu: None,
@@ -129,6 +150,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         yes: false,
         ecusim: None,
         listen: "127.0.0.1:35000".into(),
+        can: None,
+        can_ids: (
+            cascade_can::ecu::OBD_ENGINE_REQUEST,
+            cascade_can::ecu::OBD_ENGINE_RESPONSE,
+        ),
+        can_pad: Some(0xaa),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -143,6 +170,22 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--j2534-mock" => o.j2534_mock = true,
             "--ecusim" => o.ecusim = Some(val()?),
             "--listen" => o.listen = val()?,
+            "--can" => o.can = Some(val()?),
+            "--can-ids" => {
+                let v = val()?;
+                let (tx, rx) = v
+                    .split_once(':')
+                    .ok_or_else(|| format!("--can-ids {v:?}: want TX:RX, like 7E0:7E8"))?;
+                o.can_ids = (cascade_can::parse_id(tx)?, cascade_can::parse_id(rx)?);
+            }
+            "--can-pad" => {
+                let v = val()?;
+                o.can_pad = if v == "none" {
+                    None
+                } else {
+                    Some(u8::from_str_radix(&v, 16).map_err(|e| format!("--can-pad {v:?}: {e}"))?)
+                };
+            }
             "--sim-ecu" => {
                 o.sim_ecu = Some(val()?);
                 o.sim = true;
@@ -176,9 +219,29 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     }
     let sources =
         o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8 + o.ecusim.is_some() as u8;
+    if can_ecu {
+        return match &o.can {
+            None => Err("can-ecu needs --can IFACE (the bus to answer on)".into()),
+            Some(_) if sources > 1 => {
+                Err("can-ecu bridges at most one K-line source (--sim, --port or --ecusim)".into())
+            }
+            Some(_) => Ok(o),
+        };
+    }
+    if o.can.is_some() {
+        if sources != 0 || o.j2534_mock {
+            return Err("--can replaces --sim, --port, --ecusim and --j2534".into());
+        }
+        if o.system != System::Engine {
+            return Err(
+                "over CAN kdiag speaks OBD-II to the engine ECU only (--system engine)".into(),
+            );
+        }
+        return Ok(o);
+    }
     if sources != 1 {
         return Err(
-            "give exactly one of --sim, --port DEV, --ecusim SOCKET|auto or --j2534 DLL|auto"
+            "give exactly one of --sim, --port DEV, --ecusim SOCKET|auto, --j2534 DLL|auto or --can IFACE|sim"
                 .into(),
         );
     }
@@ -378,6 +441,11 @@ fn open_link(o: &Opts) -> Result<Box<dyn Link>, String> {
             None => l,
         })
     };
+    if let Some(iface) = &o.can {
+        return traced(Box::new(cascade_diag::can::CanLink::new(open_isotp(
+            o, iface,
+        )?)));
+    }
     if let Some(dll) = &o.j2534 {
         return traced(open_j2534(dll)?);
     }
@@ -553,6 +621,9 @@ fn selftest(_port: &str) -> Result<(), String> {
 
 /// Clear stored fault codes, the way the Hi-Scan's ERAS key does.
 fn clear(o: &Opts) -> Result<(), String> {
+    if o.can.is_some() {
+        return can_clear(o);
+    }
     let group = match o.system {
         System::Engine => 0xff00, // Hi-Scan sends 14 FF 00
         System::Abs => 0x4000,    // Hi-Scan sends 14 40 00
@@ -585,6 +656,9 @@ fn clear(o: &Opts) -> Result<(), String> {
 }
 
 fn dtc(o: &Opts) -> Result<(), String> {
+    if o.can.is_some() {
+        return can_dtc(o);
+    }
     if o.system == System::Tcs {
         return tcs_dtc(o);
     }
@@ -644,6 +718,9 @@ fn dtc(o: &Opts) -> Result<(), String> {
 
 /// ECU identification as the Hi-Scan asks for it.
 fn ident(o: &Opts) -> Result<(), String> {
+    if o.can.is_some() {
+        return can_ident(o);
+    }
     if o.system == System::Tcs {
         return Err("the Hi-Scan has no identification screen for traction control".into());
     }
@@ -695,6 +772,11 @@ fn ident(o: &Opts) -> Result<(), String> {
 /// SRS crash records (Hi-Scan "Crashing Information"): read-only, printed raw
 /// because the record layout is not known yet.
 fn crash(o: &Opts) -> Result<(), String> {
+    if o.can.is_some() {
+        return Err(
+            "crash records are read from the Tiburon's SRS on the K line, not over CAN".into(),
+        );
+    }
     if o.system != System::Srs {
         return Err("crash records are an SRS function: use --system srs".into());
     }
@@ -712,6 +794,9 @@ fn crash(o: &Opts) -> Result<(), String> {
 }
 
 fn log(o: &Opts) -> Result<(), String> {
+    if o.can.is_some() {
+        return can_log(o);
+    }
     if o.system == System::Tcs {
         return tcs_log(o);
     }
@@ -783,7 +868,11 @@ fn elm(o: &Opts) -> Result<(), String> {
     c.allow_clear = o.allow_clear;
     let sock = o.ecusim.clone();
     let battery = move || -> Option<f64> { ecusim_battery(sock.as_deref()?) };
-    cascade_diag::elm::serve(&mut c, &battery, &o.listen).map_err(|e| e.to_string())
+    let proto = match o.can {
+        Some(_) => cascade_diag::elm::Proto::Can { rx_id: o.can_ids.1 },
+        None => cascade_diag::elm::Proto::Kwp,
+    };
+    cascade_diag::elm::serve(&mut c, &battery, proto, &o.listen).map_err(|e| e.to_string())
 }
 
 /// Battery voltage from an ecusim server's status (for ATRV).
@@ -808,6 +897,226 @@ fn ecusim_battery(_sock: &str) -> Option<f64> {
     None
 }
 
+type Bus = Box<dyn cascade_can::CanBus + Send>;
+
+/// The CAN bus for `--can`: a SocketCAN interface, or with `sim` an
+/// in-memory bus with a simulated OBD-II engine ECU on it.
+fn open_bus(iface: &str) -> Result<Bus, String> {
+    if iface == "sim" {
+        use cascade_can::ecu::{self, OBD_ENGINE_REQUEST, OBD_ENGINE_RESPONSE, ObdSim};
+        let hub = cascade_can::vbus::Hub::new();
+        let mut tp =
+            cascade_can::isotp::IsoTp::new(hub.endpoint(), OBD_ENGINE_RESPONSE, OBD_ENGINE_REQUEST);
+        tp.functional_id = Some(ecu::OBD_FUNCTIONAL);
+        // lives as long as kdiag
+        std::thread::spawn(move || ecu::serve(&mut tp, &mut ObdSim::default(), &|| true));
+        return Ok(Box::new(hub.endpoint()));
+    }
+    open_socketcan(iface)
+}
+
+#[cfg(target_os = "linux")]
+fn open_socketcan(iface: &str) -> Result<Bus, String> {
+    cascade_can::socketcan::SocketCan::open(iface)
+        .map(|b| Box::new(b) as Bus)
+        .map_err(|e| format!("{iface}: {e}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_socketcan(iface: &str) -> Result<Bus, String> {
+    Err(format!(
+        "--can {iface}: SocketCAN needs Linux; use --can sim to try the CAN path here"
+    ))
+}
+
+fn open_isotp(o: &Opts, iface: &str) -> Result<cascade_can::isotp::IsoTp<Bus>, String> {
+    let (tx, rx) = o.can_ids;
+    let mut tp = cascade_can::isotp::IsoTp::new(open_bus(iface)?, tx, rx);
+    tp.pad = o.can_pad;
+    // after a functional request, flow control goes to the ECU's own id
+    tp.fc_id = cascade_can::isotp::physical_request_id(tx, rx);
+    Ok(tp)
+}
+
+fn can_session(o: &Opts) -> Result<Client<Box<dyn Link>>, String> {
+    let mut c = Client::new(open_link(o)?);
+    c.start().map_err(|e| format!("start: {e}"))?;
+    let (tx, rx) = o.can_ids;
+    eprintln!(
+        "CAN on {}: requests {tx:03X}, answers {rx:03X}",
+        o.can.as_deref().unwrap_or("?")
+    );
+    Ok(c)
+}
+
+/// OBD-II stored (mode 03) and pending (mode 07) codes.
+fn can_dtc(o: &Opts) -> Result<(), String> {
+    use cascade_diag::can::obd_codes;
+    let mut c = can_session(o)?;
+    let stored = c.request(&[0x03]).map_err(|e| format!("mode 03: {e}"))?;
+    let stored = obd_codes(&stored);
+    let pending = match c.request(&[0x07]) {
+        Ok(r) => obd_codes(&r),
+        Err(e) => {
+            eprintln!("mode 07 (pending codes): {e}");
+            Vec::new()
+        }
+    };
+    if stored.is_empty() && pending.is_empty() {
+        println!("no stored or pending DTCs");
+    }
+    for code in stored {
+        println!("{} (stored)", dtc_name(code));
+    }
+    for code in pending {
+        println!("{} (pending)", dtc_name(code));
+    }
+    Ok(())
+}
+
+/// OBD-II vehicle information: VIN (09 02) and ECU name (09 0A).
+fn can_ident(o: &Opts) -> Result<(), String> {
+    let mut c = can_session(o)?;
+    let text = |b: &[u8]| -> String {
+        b.iter()
+            .filter(|&&x| x != 0)
+            .map(|&x| {
+                if (0x20..0x7f).contains(&x) {
+                    x as char
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    };
+    for (pid, name) in [(0x02u8, "VIN"), (0x0a, "ECU name")] {
+        match c.request(&[0x09, pid]) {
+            // 49 pid count data..
+            Ok(r) => println!(
+                "{name:9} {}   (raw {})",
+                text(r.get(3..).unwrap_or(&[])),
+                hex(&r)
+            ),
+            Err(e) => println!("{name:9} ({e})"),
+        }
+    }
+    Ok(())
+}
+
+/// OBD-II live data (mode 01) as CSV, one PID per request.
+fn can_log(o: &Opts) -> Result<(), String> {
+    use cascade_diag::can::{LOG_PIDS, obd_value, pid_supported};
+    let mut c = can_session(o)?;
+    let mut maps = Vec::new();
+    for base in [0x00u8, 0x20, 0x40] {
+        match c.request(&[0x01, base]) {
+            Ok(r) => maps.push(r),
+            Err(_) => break,
+        }
+        if !maps.last().is_some_and(|r| pid_supported(r, base + 0x20)) {
+            break;
+        }
+    }
+    let pids: Vec<_> = LOG_PIDS
+        .iter()
+        .filter(|(p, ..)| maps.iter().any(|m| pid_supported(m, *p)))
+        .collect();
+    if pids.is_empty() {
+        return Err("the ECU lists none of the logged PIDs as supported".into());
+    }
+    let mut w: Box<dyn Write> = match &o.out {
+        Some(p) => Box::new(BufWriter::new(
+            File::create(p).map_err(|e| format!("{p}: {e}"))?,
+        )),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let header: Vec<String> = pids.iter().map(|(_, n, u)| format!("{n}[{u}]")).collect();
+    writeln!(w, "t_s,{}", header.join(",")).map_err(|e| e.to_string())?;
+    let start = c.line.elapsed();
+    loop {
+        let t = c.line.elapsed() - start;
+        if o.duration.is_some_and(|d| t >= d) {
+            break;
+        }
+        let cols: Vec<String> = pids
+            .iter()
+            .map(|(p, ..)| match c.request(&[0x01, *p]) {
+                Ok(r) if r.get(1) == Some(p) => {
+                    obd_value(*p, &r[2..]).map_or(String::new(), |v| format!("{v:.2}"))
+                }
+                _ => String::new(),
+            })
+            .collect();
+        writeln!(w, "{:.3},{}", t.as_secs_f64(), cols.join(",")).map_err(|e| e.to_string())?;
+        let spent = c.line.elapsed() - start - t;
+        if spent < o.interval {
+            c.line.idle(o.interval - spent);
+        }
+    }
+    w.flush().map_err(|e| e.to_string())
+}
+
+/// OBD-II mode 04: clears codes and freeze frames, resets readiness.
+fn can_clear(o: &Opts) -> Result<(), String> {
+    if !o.allow_clear {
+        return Err("clearing fault codes changes the ECU; rerun with --allow-clear".into());
+    }
+    if !o.yes {
+        eprint!("Clear all OBD-II codes (also resets readiness monitors)? Type yes: ");
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if answer.trim() != "yes" {
+            return Err("not confirmed; nothing sent".into());
+        }
+    }
+    let mut c = can_session(o)?;
+    c.allow_clear = true;
+    c.request(&[0x04]).map_err(|e| format!("mode 04: {e}"))?;
+    println!("fault codes cleared");
+    Ok(())
+}
+
+/// Answer on a CAN bus as the engine ECU (ISO 15765-4 ids, or --can-ids
+/// swapped: requests on TX, answers on RX): the simulated OBD-II ECU, or a
+/// K-line ECU through the read-only guard.
+fn can_ecu(o: &Opts) -> Result<(), String> {
+    use cascade_can::ecu::{self, ObdSim};
+    let iface = o.can.as_deref().unwrap_or_default();
+    if iface == "sim" {
+        return Err(
+            "can-ecu needs a real interface (vcan0, can0); --can sim already has one".into(),
+        );
+    }
+    let (req, resp) = o.can_ids;
+    let mut tp = cascade_can::isotp::IsoTp::new(open_bus(iface)?, resp, req);
+    tp.pad = o.can_pad;
+    tp.functional_id = Some(ecu::OBD_FUNCTIONAL);
+    let kline = o.sim || o.port.is_some() || o.ecusim.is_some();
+    eprintln!(
+        "can-ecu on {iface}: requests {req:03X} and {:03X}, answers {resp:03X}, {}",
+        ecu::OBD_FUNCTIONAL,
+        if kline {
+            "bridged to the K-line ECU (read-only guard on)"
+        } else {
+            "simulated OBD-II ECU"
+        }
+    );
+    if kline {
+        let inner = Opts {
+            can: None,
+            ..o.clone()
+        };
+        let mut c = Client::new(open_link(&inner)?);
+        c.allow_clear = o.allow_clear;
+        let mut bridge = cascade_diag::can::KlineBridge::new(&mut c);
+        ecu::serve(&mut tp, &mut bridge, &|| true).map_err(|e| e.to_string())
+    } else {
+        ecu::serve(&mut tp, &mut ObdSim::default(), &|| true).map_err(|e| e.to_string())
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.split_first() {
@@ -817,12 +1126,13 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "ident" => parse(rest).and_then(|o| ident(&o)),
         Some((cmd, rest)) if cmd == "crash" => parse(rest).and_then(|o| crash(&o)),
         Some((cmd, rest)) if cmd == "elm" => parse(rest).and_then(|o| elm(&o)),
+        Some((cmd, rest)) if cmd == "can-ecu" => parse_opts(rest, true).and_then(|o| can_ecu(&o)),
         Some((cmd, _)) if cmd == "j2534-list" => j2534_list(),
         Some((cmd, rest)) if cmd == "selftest" => match rest {
             [flag, dev] if flag == "--port" => selftest(dev),
             _ => Err("usage: kdiag selftest --port DEV".into()),
         },
-        _ => Err("usage: kdiag dtc|log|clear|ident|crash|elm|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
+        _ => Err("usage: kdiag dtc|log|clear|ident|crash|elm|can-ecu|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto | --can IFACE|sim [--can-ids TX:RX] [--can-pad XX|none]) [--system engine|abs|srs|tcs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };

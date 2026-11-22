@@ -28,6 +28,7 @@ engine, ABS and traction control data.
 | `cascade-diag` | `kdiag`: native KWP2000 and ISO 9141-2 client (ISO 14230 timing, 5-baud init, read-only guard, CSV-driven parameter decoding), serial K-line backend (macOS), J2534 link, adapter self-test. |
 | `cascade-runner` | Runs the emulator on its own thread in real time, for front ends. |
 | `cascade-gui` | Desktop front end (GPUI via `gpui-kit`): a flat Hi-Scan layout with a live data view. macOS. |
+| `cascade-can` | CAN diagnostics transport: ISO-TP over a bus trait, Linux SocketCAN (`can0`, `vcan0`), an in-memory bus and a simulated OBD-II ECU. |
 | `cascade-j2534` | Minimal SAE J2534 PassThru access for ISO 14230; vendor-DLL backend on Windows. |
 | `ecuc167` | Infineon C167 disassembler and emulator for running an engine ECU dump offline behind the same interface. |
 | `ecusim` | The simulated car: an engine ECU dump running in real time as its own process (`ecusim serve`), ABS/TCS/SRS models, an engine model that runs on the ECU's own fuel and spark, faults, scenarios, and a socket testers connect to. |
@@ -208,6 +209,32 @@ scenarios/loose-coolant-connector.txt` runs a timed scenario; see
 - `kdiag ... --ecusim auto --j2534-mock` runs kdiag's J2534 path against
   the simulator. A virtual J2534 DLL for Windows software was not built: it
   could not be tested here.
+
+## CAN (OBD-II on ISO 15765-4 cars)
+
+The Tiburon GK has no CAN diagnostics: all its modules are on the K line.
+kdiag can also talk OBD-II over CAN, for other cars and for testing tools:
+
+- `--can IFACE` uses a Linux SocketCAN interface. kdiag does not configure
+  it; bring it up first:
+  `sudo ip link set can0 up type can bitrate 500000`, or a virtual bus with
+  `sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up`.
+- `--can sim` uses an in-memory bus with a simulated OBD-II engine ECU, on
+  any OS.
+- `dtc`, `ident`, `log`, `clear` and `elm` then use OBD-II modes 03/07,
+  09 (VIN, ECU name), 01 and 04, through the same read-only guard.
+  `--can-ids TX:RX` (default `7E0:7E8`; `7DF:7E8` for a functional
+  request, 29-bit ids as 8 hex digits) and `--can-pad XX|none` (default AA).
+- `kdiag can-ecu --can vcan0` answers on the bus as the simulated ECU;
+  `kdiag can-ecu --can vcan0 --ecusim auto` answers as the simulated car's
+  K-line engine ECU (a gateway, behind the read-only guard), so CAN tools
+  can be tried against the real ECU code.
+
+ISO-TP is done in user space, so all of it except the SocketCAN socket
+itself is tested on any OS. **Status:** the SocketCAN path compiles for
+Linux but has not been run on `can0` or `vcan0` yet [assumed to work]. The
+Hi-Scan firmware's own CAN mode is not wired up (its adapter's CAN framing
+is unknown).
 
 ## Safety
 

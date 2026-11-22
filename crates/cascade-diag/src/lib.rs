@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod can;
 pub mod defs;
 #[cfg(all(feature = "serial", unix))]
 pub mod ecusim_line;

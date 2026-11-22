@@ -743,6 +743,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-can"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cascade-cli"
 version = "0.1.0"
 dependencies = [
@@ -763,6 +770,7 @@ dependencies = [
 name = "cascade-diag"
 version = "0.1.0"
 dependencies = [
+ "cascade-can",
  "cascade-core",
  "cascade-iface",
  "cascade-j2534",

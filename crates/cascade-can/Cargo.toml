@@ -1,0 +1,21 @@
+[package]
+name = "cascade-can"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "CAN diagnostics transport: ISO-TP (ISO 15765-2) over a CAN bus trait, Linux SocketCAN (can0, vcan0), an in-memory bus and a simulated OBD-II ECU"
+
+# Not `workspace = true`: the SocketCAN backend needs `unsafe` (libc socket
+# calls), which the workspace forbids. Only `src/socketcan.rs` uses it; the
+# rest denies it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

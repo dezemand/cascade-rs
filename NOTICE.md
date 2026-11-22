@@ -66,6 +66,8 @@ reads 16 bits.
   real time as a separate process with an engine model and models of the
   car's other modules.
 - `kdiag elm`, an ELM327 front for OBD apps.
+- CAN diagnostics (`cascade-can`): ISO-TP, Linux SocketCAN, a simulated
+  OBD-II ECU, and `kdiag --can` / `kdiag can-ecu`.
 - Tracing and analysis: oracle trace format and diff, line-event logs, ROM
   read and code coverage probes, a disassembler command.
 - `kdiag`, a native diagnostic tool that uses the protocol data learned with

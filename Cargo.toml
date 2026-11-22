@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/*"]
 # cascade-gui and ecusim-gui pull in GPUI (~520 crates); build them with -p
-default-members = ["crates/cascade-core", "crates/cascade-iface", "crates/cascade-cli", "crates/cascade-diag", "crates/cascade-runner", "crates/ecu8051", "crates/ecuc167", "crates/cascade-j2534", "crates/ecusim"]
+default-members = ["crates/cascade-core", "crates/cascade-iface", "crates/cascade-cli", "crates/cascade-diag", "crates/cascade-runner", "crates/ecu8051", "crates/ecuc167", "crates/cascade-j2534", "crates/cascade-can", "crates/ecusim"]
 
 [workspace.package]
 version = "0.1.0"

@@ -6,12 +6,24 @@
 //!
 //! Enough of the ELM327 command set for common apps: ATZ, ATI, AT@1, ATE,
 //! ATL, ATS, ATH, ATSP/ATTP, ATDP/ATDPN, ATRV, plus harmless settings
-//! answered OK. Requests are KWP2000 (ISO 14230-4) to the engine ECU.
+//! answered OK. Requests go to the engine ECU over KWP2000 (ISO 14230-4)
+//! or, with kdiag's `--can`, OBD-II on CAN (ISO 15765-4, 11-bit, 500 kbit/s
+//! reported [assumed: the bus rate is whatever the interface is set to]).
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 
 use crate::kwp::{Client, Error, Link, hex};
+
+/// What the client's link is, for ATDP and headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proto {
+    Kwp,
+    /// CAN, with the ECU's response identifier.
+    Can {
+        rx_id: u32,
+    },
+}
 
 #[derive(Clone, Copy)]
 struct Settings {
@@ -38,6 +50,7 @@ fn answer<L: Link>(
     session: &mut bool,
     st: &mut Settings,
     battery: &dyn Fn() -> Option<f64>,
+    proto: Proto,
     cmd: &str,
 ) -> String {
     let cmd: String = cmd.chars().filter(|c| !c.is_whitespace()).collect();
@@ -67,8 +80,14 @@ fn answer<L: Link>(
                 st.headers = at == "H1";
                 "OK".into()
             }
-            "DP" => "ISO 14230-4 (KWP FAST)".into(),
-            "DPN" => "A5".into(),
+            "DP" => match proto {
+                Proto::Kwp => "ISO 14230-4 (KWP FAST)".into(),
+                Proto::Can { .. } => "ISO 15765-4 (CAN 11/500)".into(),
+            },
+            "DPN" => match proto {
+                Proto::Kwp => "A5".into(),
+                Proto::Can { .. } => "A6".into(),
+            },
             "RV" => battery().map_or("?".into(), |v| format!("{v:.1}V")),
             a if a.starts_with("SP") || a.starts_with("TP") => {
                 *session = false;
@@ -106,15 +125,21 @@ fn answer<L: Link>(
     };
     match r {
         Ok(data) => {
-            let bytes = if st.headers {
-                let mut f = vec![0x80 | data.len() as u8, c.source, c.target];
-                f.extend_from_slice(&data);
-                f.push(f.iter().fold(0u8, |a, &b| a.wrapping_add(b)));
-                f
-            } else {
-                data
+            let h = match (st.headers, proto) {
+                (false, _) => hex(&data),
+                (true, Proto::Kwp) => {
+                    let mut f = vec![0x80 | data.len() as u8, c.source, c.target];
+                    f.extend_from_slice(&data);
+                    f.push(f.iter().fold(0u8, |a, &b| a.wrapping_add(b)));
+                    hex(&f)
+                }
+                // identifier, then the single-frame length byte as an ELM
+                // shows it (longer answers: identifier and data only)
+                (true, Proto::Can { rx_id }) if data.len() <= 7 => {
+                    format!("{rx_id:03X} {:02X} {}", data.len(), hex(&data))
+                }
+                (true, Proto::Can { rx_id }) => format!("{rx_id:03X} {}", hex(&data)),
             };
-            let h = hex(&bytes);
             if st.spaces { h } else { h.replace(' ', "") }
         }
         Err(Error::Blocked(b)) => {
@@ -137,6 +162,7 @@ fn answer<L: Link>(
 fn serve_one<L: Link>(
     c: &mut Client<L>,
     battery: &dyn Fn() -> Option<f64>,
+    proto: Proto,
     stream: TcpStream,
 ) -> io::Result<()> {
     let mut w = stream.try_clone()?;
@@ -155,7 +181,7 @@ fn serve_one<L: Link>(
             w.write_all(b">")?;
             continue;
         }
-        let out = answer(c, &mut session, &mut st, battery, &line);
+        let out = answer(c, &mut session, &mut st, battery, proto, &line);
         let nl = if st.linefeed { "\r\n" } else { "\r" };
         let mut text = String::new();
         if st.echo {
@@ -174,6 +200,7 @@ fn serve_one<L: Link>(
 pub fn serve<L: Link>(
     c: &mut Client<L>,
     battery: &dyn Fn() -> Option<f64>,
+    proto: Proto,
     addr: &str,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
@@ -181,7 +208,7 @@ pub fn serve<L: Link>(
     for stream in listener.incoming() {
         let stream = stream?;
         eprintln!("elm: client {}", stream.peer_addr()?);
-        if let Err(e) = serve_one(c, battery, stream) {
+        if let Err(e) = serve_one(c, battery, proto, stream) {
             eprintln!("elm: {e}");
         }
     }
@@ -202,7 +229,7 @@ mod tests {
         let mut c = Client::new(SimLine::new(KwpEcu::new(cfg)));
         let (mut session, mut st) = (false, Settings::default());
         let bat = || Some(13.9);
-        let mut ask = |cmd: &str| answer(&mut c, &mut session, &mut st, &bat, cmd);
+        let mut ask = |cmd: &str| answer(&mut c, &mut session, &mut st, &bat, Proto::Kwp, cmd);
         assert_eq!(ask("ATZ"), "ELM327 v1.5");
         assert_eq!(ask("ATRV"), "13.9V");
         assert_eq!(ask("010C"), "41 0C 0C 80");
@@ -212,5 +239,22 @@ mod tests {
         assert_eq!(ask("04"), "?");
         assert_eq!(ask("2E0101"), "?");
         assert_eq!(ask("zz"), "?");
+    }
+
+    #[test]
+    fn can_protocol_and_headers() {
+        let mut cfg = KwpConfig::default();
+        cfg.responses
+            .insert(vec![0x01, 0x0c], vec![0x41, 0x0c, 0x0c, 0x80]);
+        let mut c = Client::new(SimLine::new(KwpEcu::new(cfg)));
+        let (mut session, mut st) = (false, Settings::default());
+        let bat = || None;
+        let can = Proto::Can { rx_id: 0x7e8 };
+        let mut ask = |cmd: &str| answer(&mut c, &mut session, &mut st, &bat, can, cmd);
+        assert_eq!(ask("ATDP"), "ISO 15765-4 (CAN 11/500)");
+        assert_eq!(ask("ATDPN"), "A6");
+        assert_eq!(ask("ATRV"), "?");
+        assert_eq!(ask("ATH1"), "OK");
+        assert_eq!(ask("010C"), "7E8 04 41 0C 0C 80");
     }
 }

@@ -16,6 +16,7 @@ path = "src/bin/kdiag.rs"
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }
 cascade-j2534 = { path = "../cascade-j2534" }
+cascade-can = { path = "../cascade-can" }
 serialport = { version = "4.10.1", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
