@@ -13,6 +13,7 @@ name = "cascade"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 cascade-core.workspace = true
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }

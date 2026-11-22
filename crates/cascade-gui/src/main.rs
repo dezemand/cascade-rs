@@ -1,6 +1,10 @@
 //! cascade-gui: desktop front end for the cascade-rs Hi-Scan emulator.
 //!
-//! Usage: cascade-gui ROM   (or set CASCADE_ROM)
+//! Usage: cascade-gui [ROM [--exrom INFO.dat] [--eeprom FILE | --no-eeprom]
+//!        [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]]
+//! (or set CASCADE_ROM, CASCADE_EXROM, CASCADE_ECU_ROM). Without a ROM a
+//! setup screen asks for the pack, the optional troubleshooting pack and
+//! engine ECU dump, and remembers them.
 //!
 //! A flat, modern take on the Hi-Scan Pro handset: dark card, LCD on top,
 //! keys on one aligned six-column grid, the Hi-Scan yellow as the only
@@ -14,6 +18,7 @@
 
 use std::time::Duration;
 
+mod cli;
 mod live;
 
 use cascade_core::Key;
@@ -1435,114 +1440,503 @@ impl Render for CascadeView {
     }
 }
 
-fn main() {
-    let Some(path) = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("CASCADE_ROM").ok())
-    else {
-        eprintln!(
-            "usage: cascade-gui ROM [--exrom INFO.dat] [--eeprom FILE | --no-eeprom] [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_EXROM, CASCADE_ECU_ROM)"
-        );
-        std::process::exit(2);
-    };
-    let rom = match std::fs::read(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("cascade-gui: {path}: {e}");
-            std::process::exit(2);
+/// What the device window starts with.
+struct Start {
+    rom: Vec<u8>,
+    replay: Option<Result<Loaded, String>>,
+    ecu: (Option<Result<EcuRom, String>>, bool),
+    exrom: Option<(String, Vec<u8>)>,
+    eeprom: Option<std::path::PathBuf>,
+}
+
+fn read_exrom(p: &std::path::Path) -> Option<(String, Vec<u8>)> {
+    match std::fs::read(p) {
+        Ok(x) => {
+            let name = p
+                .file_name()
+                .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into());
+            Some((name, x))
         }
+        Err(e) => {
+            eprintln!("cascade-gui: {}: {e}", p.display());
+            None
+        }
+    }
+}
+
+/// The Hi-Scan window, as tall as the display allows.
+fn open_device(start: Start, cx: &mut App) {
+    let display_h = cx
+        .primary_display()
+        .map(|d| f32::from(d.bounds().size.height))
+        .unwrap_or(1000.0);
+    let h = (display_h - 80.0).clamp(700.0, 1400.0);
+    let w = h * DEVICE_W_PER_SCALE / DEVICE_H_PER_SCALE + PANEL_W + 40.0;
+    let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+    let opts = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Cascade".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
-    let args: Vec<String> = std::env::args().collect();
-    let replay = args
-        .iter()
-        .position(|a| a == "--replay")
-        .and_then(|i| args.get(i + 1))
-        .map(|p| {
-            let p = std::path::Path::new(p);
-            load_trace(p).map_err(|e| format!("{}: {e}", p.display()))
+    let mut start = Some(start);
+    gpui_kit::open_window(opts, cx, move |window, cx| {
+        let s = start.take().expect("one window");
+        cx.new(|cx| CascadeView::new(s.rom, s.replay, s.ecu, s.exrom, s.eeprom, window, cx))
+    })
+    .expect("failed to open window");
+}
+
+/// The first screen when no pack was given: which Hi-Scan pack to run,
+/// and the optional troubleshooting pack, engine ECU dump and EEPROM file.
+struct Setup {
+    settings: ecusim::settings::Settings,
+    pack: Option<std::path::PathBuf>,
+    exrom: Option<std::path::PathBuf>,
+    ecu: Option<std::path::PathBuf>,
+    eeprom: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Pick {
+    Pack,
+    Exrom,
+    Ecu,
+}
+
+impl Setup {
+    fn new() -> Self {
+        let settings = ecusim::settings::Settings::load("cascade-gui");
+        let first = |k: &str| settings.recent(k).into_iter().next();
+        Self {
+            pack: first("pack"),
+            exrom: first("exrom").filter(|_| settings.flag("use_exrom", false)),
+            ecu: first("ecu").filter(|_| settings.flag("use_ecu", false)),
+            eeprom: settings.flag("eeprom", true),
+            settings,
+            error: None,
+        }
+    }
+
+    fn choose(&mut self, what: Pick, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose".into()),
         });
-    // --ecu-rom selects the ECU line at start; CASCADE_ECU_ROM only preloads it
-    let ecu_arg = args
-        .iter()
-        .position(|a| a == "--ecu-rom")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let ecu_first = ecu_arg.is_some();
-    // EEPROM file, as upstream: ROM.eep next to the ROM unless --eeprom PATH
-    // names another or --no-eeprom keeps it in memory only
-    let eeprom = if args.iter().any(|a| a == "--no-eeprom") {
-        None
-    } else {
-        Some(
-            args.iter()
-                .position(|a| a == "--eeprom")
-                .and_then(|i| args.get(i + 1))
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(format!("{path}.eep"))),
-        )
-    };
-    // extended ROM (troubleshooting pack): --exrom PATH or CASCADE_EXROM
-    let exrom = args
-        .iter()
-        .position(|a| a == "--exrom")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .or_else(|| std::env::var("CASCADE_EXROM").ok())
-        .and_then(|p| match std::fs::read(&p) {
-            Ok(x) => {
-                let name = std::path::Path::new(&p)
-                    .file_name()
-                    .map_or(p.clone(), |n| n.to_string_lossy().into());
-                Some((name, x))
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |v, cx| {
+                    match what {
+                        Pick::Pack => v.pack = Some(p),
+                        Pick::Exrom => v.exrom = Some(p),
+                        Pick::Ecu => v.ecu = Some(p),
+                    }
+                    v.error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pack) = self.pack.clone() else {
+            return;
+        };
+        let rom = match std::fs::read(&pack) {
+            Ok(r) if r.len() >= 0x10000 => r,
+            Ok(r) => {
+                self.error = Some(format!(
+                    "{} bytes is too small for a Hi-Scan Pro pack",
+                    r.len()
+                ));
+                return;
             }
             Err(e) => {
-                eprintln!("cascade-gui: {p}: {e}");
-                None
+                self.error = Some(format!("{}: {e}", pack.display()));
+                return;
             }
-        });
-    let ecu = ecu_arg
-        .or_else(|| std::env::var("CASCADE_ECU_ROM").ok())
-        .map(|p| {
+        };
+        let ecu = self
+            .ecu
+            .as_deref()
+            .map(|p| load_ecu(p).map_err(|e| format!("{}: {e}", p.display())));
+        let start = Start {
+            rom,
+            replay: None,
+            ecu: (ecu, false),
+            exrom: self.exrom.as_deref().and_then(read_exrom),
+            eeprom: self
+                .eeprom
+                .then(|| std::path::PathBuf::from(format!("{}.eep", pack.display()))),
+        };
+        let s = &mut self.settings;
+        s.push_recent("pack", &pack);
+        s.set_flag("eeprom", self.eeprom);
+        s.set_flag("use_exrom", self.exrom.is_some());
+        s.set_flag("use_ecu", self.ecu.is_some());
+        if let Some(p) = &self.exrom {
+            s.push_recent("exrom", p);
+        }
+        if let Some(p) = &self.ecu {
+            s.push_recent("ecu", p);
+        }
+        s.save();
+        open_device(start, cx);
+        window.remove_window();
+    }
+
+    /// One file choice: label, chosen file (or what is missing), Choose…
+    /// and, for optional ones, a way to drop it.
+    fn file_row(
+        &self,
+        what: Pick,
+        label: &'static str,
+        none: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let chosen = match what {
+            Pick::Pack => &self.pack,
+            Pick::Exrom => &self.exrom,
+            Pick::Ecu => &self.ecu,
+        };
+        let (name, dir) = match chosen {
+            Some(p) => (
+                p.file_name()
+                    .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into()),
+                p.parent()
+                    .map_or(String::new(), |d| d.display().to_string()),
+            ),
+            None => (none.to_string(), String::new()),
+        };
+        let optional = !matches!(what, Pick::Pack);
+        let button = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .h(px(30.))
+                .px(px(12.))
+                .rounded(px(7.))
+                .border_1()
+                .border_color(rgb(CARD_EDGE))
+                .text_sm()
+                .text_color(rgb(TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(KEY_HOVER)))
+                .child(text)
+        };
+        let ids = match what {
+            Pick::Pack => ("choose-pack", "clear-pack"),
+            Pick::Exrom => ("choose-exrom", "clear-exrom"),
+            Pick::Ecu => ("choose-ecu", "clear-ecu"),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(label))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(rgb(if chosen.is_some() { TEXT } else { TEXT_DIM }))
+                                    .child(name),
+                            )
+                            .when(!dir.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_DIM))
+                                        .child(dir),
+                                )
+                            }),
+                    )
+                    .when(optional && chosen.is_some(), |d| {
+                        d.child(button(ids.1, "Remove").on_click(cx.listener(
+                            move |v, _, _, cx| {
+                                match what {
+                                    Pick::Pack => {}
+                                    Pick::Exrom => v.exrom = None,
+                                    Pick::Ecu => v.ecu = None,
+                                }
+                                cx.notify();
+                            },
+                        )))
+                    })
+                    .child(
+                        button(ids.0, "Choose…")
+                            .on_click(cx.listener(move |v, _, _, cx| v.choose(what, cx))),
+                    ),
+            )
+    }
+}
+
+impl Render for Setup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent: Vec<std::path::PathBuf> = self
+            .settings
+            .recent("pack")
+            .into_iter()
+            .filter(|p| Some(p) != self.pack.as_ref())
+            .collect();
+        let recent_list =
+            recent
+                .into_iter()
+                .enumerate()
+                .fold(div().flex().flex_col(), |d, (i, p)| {
+                    let name = p
+                        .file_name()
+                        .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into());
+                    d.child(
+                        div()
+                            .id(("recent", i))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(KEY_HOVER)))
+                            .child(name)
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                v.pack = Some(p.clone());
+                                cx.notify();
+                            })),
+                    )
+                });
+        let has_recent = self
+            .settings
+            .recent("pack")
+            .iter()
+            .any(|p| Some(p) != self.pack.as_ref());
+        let can_start = self.pack.is_some();
+        let card = || {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .p(px(16.))
+                .rounded(px(10.))
+                .bg(rgb(CARD))
+                .border_1()
+                .border_color(rgb(CARD_EDGE))
+        };
+        let eeprom_on = self.eeprom;
+        div()
+            .id("setup")
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .p(px(24.))
+            .bg(rgb(DESK))
+            .text_color(rgb(TEXT))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_xl().child("Cascade"))
+                    .child(div().text_sm().text_color(rgb(TEXT_DIM)).child(
+                        "The Hi-Scan Pro, emulated. It runs your own pack; nothing is \
+                         bundled.",
+                    )),
+            )
+            .child(
+                card()
+                    .child(self.file_row(
+                        Pick::Pack,
+                        "HI-SCAN PACK",
+                        "No pack chosen yet (for example hyundai.his.dat)",
+                        cx,
+                    ))
+                    .when(has_recent, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child("RECENT"))
+                                .child(recent_list),
+                        )
+                    }),
+            )
+            .child(
+                card()
+                    .child(self.file_row(
+                        Pick::Exrom,
+                        "TROUBLESHOOTING PACK (optional)",
+                        "None: the DTC HELP flow screens stay empty",
+                        cx,
+                    ))
+                    .child(self.file_row(
+                        Pick::Ecu,
+                        "ENGINE ECU DUMP (optional, for the ECU line)",
+                        "None: the ECU line can load one later",
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .id("eeprom")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(rgb(if eeprom_on { ACCENT } else { CARD_EDGE }))
+                                    .when(eeprom_on, |d| d.bg(rgb(ACCENT))),
+                            )
+                            .child(div().text_sm().child(
+                                "Keep the Hi-Scan's settings (EEPROM) in a file next to the pack",
+                            ))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.eeprom = !v.eeprom;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div().flex().flex_row().justify_end().child(
+                    div()
+                        .id("start")
+                        .flex()
+                        .items_center()
+                        .h(px(40.))
+                        .px(px(22.))
+                        .rounded(px(8.))
+                        .bg(rgb(ACCENT))
+                        .text_color(rgb(ACCENT_TEXT))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .when(!can_start, |d| d.opacity(0.4))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
+                        .child("Power on")
+                        .on_click(cx.listener(move |v, _, w, cx| {
+                            if can_start {
+                                v.start(w, cx);
+                            }
+                        })),
+                ),
+            )
+            .when_some(self.error.clone(), |d, e| {
+                d.child(div().text_sm().text_color(rgb(WARN)).child(e))
+            })
+    }
+}
+
+fn main() {
+    let cli = <cli::Cli as clap::Parser>::parse();
+    let path = cli.rom.or_else(|| std::env::var("CASCADE_ROM").ok());
+    let options =
+        cli.exrom.is_some() || cli.eeprom.is_some() || cli.no_eeprom || cli.replay.is_some();
+    if path.is_none() && (options || cli.ecu_rom.is_some()) {
+        eprintln!(
+            "cascade-gui: no pack given; options without one are ignored and the setup \
+             screen opens"
+        );
+    }
+    let start = path.map(|path| {
+        let rom = match std::fs::read(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("cascade-gui: {path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let replay = cli.replay.map(|p| {
             let p = std::path::Path::new(&p);
-            load_ecu(p).map_err(|e| format!("{}: {e}", p.display()))
+            load_trace(p).map_err(|e| format!("{}: {e}", p.display()))
         });
+        // --ecu-rom selects the ECU line at start; CASCADE_ECU_ROM only preloads it
+        let ecu_arg = cli.ecu_rom;
+        let ecu_first = ecu_arg.is_some();
+        // EEPROM file, as upstream: ROM.eep next to the ROM unless --eeprom
+        // PATH names another or --no-eeprom keeps it in memory only
+        let eeprom = if cli.no_eeprom {
+            None
+        } else {
+            Some(
+                cli.eeprom
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from(format!("{path}.eep"))),
+            )
+        };
+        // extended ROM (troubleshooting pack): --exrom PATH or CASCADE_EXROM
+        let exrom = cli
+            .exrom
+            .or_else(|| std::env::var("CASCADE_EXROM").ok())
+            .and_then(|p| read_exrom(std::path::Path::new(&p)));
+        let ecu = ecu_arg
+            .or_else(|| std::env::var("CASCADE_ECU_ROM").ok())
+            .map(|p| {
+                let p = std::path::Path::new(&p);
+                load_ecu(p).map_err(|e| format!("{}: {e}", p.display()))
+            });
+        Start {
+            rom,
+            replay,
+            ecu: (ecu, ecu_first),
+            exrom,
+            eeprom,
+        }
+    });
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             // the panel is dark; gpui-component's buttons must match
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            // as tall as the display allows; the device scales to the window
-            let display_h = cx
-                .primary_display()
-                .map(|d| f32::from(d.bounds().size.height))
-                .unwrap_or(1000.0);
-            let h = (display_h - 80.0).clamp(700.0, 1400.0);
-            let w = h * DEVICE_W_PER_SCALE / DEVICE_H_PER_SCALE + PANEL_W + 40.0;
-            let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
-            let opts = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Cascade".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| {
-                    CascadeView::new(
-                        rom,
-                        replay,
-                        (ecu, ecu_first),
-                        exrom.clone(),
-                        eeprom.clone(),
-                        window,
-                        cx,
-                    )
-                })
+            match start {
+                Some(s) => open_device(s, cx),
+                None => {
+                    let bounds = Bounds::centered(None, size(px(640.), px(560.)), cx);
+                    let opts = WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("Cascade".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    gpui_kit::open_window(opts, cx, |_, cx| cx.new(|_| Setup::new()))
+                        .expect("failed to open window");
+                }
+            }
+            // the setup window closes itself when the device opens
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit()
+                }
             })
-            .expect("failed to open window");
-            cx.on_window_closed(|cx, _| cx.quit()).detach();
+            .detach();
             cx.activate(true);
         });
 }

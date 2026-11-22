@@ -13,6 +13,7 @@ name = "cascade-gui"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 cascade-core.workspace = true
 cascade-iface.workspace = true
 cascade-runner.workspace = true

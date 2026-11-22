@@ -31,6 +31,7 @@ pub mod plant;
 pub mod probe;
 pub mod proto;
 pub mod server;
+pub mod settings;
 pub mod vehicle;
 
 /// Default socket path.

@@ -6,13 +6,17 @@
 //!
 //! Connects to the ECU process on its socket (default `$TMPDIR/ecusim.sock`).
 //! With `--rom`, and no server answering, it starts `ecusim serve` itself
-//! (the `ecusim` binary next to this one) and stops it on exit.
+//! (the `ecusim` binary next to this one) and stops it on exit. With
+//! neither, a setup screen asks for the dump (remembering recent ones) or
+//! connects to a server started elsewhere.
 //!
 //! Ignition, a hold-to-crank START button, throttle, temperatures, battery,
 //! road speed and idle speed go to the engine model; the panel shows what
 //! the model does and what the ECU reports about itself. Testers (the
 //! Hi-Scan GUI's "Process" line, `kdiag --ecusim auto`) connect to the same
 //! socket.
+
+mod cli;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1063,66 +1067,393 @@ impl Render for Panel {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
+type Server = std::rc::Rc<std::cell::RefCell<Option<std::process::Child>>>;
+
+/// Start `ecusim serve` (the binary next to this one) on `socket` and wait
+/// until it answers.
+fn start_server(
+    rom: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<std::process::Child, String> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("ecusim")))
+        .unwrap_or_else(|| PathBuf::from("ecusim"));
+    let mut child = Command::new(&exe)
+        .args(["serve", "--rom"])
+        .arg(rom)
+        .arg("--socket")
+        .arg(socket)
+        .spawn()
+        .map_err(|e| format!("starting {}: {e}", exe.display()))?;
+    for _ in 0..50 {
+        if Conn::connect(socket).is_ok() {
+            return Ok(child);
+        }
+        if let Ok(Some(st)) = child.try_wait() {
+            return Err(format!(
+                "ecusim stopped ({st}); is this an engine ECU dump?"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    Err("ecusim did not answer on its socket".into())
+}
+
+/// The car's controls.
+fn open_panel(socket: PathBuf, cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
+    let opts = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(900.), px(560.))),
+        titlebar: Some(TitlebarOptions {
+            title: Some("GK 2.0 engine".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
     };
-    let socket = arg("--socket").map_or_else(ecusim::default_socket, PathBuf::from);
-    // start a server if none answers and a ROM was given
-    let server = match (Conn::connect(&socket), arg("--rom")) {
-        (Ok(_), _) | (Err(_), None) => None,
-        (Err(_), Some(rom)) => {
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("ecusim")))
-                .unwrap_or_else(|| PathBuf::from("ecusim"));
-            match Command::new(&exe)
-                .args(["serve", "--rom", &rom, "--socket"])
-                .arg(&socket)
-                .spawn()
+    gpui_kit::open_window(opts, cx, move |_, cx| {
+        cx.new(|cx| Panel::new(socket.clone(), cx))
+    })
+    .expect("failed to open window");
+}
+
+/// The first screen when nothing says what to run: pick an engine ECU
+/// dump to start the simulated car, or connect to an `ecusim` already
+/// running.
+struct Setup {
+    settings: ecusim::settings::Settings,
+    dump: Option<PathBuf>,
+    socket: PathBuf,
+    server: Server,
+    error: Option<String>,
+    busy: bool,
+}
+
+impl Setup {
+    fn new(socket: PathBuf, server: Server) -> Self {
+        let settings = ecusim::settings::Settings::load("ecusim-gui");
+        let dump = settings.recent("rom").into_iter().next();
+        Self {
+            settings,
+            dump,
+            socket,
+            server,
+            error: None,
+            busy: false,
+        }
+    }
+
+    fn choose(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use this dump".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.into_iter().next()
             {
-                Ok(c) => {
-                    // give it a moment to bind
-                    std::thread::sleep(Duration::from_millis(300));
-                    Some(c)
-                }
-                Err(e) => {
-                    eprintln!("ecusim-gui: starting {}: {e}", exe.display());
-                    None
-                }
+                let _ = this.update(cx, |v, cx| {
+                    v.dump = Some(p);
+                    v.error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dump) = self.dump.clone() else {
+            return;
+        };
+        match std::fs::metadata(&dump).map(|m| m.len()) {
+            Ok(0x40000 | 0x80000) => {}
+            Ok(n) => {
+                self.error = Some(format!(
+                    "{n} bytes: an engine ECU dump is 256 KB (SIMK41) or 512 KB (SIMK43)"
+                ));
+                return;
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
             }
         }
-    };
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        // the server needs up to a few seconds to answer: wait off the UI
+        let socket = self.socket.clone();
+        let setup_window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let (d, s) = (dump.clone(), socket.clone());
+            let started = cx
+                .background_executor()
+                .spawn(async move { start_server(&d, &s) })
+                .await;
+            let _ = this.update(cx, |v, cx| match started {
+                Ok(child) => {
+                    *v.server.borrow_mut() = Some(child);
+                    v.settings.push_recent("rom", &dump);
+                    v.settings.save();
+                    open_panel(socket, cx);
+                    let _ = cx.update_window(setup_window, |_, w, _| w.remove_window());
+                }
+                Err(e) => {
+                    v.busy = false;
+                    v.error = Some(e);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match Conn::connect(&self.socket) {
+            Ok(_) => {
+                open_panel(self.socket.clone(), cx);
+                window.remove_window();
+            }
+            Err(_) => {
+                self.error = Some(format!(
+                    "nothing answers on {}: start one with `ecusim serve --rom DUMP`",
+                    self.socket.display()
+                ))
+            }
+        }
+    }
+}
+
+fn file_label(p: &std::path::Path) -> (String, String) {
+    let name = p
+        .file_name()
+        .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into());
+    let dir = p
+        .parent()
+        .map_or(String::new(), |d| d.display().to_string());
+    (name, dir)
+}
+
+/// A flat secondary button.
+fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(34.))
+        .px(px(14.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgb(EDGE))
+        .text_sm()
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x1f2024)))
+        .child(label.into())
+}
+
+impl Render for Setup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent: Vec<PathBuf> = self
+            .settings
+            .recent("rom")
+            .into_iter()
+            .filter(|p| Some(p) != self.dump.as_ref())
+            .collect();
+        let chosen = match &self.dump {
+            Some(p) => {
+                let (name, dir) = file_label(p);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(div().truncate().text_sm().text_color(rgb(TEXT)).child(name))
+                    .child(caption(dir).truncate())
+            }
+            None => div().flex_1().child(caption("No dump chosen yet")),
+        };
+        let recent_list = recent.into_iter().enumerate().fold(
+            div().flex().flex_col().gap(px(2.)),
+            |d, (i, p)| {
+                let (name, dir) = file_label(&p);
+                d.child(
+                    div()
+                        .id(("recent", i))
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .gap(px(12.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x1f2024)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_sm()
+                                .text_color(rgb(TEXT))
+                                .child(name),
+                        )
+                        .child(caption(dir).flex_none().max_w(px(160.)).truncate())
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            v.dump = Some(p.clone());
+                            v.error = None;
+                            cx.notify();
+                        })),
+                )
+            },
+        );
+        let can_start = self.dump.is_some() && !self.busy;
+        let start = div()
+            .id("start")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h(px(40.))
+            .px(px(22.))
+            .rounded(px(8.))
+            .bg(rgb(ACCENT))
+            .text_color(rgb(ACCENT_TEXT))
+            .font_weight(FontWeight::SEMIBOLD)
+            .when(!can_start, |d| d.opacity(0.4))
+            .cursor_pointer()
+            .child(if self.busy {
+                "Starting…"
+            } else {
+                "Start the car"
+            })
+            .on_click(cx.listener(move |v, _, w, cx| {
+                if can_start {
+                    v.start(w, cx);
+                }
+            }));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .p(px(24.))
+            .bg(rgb(BG))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().text_xl().child("EcuSim"))
+                    .child(caption(
+                        "Runs a real engine ECU dump as a simulated car that the Hi-Scan GUI \
+                         and kdiag can diagnose.",
+                    )),
+            )
+            .child(
+                card()
+                    .gap(px(12.))
+                    .child(caption("ENGINE ECU DUMP"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(chosen)
+                            .child(
+                                ghost("choose", "Choose…")
+                                    .on_click(cx.listener(|v, _, _, cx| v.choose(cx))),
+                            ),
+                    )
+                    .when(!recent_list_is_empty(&self.settings, &self.dump), |d| {
+                        d.child(caption("RECENT")).child(recent_list)
+                    })
+                    .child(caption(
+                        "A 256 KB (SIMK41) or 512 KB (SIMK43) dump without immobiliser. \
+                         Dumps stay on this computer.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        ghost("connect", "Connect to a running ecusim")
+                            .on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))),
+                    )
+                    .child(start),
+            )
+            .when_some(self.error.clone(), |d, e| {
+                d.child(div().text_sm().text_color(rgb(WARN)).child(e))
+            })
+    }
+}
+
+fn recent_list_is_empty(s: &ecusim::settings::Settings, chosen: &Option<PathBuf>) -> bool {
+    s.recent("rom").iter().all(|p| Some(p) == chosen.as_ref())
+}
+
+fn main() {
+    let cli = <cli::Cli as clap::Parser>::parse();
+    let socket = cli.socket.unwrap_or_else(ecusim::default_socket);
+    let running = Conn::connect(&socket).is_ok();
+    // with --rom and no server answering: start one; with neither, the
+    // setup screen asks
+    let mut server = None;
+    let mut setup = false;
+    match (running, cli.rom) {
+        (true, _) => {}
+        (false, Some(rom)) => match start_server(std::path::Path::new(&rom), &socket) {
+            Ok(c) => server = Some(c),
+            Err(e) => {
+                eprintln!("ecusim-gui: {e}");
+                setup = true;
+            }
+        },
+        (false, None) => setup = true,
+    }
+    let server: Server = std::rc::Rc::new(std::cell::RefCell::new(server));
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
-            let opts = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(900.), px(560.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("GK 2.0 engine".into()),
+            if setup {
+                let bounds = Bounds::centered(None, size(px(640.), px(480.)), cx);
+                let opts = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("EcuSim".into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let socket = socket.clone();
-            gpui_kit::open_window(opts, cx, move |_, cx| {
-                cx.new(|cx| Panel::new(socket.clone(), cx))
-            })
-            .expect("failed to open window");
-            // a server this panel started goes with it, however the app ends
-            let server = std::rc::Rc::new(std::cell::RefCell::new(server));
-            let stop = move || {
-                if let Some(mut c) = server.borrow_mut().take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
+                };
+                let (socket, server) = (socket.clone(), server.clone());
+                gpui_kit::open_window(opts, cx, move |_, cx| {
+                    cx.new(|_| Setup::new(socket.clone(), server.clone()))
+                })
+                .expect("failed to open window");
+            } else {
+                open_panel(socket.clone(), cx);
+            }
+            // a server this app started goes with it, however the app ends
+            let stop = {
+                let server = server.clone();
+                move || {
+                    if let Some(mut c) = server.borrow_mut().take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
                 }
             };
             let stop2 = stop.clone();
@@ -1131,9 +1462,12 @@ fn main() {
                 async {}
             })
             .detach();
+            // the setup window closes itself when the panel opens
             cx.on_window_closed(move |cx, _| {
-                stop();
-                cx.quit()
+                if cx.windows().is_empty() {
+                    stop();
+                    cx.quit()
+                }
             })
             .detach();
             cx.activate(true);

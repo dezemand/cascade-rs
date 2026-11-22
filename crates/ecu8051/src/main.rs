@@ -31,143 +31,8 @@ use cpu::{Cpu, Event};
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-struct Opts {
-    rom: String,
-    max_ms: f64,
-    fosc: u64,
-    chan: usize,
-    init_at_ms: Option<f64>,
-    reqs: Vec<Vec<u8>>,
-    watch: Vec<u8>,
-    xlog: Option<(u16, u16)>,
-    trace_from_ms: Option<f64>,
-    trace_n: u64,
-    new_pcs: bool,
-    hot: bool,
-    adc: Vec<(usize, u16)>,
-    pin: Option<(u8, u8)>,
-    echo: bool,
-    gap_ms: f64,
-    baud: f64,
-    stop_at_pc: Option<u16>,
-    five_baud: bool,
-    wake06: bool,
-    addr: u8,
-    kwp: bool,
-    show_rx: bool,
-    kw1281: bool,
-    acks: u32,
-}
-
-fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    s.split([' ', ','])
-        .filter(|t| !t.is_empty())
-        .map(|t| u8::from_str_radix(t, 16).map_err(|e| format!("{t}: {e}")))
-        .collect()
-}
-
-fn num(s: &str) -> Result<u64, String> {
-    let r = if let Some(h) = s.strip_prefix("0x") {
-        u64::from_str_radix(h, 16)
-    } else {
-        s.parse()
-    };
-    r.map_err(|e| format!("{s}: {e}"))
-}
-
-fn parse() -> Result<Opts, String> {
-    let mut a = std::env::args().skip(1);
-    let mut o = Opts {
-        rom: String::new(),
-        max_ms: 2000.0,
-        fosc: 16_000_000,
-        chan: 1,
-        init_at_ms: None,
-        reqs: Vec::new(),
-        watch: Vec::new(),
-        xlog: None,
-        trace_from_ms: None,
-        trace_n: 2000,
-        new_pcs: false,
-        hot: false,
-        adc: Vec::new(),
-        pin: None,
-        echo: true,
-        gap_ms: 1.0,
-        baud: 10400.0,
-        stop_at_pc: None,
-        five_baud: true,
-        wake06: false,
-        addr: 0x10,
-        kwp: false,
-        show_rx: false,
-        kw1281: true,
-        acks: 6,
-    };
-    while let Some(x) = a.next() {
-        let mut v = || a.next().ok_or(format!("{x} needs a value"));
-        match x.as_str() {
-            "-m" => o.max_ms = v()?.parse().map_err(|e| format!("{e}"))?,
-            "--fosc" => o.fosc = num(&v()?)?,
-            "--chan" => o.chan = num(&v()?)? as usize,
-            "--init-at" => o.init_at_ms = Some(v()?.parse().map_err(|e| format!("{e}"))?),
-            "--req" => o.reqs.push(hex_bytes(&v()?)?),
-            "--watch-sfr" => {
-                for t in v()?.split(',') {
-                    o.watch
-                        .push(u8::from_str_radix(t, 16).map_err(|e| format!("{e}"))?);
-                }
-            }
-            "--xlog" => {
-                let s = v()?;
-                let (l, h) = s.split_once('-').ok_or("--xlog LO-HI")?;
-                o.xlog = Some((
-                    u16::from_str_radix(l, 16).map_err(|e| format!("{e}"))?,
-                    u16::from_str_radix(h, 16).map_err(|e| format!("{e}"))?,
-                ));
-            }
-            "--trace-from" => o.trace_from_ms = Some(v()?.parse().map_err(|e| format!("{e}"))?),
-            "--trace-n" => o.trace_n = num(&v()?)?,
-            "--new-pcs" => o.new_pcs = true,
-            "--hot" => o.hot = true,
-            "--no-echo" => o.echo = false,
-            "--fast" => o.five_baud = false,
-            "--wake06" => o.wake06 = true,
-            "--kwp" => {
-                o.kwp = true;
-                o.kw1281 = false;
-            }
-            "--raw" => o.kw1281 = false,
-            "--acks" => o.acks = num(&v()?)? as u32,
-            "--show-rx" => o.show_rx = true,
-            "--addr" => o.addr = u8::from_str_radix(&v()?, 16).map_err(|e| format!("{e}"))?,
-            "--gap" => o.gap_ms = v()?.parse().map_err(|e| format!("{e}"))?,
-            "--baud" => o.baud = v()?.parse().map_err(|e| format!("{e}"))?,
-            "--stop-at" => {
-                o.stop_at_pc = Some(u16::from_str_radix(&v()?, 16).map_err(|e| format!("{e}"))?)
-            }
-            "--adc" => {
-                let s = v()?;
-                let (c, val) = s.split_once('=').ok_or("--adc CH=VAL")?;
-                o.adc.push((num(c)? as usize, num(val)? as u16));
-            }
-            "--pin" => {
-                let s = v()?;
-                let (r, b) = s.split_once('.').ok_or("--pin SFR.BIT")?;
-                o.pin = Some((
-                    u8::from_str_radix(r, 16).map_err(|e| format!("{e}"))?,
-                    b.parse().map_err(|e| format!("{e}"))?,
-                ));
-            }
-            s if s.starts_with('-') => return Err(format!("unknown option {s}")),
-            s => o.rom = s.to_string(),
-        }
-    }
-    if o.rom.is_empty() {
-        return Err("usage: ecu8051 ROM [options] (see source header)".into());
-    }
-    Ok(o)
-}
+mod cli;
+use cli::parse;
 
 /// ISO 14230 frame: format byte with length, target 0x11, source 0xF1.
 fn frame(data: &[u8]) -> Vec<u8> {
@@ -319,13 +184,7 @@ enum Phase {
 }
 
 fn main() -> ExitCode {
-    let o = match parse() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
+    let o = parse();
     let rom = match std::fs::read(&o.rom) {
         Ok(r) => r,
         Err(e) => {

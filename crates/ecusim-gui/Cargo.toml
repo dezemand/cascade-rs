@@ -13,6 +13,7 @@ name = "ecusim-gui"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 ecusim = { path = "../ecusim" }
 gpui-kit = "0.10.0"
 

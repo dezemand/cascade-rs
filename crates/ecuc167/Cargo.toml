@@ -12,5 +12,6 @@ description = "Infineon C167-class (C16x) disassembler and emulator for offline 
 workspace = true
 
 [dependencies]
+clap.workspace = true
 cascade-iface.workspace = true
 cascade-can = { path = "../cascade-can" }

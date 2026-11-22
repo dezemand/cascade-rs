@@ -12,3 +12,4 @@ description = "Siemens 80C517-class 8051 emulator for offline analysis of an ear
 workspace = true
 
 [dependencies]
+clap.workspace = true

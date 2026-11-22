@@ -67,8 +67,13 @@ The GUI is built separately because GPUI pulls in about 500 crates:
 
 ```sh
 tools/bundle-gui.sh                      # builds target/Cascade.app (macOS)
-open target/Cascade.app --args path/to/hyundai.his.dat
+open target/Cascade.app                  # setup screen: pick the pack
+open target/Cascade.app --args path/to/hyundai.his.dat   # or skip it
 ```
+
+Started without a pack, the GUI asks for it (and the optional
+troubleshooting pack and engine ECU dump) and remembers the choices in
+`~/Library/Application Support/cascade-rs/`.
 
 ## Quick start
 
@@ -140,6 +145,7 @@ and, through `kdiag elm`, ELM327 OBD apps.
 
 ```sh
 tools/bundle-ecusim.sh
+open target/EcuSim.app                   # setup screen: pick the dump
 open target/EcuSim.app --args --rom path/to/simk4x-without-immobiliser.bin
 kdiag log --ecusim auto --duration-s 5
 ```

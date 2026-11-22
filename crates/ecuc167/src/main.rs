@@ -10,7 +10,7 @@
 //! ecuc167 run  ROM [options]           emulate; see `run` below
 //! ```
 //!
-//! `run` options:
+//! `run` options (`ecuc167 help run` lists them with their defaults):
 //! - `-m MS` emulated time (default 3000), `--fcpu HZ` (default 16 MHz: the boot code's S0BG 0x2F
 //!   is then 10,417 baud and the CAPCOM2 CC26 tick exactly 1 ms)
 //! - `--init-at MS` start the tester: KWP2000 fast init (25 ms low, 25 ms
@@ -50,16 +50,8 @@ use cpu::{Cpu, Event};
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    s.split([' ', ','])
-        .filter(|t| !t.is_empty())
-        .map(|t| u8::from_str_radix(t, 16).map_err(|e| format!("{t}: {e}")))
-        .collect()
-}
-
-fn hexnum(s: &str) -> Result<u32, String> {
-    u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("{s}: {e}"))
-}
+mod cli;
+use cli::{Cmd, RunOpts};
 
 fn hx(b: &[u8]) -> String {
     b.iter()
@@ -69,12 +61,13 @@ fn hx(b: &[u8]) -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let r = match args.first().map(String::as_str) {
-        Some("dis") => cmd_dis(&args[1..]),
-        Some("scan") => cmd_scan(&args[1..]),
-        Some("run") => cmd_run(&args[1..]),
-        _ => Err("usage: ecuc167 dis|scan|run ROM ... (see source header)".into()),
+    let (cli, m) = cli::parse();
+    let r = match cli.cmd {
+        Cmd::Dis { rom, addr, count } => cmd_dis(&rom, addr, count),
+        Cmd::Scan { rom, refs, from } => cmd_scan(&rom, &refs, &from),
+        Cmd::Run(a) => {
+            cli::parse_run(*a, m.subcommand_matches("run").expect("run matches")).and_then(cmd_run)
+        }
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -102,12 +95,9 @@ fn line(c: &Cpu, pc: u32) -> (u8, String) {
     )
 }
 
-fn cmd_dis(a: &[String]) -> Result<(), String> {
-    let rom = load(a.first().ok_or("ROM")?)?;
-    let mut pc = hexnum(a.get(1).ok_or("ADDR")?)?;
-    let n: usize = a
-        .get(2)
-        .map_or(Ok(40), |s| s.parse().map_err(|e| format!("{e}")))?;
+fn cmd_dis(rom: &str, addr: u32, n: usize) -> Result<(), String> {
+    let rom = load(rom)?;
+    let mut pc = addr;
     let c = Cpu::new(rom, 16_000_000);
     let mut extr = 0u8;
     for _ in 0..n {
@@ -176,20 +166,10 @@ fn traverse(c: &Cpu, extra: &[u32]) -> BTreeMap<u32, isa::Decoded> {
     seen
 }
 
-fn cmd_scan(a: &[String]) -> Result<(), String> {
-    let rom = load(a.first().ok_or("ROM")?)?;
-    let mut refs = Vec::new();
-    let mut extra = Vec::new();
-    let mut it = a[1..].iter();
-    while let Some(x) = it.next() {
-        match x.as_str() {
-            "--refs" => refs.push(hexnum(it.next().ok_or("--refs HEX")?)? as u16),
-            "--from" => extra.push(hexnum(it.next().ok_or("--from PC")?)?),
-            s => return Err(format!("unknown option {s}")),
-        }
-    }
+fn cmd_scan(rom: &str, refs: &[u16], extra: &[u32]) -> Result<(), String> {
+    let rom = load(rom)?;
     let c = Cpu::new(rom, 16_000_000);
-    let code = traverse(&c, &extra);
+    let code = traverse(&c, extra);
     println!("{} instructions reached", code.len());
     use isa::Op;
     let hit = |o: Op, v: u16| match o {
@@ -221,7 +201,7 @@ fn cmd_scan(a: &[String]) -> Result<(), String> {
                 .collect(),
             _ => vec![],
         };
-        for &v in &refs {
+        for &v in refs {
             if ops.iter().any(|&o| hit(o, v)) {
                 println!("{}", line(&c, pc).1);
             }
@@ -246,224 +226,6 @@ fn frame(data: &[u8]) -> Vec<u8> {
     f
 }
 
-struct RunOpts {
-    rom: String,
-    max_ms: f64,
-    fcpu: u64,
-    init_at: Option<f64>,
-    reqs: Vec<Vec<u8>>,
-    p3_ms: f64,
-    gap_ms: f64,
-    wake_low: f64,
-    wake_high: f64,
-    adc: Vec<(usize, u16)>,
-    wheels: Vec<cpu::Wheel>,
-    compares: bool,
-    rpm_at: Vec<(f64, f64)>,
-    p2_in: Option<u16>,
-    cmp_wr: bool,
-    ssc_trace: bool,
-    watch_from: f64,
-    adc_at: Vec<(f64, usize, u16)>,
-    ram_in: Vec<(String, u32)>,
-    ram_out: Vec<(String, u32, u32)>,
-    echo: bool,
-    trace_from: Option<f64>,
-    trace_n: u64,
-    prof: bool,
-    watch: Vec<(u32, u32)>,
-    stop_at: Option<u32>,
-    dumps: Vec<(u32, u32)>,
-    start: Vec<u8>,
-    show_rx: bool,
-    pokes: Vec<(u32, u32, Vec<u8>)>,
-    watch_w: bool,
-    can_log: bool,
-    can_ack: bool,
-    /// Frames another node sends: (id, data, period ms).
-    can_rx: Vec<(u32, Vec<u8>, f64)>,
-}
-
-fn parse_run(a: &[String]) -> Result<RunOpts, String> {
-    let mut o = RunOpts {
-        rom: String::new(),
-        max_ms: 3000.0,
-        fcpu: 16_000_000,
-        init_at: None,
-        reqs: Vec::new(),
-        p3_ms: 60.0,
-        gap_ms: 2.0,
-        wake_low: 25.0,
-        wake_high: 25.0,
-        adc: Vec::new(),
-        wheels: Vec::new(),
-        compares: false,
-        rpm_at: Vec::new(),
-        p2_in: None,
-        cmp_wr: true,
-        ssc_trace: false,
-        watch_from: 0.0,
-        adc_at: Vec::new(),
-        ram_in: Vec::new(),
-        ram_out: Vec::new(),
-        echo: true,
-        trace_from: None,
-        trace_n: 2000,
-        prof: false,
-        watch: Vec::new(),
-        stop_at: None,
-        dumps: Vec::new(),
-        start: vec![0x81],
-        show_rx: false,
-        pokes: Vec::new(),
-        watch_w: false,
-        can_log: false,
-        can_ack: false,
-        can_rx: Vec::new(),
-    };
-    let mut it = a.iter();
-    let f = |s: &str| s.parse::<f64>().map_err(|e| format!("{s}: {e}"));
-    while let Some(x) = it.next() {
-        let mut v = || it.next().cloned().ok_or(format!("{x} needs a value"));
-        match x.as_str() {
-            "-m" => o.max_ms = f(&v()?)?,
-            "--fcpu" => o.fcpu = v()?.parse().map_err(|e| format!("{e}"))?,
-            "--init-at" => o.init_at = Some(f(&v()?)?),
-            "--req" => o.reqs.push(hex_bytes(&v()?)?),
-            "--start" => o.start = hex_bytes(&v()?)?,
-            "--p3" => o.p3_ms = f(&v()?)?,
-            "--gap" => o.gap_ms = f(&v()?)?,
-            "--wake-low" => o.wake_low = f(&v()?)?,
-            "--wake-high" => o.wake_high = f(&v()?)?,
-            "--no-echo" => o.echo = false,
-            "--trace-from" => o.trace_from = Some(f(&v()?)?),
-            "--trace-n" => o.trace_n = v()?.parse().map_err(|e| format!("{e}"))?,
-            "--prof" => o.prof = true,
-            "--show-rx" => o.show_rx = true,
-            "--poke-at" => {
-                let pc = hexnum(&v()?)?;
-                let s = v()?;
-                let (a, b) = s.split_once('=').ok_or("--poke-at PC ADDR=HEX..")?;
-                o.pokes.push((pc, hexnum(a)?, hex_bytes(b)?));
-            }
-            "--stop-at" => o.stop_at = Some(hexnum(&v()?)?),
-            "--adc" => {
-                let s = v()?;
-                let (c, val) = s.split_once('=').ok_or("--adc CH=VAL")?;
-                o.adc
-                    .push((c.parse().map_err(|e| format!("{e}"))?, hexnum(val)? as u16));
-            }
-            "--watch-w" => o.watch_w = true,
-            "--can-log" => o.can_log = true,
-            "--can-ack" => o.can_ack = true,
-            "--can-rx" => {
-                let s = v()?;
-                let p: Vec<&str> = s.split(':').collect();
-                let [id, data, period] = p[..] else {
-                    return Err("--can-rx ID:HEX:PERIOD_MS".into());
-                };
-                o.can_rx
-                    .push((cascade_can::parse_id(id)?, hex_bytes(data)?, f(period)?));
-                // a node that sends also acknowledges
-                o.can_ack = true;
-            }
-            "--watch" => {
-                let s = v()?;
-                let (l, h) = s.split_once('-').unwrap_or((&s, &s));
-                o.watch.push((hexnum(l)?, hexnum(h)?));
-            }
-            "--compares" => o.compares = true,
-            "--watch-from" => {
-                o.watch_from = v()?
-                    .parse::<f64>()
-                    .map_err(|e| format!("--watch-from: {e}"))?
-            }
-            "--adc-at" => {
-                // MS:CH=VAL: change an ADC input at that time
-                let a = v()?;
-                let (t, r) = a.split_once(':').ok_or("--adc-at MS:CH=VAL")?;
-                let (ch, val) = r.split_once('=').ok_or("--adc-at MS:CH=VAL")?;
-                o.adc_at.push((
-                    t.parse::<f64>().map_err(|e| format!("--adc-at {t}: {e}"))?,
-                    ch.parse::<usize>()
-                        .map_err(|e| format!("--adc-at {ch}: {e}"))?,
-                    hexnum(val)? as u16,
-                ));
-            }
-            "--ram-in" => {
-                // FILE@ADDR: load memory before reset (keep-alive RAM)
-                let a = v()?;
-                let (f, addr) = a.split_once('@').ok_or("--ram-in FILE@ADDR")?;
-                o.ram_in.push((f.to_string(), hexnum(addr)?));
-            }
-            "--ram-out" => {
-                // FILE@ADDR:LEN: save memory at the end
-                let a = v()?;
-                let (f, r) = a.split_once('@').ok_or("--ram-out FILE@ADDR:LEN")?;
-                let (addr, len) = r.split_once(':').ok_or("--ram-out FILE@ADDR:LEN")?;
-                o.ram_out.push((f.to_string(), hexnum(addr)?, hexnum(len)?));
-            }
-            "--ssc-trace" => o.ssc_trace = true,
-            "--no-compare-on-write" => o.cmp_wr = false,
-            "--p2-in" => o.p2_in = Some(hexnum(&v()?)? as u16),
-            "--rpm-at" => {
-                // MS=RPM: set the first wheel's speed at that time
-                let a = v()?;
-                let (t, r) = a.split_once('=').ok_or("--rpm-at MS=RPM")?;
-                let num = |x: &str| x.parse::<f64>().map_err(|e| format!("--rpm-at {x}: {e}"));
-                o.rpm_at.push((num(t)?, num(r)?));
-            }
-            "--cam" => {
-                // PINS:FALL:RISE[:FALL:RISE...] in crank tooth positions over
-                // 720 degrees, locked to the last --wheel
-                let a = v()?;
-                let f: Vec<&str> = a.split(':').collect();
-                if f.len() < 3 || f.len().is_multiple_of(2) {
-                    return Err("--cam PINS:FALL:RISE[:FALL:RISE...]".into());
-                }
-                let targets = f[0]
-                    .split('+')
-                    .map(str::parse)
-                    .collect::<Result<Vec<cpu::Pin>, _>>()?;
-                let n = |x: &str| x.parse::<u32>().map_err(|e| format!("--cam {x}: {e}"));
-                let lows = f[1..]
-                    .chunks(2)
-                    .map(|c| Ok((n(c[0])?, n(c[1])?)))
-                    .collect::<Result<Vec<_>, String>>()?;
-                let w = o.wheels.last_mut().ok_or("--cam needs a --wheel first")?;
-                w.cam = Some(cpu::Cam { targets, lows });
-            }
-            "--wheel" => {
-                // PINS:TEETH:MISSING:RPM, e.g. t0in+capin:60:2:800
-                let a = v()?;
-                let f: Vec<&str> = a.split(':').collect();
-                let [pins, t, m, rpm] = f[..] else {
-                    return Err("--wheel PINS:TEETH:MISSING:RPM".into());
-                };
-                let pins = pins
-                    .split('+')
-                    .map(str::parse)
-                    .collect::<Result<Vec<cpu::Pin>, _>>()?;
-                let num = |x: &str| x.parse::<f64>().map_err(|e| format!("--wheel {x}: {e}"));
-                let mut w = cpu::Wheel::new(pins, num(t)? as u32, num(m)? as u32);
-                w.rpm = num(rpm)?;
-                o.wheels.push(w);
-            }
-            "--dump" => {
-                let a = hexnum(&v()?)?;
-                let n = hexnum(&v()?)?;
-                o.dumps.push((a, n));
-            }
-            s if s.starts_with('-') => return Err(format!("unknown option {s}")),
-            s => o.rom = s.to_string(),
-        }
-    }
-    if o.rom.is_empty() {
-        return Err("run: ROM missing".into());
-    }
-    Ok(o)
-}
-
 enum Phase {
     Idle,
     /// Fast init: line low until .0, then idle high until .1.
@@ -476,8 +238,7 @@ enum Phase {
     Done,
 }
 
-fn cmd_run(a: &[String]) -> Result<(), String> {
-    let o = parse_run(a)?;
+fn cmd_run(o: RunOpts) -> Result<(), String> {
     let rom = load(&o.rom)?;
     let mut c = Cpu::new(rom, o.fcpu);
     c.echo = o.echo;

@@ -10,6 +10,8 @@
 //!   kdiag log  (--sim | --port DEV) [--system engine|abs|tcs] [--out FILE.csv]
 //!              [--interval-ms N] [--duration-s N] [line options]
 //!
+//! `kdiag help COMMAND` lists every option with its default.
+//!
 //! Line options: --trace FILE.jsonl (every byte with a timestamp),
 //! --no-echo (adapter does not hear its own bytes), --wake break|zero
 //! (fast-init method).
@@ -54,7 +56,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use cascade_diag::defs::{self, Value};
 use cascade_diag::j2534::{J2534Link, MockPassThru};
@@ -64,14 +65,10 @@ use cascade_diag::sim::SimLine;
 use cascade_diag::trace::{TracedLine, TracedLink};
 use cascade_diag::{guard, iso9141};
 use cascade_iface::{KwpConfig, KwpEcu};
+use clap::Parser;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum System {
-    Engine,
-    Abs,
-    Srs,
-    Tcs,
-}
+mod cli;
+use cli::{Cli, Cmd, Opts, System, check};
 
 impl System {
     fn address(self) -> u8 {
@@ -97,161 +94,6 @@ impl System {
             System::Tcs => Err("traction control data is read by tcs_log".into()),
         }
     }
-}
-
-#[derive(Clone)]
-struct Opts {
-    sim: bool,
-    sim_ecu: Option<String>,
-    port: Option<String>,
-    j2534: Option<String>,
-    j2534_mock: bool,
-    out: Option<String>,
-    trace: Option<String>,
-    interval: Duration,
-    duration: Option<Duration>,
-    echo: bool,
-    wake: String,
-    system: System,
-    allow_clear: bool,
-    yes: bool,
-    /// Socket of an `ecusim` server (the ECU dump as its own process).
-    ecusim: Option<String>,
-    /// `elm`: where to serve ELM327 clients.
-    listen: String,
-    /// SocketCAN interface, or `sim` (in-memory bus, simulated ECU).
-    can: Option<String>,
-    /// ISO-TP request and response identifiers.
-    can_ids: (u32, u32),
-    can_pad: Option<u8>,
-}
-
-fn parse(args: &[String]) -> Result<Opts, String> {
-    parse_opts(args, false)
-}
-
-/// `can_ecu`: --can is the bus to answer on, and the other source (if any)
-/// is the K-line ECU behind it.
-fn parse_opts(args: &[String], can_ecu: bool) -> Result<Opts, String> {
-    let mut o = Opts {
-        sim: false,
-        sim_ecu: None,
-        port: None,
-        j2534: None,
-        j2534_mock: false,
-        out: None,
-        trace: None,
-        interval: Duration::from_millis(170),
-        duration: None,
-        echo: true,
-        wake: "break".into(),
-        system: System::Engine,
-        allow_clear: false,
-        yes: false,
-        ecusim: None,
-        listen: "127.0.0.1:35000".into(),
-        can: None,
-        can_ids: (
-            cascade_can::ecu::OBD_ENGINE_REQUEST,
-            cascade_can::ecu::OBD_ENGINE_RESPONSE,
-        ),
-        can_pad: Some(0xaa),
-    };
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut val = || {
-            it.next()
-                .cloned()
-                .ok_or_else(|| format!("{a} needs a value"))
-        };
-        match a.as_str() {
-            "--sim" => o.sim = true,
-            "--j2534" => o.j2534 = Some(val()?),
-            "--j2534-mock" => o.j2534_mock = true,
-            "--ecusim" => o.ecusim = Some(val()?),
-            "--listen" => o.listen = val()?,
-            "--can" => o.can = Some(val()?),
-            "--can-ids" => {
-                let v = val()?;
-                let (tx, rx) = v
-                    .split_once(':')
-                    .ok_or_else(|| format!("--can-ids {v:?}: want TX:RX, like 7E0:7E8"))?;
-                o.can_ids = (cascade_can::parse_id(tx)?, cascade_can::parse_id(rx)?);
-            }
-            "--can-pad" => {
-                let v = val()?;
-                o.can_pad = if v == "none" {
-                    None
-                } else {
-                    Some(u8::from_str_radix(&v, 16).map_err(|e| format!("--can-pad {v:?}: {e}"))?)
-                };
-            }
-            "--sim-ecu" => {
-                o.sim_ecu = Some(val()?);
-                o.sim = true;
-            }
-            "--port" => o.port = Some(val()?),
-            "--out" => o.out = Some(val()?),
-            "--trace" => o.trace = Some(val()?),
-            "--no-echo" => o.echo = false,
-            "--wake" => o.wake = val()?,
-            "--allow-clear" => o.allow_clear = true,
-            "--yes" => o.yes = true,
-            "--system" => {
-                o.system = match val()?.as_str() {
-                    "engine" => System::Engine,
-                    "abs" => System::Abs,
-                    "srs" => System::Srs,
-                    "tcs" => System::Tcs,
-                    s => return Err(format!("unknown --system {s:?} (engine, abs, srs, tcs)")),
-                }
-            }
-            "--interval-ms" => {
-                o.interval = Duration::from_millis(val()?.parse().map_err(|e| format!("{e}"))?)
-            }
-            "--duration-s" => {
-                o.duration = Some(Duration::from_secs(
-                    val()?.parse().map_err(|e| format!("{e}"))?,
-                ))
-            }
-            _ => return Err(format!("unexpected argument {a:?}")),
-        }
-    }
-    let sources =
-        o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8 + o.ecusim.is_some() as u8;
-    if can_ecu {
-        return match &o.can {
-            None => Err("can-ecu needs --can IFACE (the bus to answer on)".into()),
-            Some(_) if sources > 1 => {
-                Err("can-ecu bridges at most one K-line source (--sim, --port or --ecusim)".into())
-            }
-            Some(_) => Ok(o),
-        };
-    }
-    if o.can.is_some() {
-        if sources != 0 || o.j2534_mock {
-            return Err("--can replaces --sim, --port, --ecusim and --j2534".into());
-        }
-        if o.system != System::Engine {
-            return Err(
-                "over CAN kdiag speaks OBD-II to the engine ECU only (--system engine)".into(),
-            );
-        }
-        return Ok(o);
-    }
-    if sources != 1 {
-        return Err(
-            "give exactly one of --sim, --port DEV, --ecusim SOCKET|auto, --j2534 DLL|auto or --can IFACE|sim"
-                .into(),
-        );
-    }
-    if o.system == System::Tcs && (o.j2534.is_some() || o.j2534_mock) {
-        return Err("traction control (ISO 9141-2, 5-baud init) is not done over J2534 yet".into());
-    }
-    if o.j2534_mock && !o.sim && o.ecusim.is_none() {
-        return Err("--j2534-mock goes with --sim, --sim-ecu or --ecusim".into());
-    }
-    Ok(o)
 }
 
 /// ABS simulator: standing still, 800 rpm, 14 V, brake pressed.
@@ -562,10 +404,9 @@ fn open_serial(o: &Opts) -> Result<Box<dyn Line>, String> {
     use cascade_diag::serial::{SerialLine, WakeMethod};
     let port = o.port.as_deref().unwrap_or_default();
     let mut l = SerialLine::open(port, o.echo).map_err(|e| format!("{port}: {e}"))?;
-    l.wake = match o.wake.as_str() {
-        "break" => WakeMethod::Break,
-        "zero" => WakeMethod::ZeroByte,
-        w => return Err(format!("unknown --wake {w:?} (break, zero)")),
+    l.wake = match o.wake {
+        cli::Wake::Break => WakeMethod::Break,
+        cli::Wake::Zero => WakeMethod::ZeroByte,
     };
     Ok(Box::new(l))
 }
@@ -886,7 +727,10 @@ fn ecusim_battery(sock: &str) -> Option<f64> {
     };
     let mut c = ecusim::client::Conn::connect(&path).ok()?;
     c.send(&ToServer::Watch).ok()?;
-    match c.recv_timeout(Duration::from_millis(300)).ok()?? {
+    match c
+        .recv_timeout(std::time::Duration::from_millis(300))
+        .ok()??
+    {
         ToClient::Status(kv) => kv.iter().find(|(k, _)| k == "battery")?.1.parse().ok(),
         _ => None,
     }
@@ -1118,23 +962,16 @@ fn can_ecu(o: &Opts) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let r = match args.split_first() {
-        Some((cmd, rest)) if cmd == "dtc" => parse(rest).and_then(|o| dtc(&o)),
-        Some((cmd, rest)) if cmd == "log" => parse(rest).and_then(|o| log(&o)),
-        Some((cmd, rest)) if cmd == "clear" => parse(rest).and_then(|o| clear(&o)),
-        Some((cmd, rest)) if cmd == "ident" => parse(rest).and_then(|o| ident(&o)),
-        Some((cmd, rest)) if cmd == "crash" => parse(rest).and_then(|o| crash(&o)),
-        Some((cmd, rest)) if cmd == "elm" => parse(rest).and_then(|o| elm(&o)),
-        Some((cmd, rest)) if cmd == "can-ecu" => parse_opts(rest, true).and_then(|o| can_ecu(&o)),
-        Some((cmd, _)) if cmd == "j2534-list" => j2534_list(),
-        Some((cmd, rest)) if cmd == "selftest" => match rest {
-            [flag, dev] if flag == "--port" => selftest(dev),
-            _ => Err("usage: kdiag selftest --port DEV".into()),
-        },
-        _ => Err("usage: kdiag dtc|log|clear|ident|crash|elm|can-ecu|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto | --can IFACE|sim [--can-ids TX:RX] [--can-pad XX|none]) [--system engine|abs|srs|tcs] [--out F] \
-                  [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
-            .into()),
+    let r = match Cli::parse().cmd {
+        Cmd::Dtc(o) => check(o, false).and_then(|o| dtc(&o)),
+        Cmd::Log(o) => check(o, false).and_then(|o| log(&o)),
+        Cmd::Clear(o) => check(o, false).and_then(|o| clear(&o)),
+        Cmd::Ident(o) => check(o, false).and_then(|o| ident(&o)),
+        Cmd::Crash(o) => check(o, false).and_then(|o| crash(&o)),
+        Cmd::Elm(o) => check(o, false).and_then(|o| elm(&o)),
+        Cmd::CanEcu(o) => check(o, true).and_then(|o| can_ecu(&o)),
+        Cmd::J2534List => j2534_list(),
+        Cmd::Selftest { port } => selftest(&port),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

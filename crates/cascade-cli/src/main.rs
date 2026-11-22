@@ -1,6 +1,8 @@
 //! `cascade` command-line tool.
 //!
 //! Commands:
+//! (`cascade help run` lists every option with its default.)
+//!
 //!   cascade run <rom> [-m CYCLES] [--trace FILE] [--dump DIR]
 //!               [--key CYCLE:NAME[:HOLD]]... [--screen]
 //!       Run the emulator headless. The diagnostic line is upstream's fake
@@ -48,6 +50,7 @@
 //!       ADDR. Below 0xC000 the ROM maps 1:1; 0xC000-0xFFFF is the code
 //!       window, whose physical start is --bank (default 0xC000).
 
+mod cli;
 mod png;
 
 use std::collections::HashSet;
@@ -55,8 +58,12 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::ExitCode;
 
+use clap::ArgMatches;
+
+use cli::{Cmd, RunArgs, iface_choice};
+
 use cascade_core::trace::{Divergence, ParseError, Reader, Record, first_divergence};
-use cascade_core::{Cpu, Key, KeyEvent, StepEvent, Stop};
+use cascade_core::{Cpu, KeyEvent, StepEvent, Stop};
 
 fn records(path: &str) -> Result<impl Iterator<Item = Result<Record, ParseError>>, String> {
     let f = File::open(path).map_err(|e| format!("{path}: {e}"))?;
@@ -100,207 +107,75 @@ fn trace_stats(path: &str) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn parse_num(s: &str) -> Result<u64, String> {
-    let s = s.replace('_', "");
-    let r = if let Some(h) = s.strip_prefix("0x") {
-        u64::from_str_radix(h, 16)
-    } else if let Some(m) = s.strip_suffix('M') {
-        m.parse::<u64>().map(|v| v * 1_000_000)
-    } else {
-        s.parse()
-    };
-    r.map_err(|e| format!("{s:?}: {e}"))
-}
-
-fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
-    let h: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if !h.len().is_multiple_of(2) {
-        return Err(format!("odd hex length in {s:?}"));
-    }
-    (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).map_err(|e| format!("{s:?}: {e}")))
-        .collect()
-}
-
-fn run(args: &[&str]) -> Result<ExitCode, String> {
-    let mut rom_path = None;
-    let mut max = u64::MAX;
-    let mut trace_path = None;
-    let mut dump_dir = None;
-    let mut screen = false;
-    let mut png_path = None;
-    let mut lcd_dump_path = None;
-    let mut line_log_path = None;
-    let mut kwp_log_path = None;
-    let mut dtcs: Vec<(u16, u8)> = Vec::new();
-    let mut local_data = std::collections::BTreeMap::new();
-    let mut responses = std::collections::BTreeMap::new();
-    let mut kwp_addr: Option<u8> = None;
-    let mut replay = None;
-    let mut ecu_rom: Option<String> = None;
-    let mut ecusim_sock: Option<std::path::PathBuf> = None;
-    let mut realtime = false;
-    let mut exrom: Option<String> = None;
-    let mut eeprom_file: Option<String> = None;
-    let mut adc: Vec<(usize, u16)> = Vec::new();
-    let mut rom_reads: Option<(u64, String)> = None;
-    let mut pcs_out: Option<(u64, String)> = None;
-    let mut kwp_kb: Option<[u8; 2]> = None;
-    let mut kwp_len_byte = false;
-    let mut kwp_p3_max: Option<u64> = None;
-    let mut kwp_5baud_kb: Option<[u8; 2]> = None;
-    let mut kwp_iso9141 = false;
-    let mut stats = false;
-    let mut continue_after_reset = false;
-    let mut iface_name = "fake";
-    let mut keys = Vec::new();
-    let mut it = args.iter();
-    while let Some(&a) = it.next() {
-        let mut val = || {
-            it.next()
-                .copied()
-                .ok_or_else(|| format!("{a} needs a value"))
-        };
-        match a {
-            "-m" => max = parse_num(val()?)?,
-            "--trace" => trace_path = Some(val()?),
-            "--dump" => dump_dir = Some(val()?),
-            "--screen" => screen = true,
-            "--png" => png_path = Some(val()?),
-            "--lcd-dump" => lcd_dump_path = Some(val()?),
-            "--line-log" => line_log_path = Some(val()?),
-            "--kwp-log" => kwp_log_path = Some(val()?),
-            "--local" => {
-                let v = val()?;
-                let (id, hex) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("bad --local {v:?}, want ID=HEX"))?;
-                let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-                if !hex.len().is_multiple_of(2) {
-                    return Err(format!("odd hex length in --local {v:?}"));
-                }
-                let bytes = (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-                    .collect::<Result<Vec<u8>, _>>()
-                    .map_err(|e| format!("--local {v:?}: {e}"))?;
-                local_data.insert(parse_num(id)? as u8, bytes);
-            }
-            "--kwp-addr" => kwp_addr = Some(parse_num(val()?)? as u8),
-            "--pcs" => {
-                let v = val()?;
-                let (from, file) = v
-                    .split_once(':')
-                    .ok_or_else(|| format!("bad --pcs {v:?}, want FROM_CYCLE:FILE"))?;
-                pcs_out = Some((parse_num(from)?, file.to_string()));
-            }
-            "--rom-reads" => {
-                let v = val()?;
-                let (from, file) = v
-                    .split_once(':')
-                    .ok_or_else(|| format!("bad --rom-reads {v:?}, want FROM_CYCLE:FILE"))?;
-                rom_reads = Some((parse_num(from)?, file.to_string()));
-            }
-            "--exrom" | "-x" => exrom = Some(val()?.to_string()),
-            "--eeprom" => eeprom_file = Some(val()?.to_string()),
-            "--ecu-rom" => {
-                ecu_rom = Some(val()?.to_string());
-                iface_name = "simk41";
-            }
-            #[cfg(unix)]
-            "--ecusim" => {
-                let v = val()?;
-                ecusim_sock = Some(if v == "auto" {
-                    ecusim::default_socket()
-                } else {
-                    v.into()
-                });
-                iface_name = "ecusim";
-                // the ECU process runs in real time
-                realtime = true;
-            }
-            "--realtime" => realtime = true,
-            "--ecu-adc" => {
-                let v = val()?;
-                let (ch, x) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("bad --ecu-adc {v:?}, want CH=VALUE"))?;
-                adc.push((parse_num(ch)? as usize, parse_num(x)? as u16));
-            }
-            "--replay" => {
-                let p = val()?;
-                let text = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
-                let rec =
-                    cascade_iface::replay::from_jsonl(&text).map_err(|e| format!("{p}: {e}"))?;
-                eprintln!(
-                    "replay: {} answers to {} distinct requests from {p} (address {:02X?}, {} unanswered)",
-                    rec.pairs(),
-                    rec.sequences.len(),
-                    rec.address,
-                    rec.unanswered
-                );
-                replay = Some(rec);
-                iface_name = "kwp";
-            }
-            "--kwp-keybytes" => {
-                let kb = parse_hex(val()?)?;
-                kwp_kb = Some(kb.try_into().map_err(|_| "--kwp-keybytes needs 2 bytes")?);
-            }
-            "--kwp-length-byte" => kwp_len_byte = true,
-            "--kwp-p3-max" => kwp_p3_max = Some(parse_num(val()?)?),
-            "--kwp-iso9141" => kwp_iso9141 = true,
-            "--kwp-5baud-keybytes" => {
-                let kb = parse_hex(val()?)?;
-                kwp_5baud_kb = Some(
-                    kb.try_into()
-                        .map_err(|_| "--kwp-5baud-keybytes needs 2 bytes")?,
-                );
-            }
-            "--respond" => {
-                let v = val()?;
-                let (req, resp) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("bad --respond {v:?}, want REQHEX=RESPHEX"))?;
-                responses.insert(parse_hex(req)?, parse_hex(resp)?);
-            }
-            "--dtc" => {
-                let v = val()?;
-                let (c, st) = v
-                    .split_once(':')
-                    .ok_or_else(|| format!("bad --dtc {v:?}, want CODE:STATUS"))?;
-                dtcs.push((parse_num(c)? as u16, parse_num(st)? as u8));
-            }
-            "--stats" => stats = true,
-            "--iface" => iface_name = val()?,
-            "--continue-after-reset" => continue_after_reset = true,
-            "--key" => {
-                let v = val()?;
-                let parts: Vec<&str> = v.split(':').collect();
-                let (at, name, hold) = match parts.as_slice() {
-                    [at, name] => (*at, *name, "3M"),
-                    [at, name, hold] => (*at, *name, *hold),
-                    _ => return Err(format!("bad --key {v:?}, want CYCLE:NAME[:HOLD]")),
-                };
-                let key = Key::from_name(name).ok_or_else(|| format!("unknown key {name:?}"))?;
-                let at = parse_num(at)?;
-                keys.push(KeyEvent {
-                    at,
-                    key,
-                    down: true,
-                });
-                keys.push(KeyEvent {
-                    at: at + parse_num(hold)?,
-                    key,
-                    down: false,
-                });
-            }
-            _ if rom_path.is_none() && !a.starts_with('-') => rom_path = Some(a),
-            _ => return Err(format!("unexpected argument {a:?}")),
+fn run(a: RunArgs, m: &ArgMatches) -> Result<ExitCode, String> {
+    let RunArgs {
+        rom: rom_path,
+        max,
+        trace: trace_path,
+        dump: dump_dir,
+        key,
+        screen,
+        png: png_path,
+        lcd_dump: lcd_dump_path,
+        line_log: line_log_path,
+        stats,
+        iface,
+        kwp_log: kwp_log_path,
+        dtc: dtcs,
+        local,
+        respond,
+        kwp_addr,
+        kwp_keybytes: kwp_kb,
+        kwp_length_byte: kwp_len_byte,
+        kwp_p3_max,
+        kwp_5baud_keybytes: kwp_5baud_kb,
+        kwp_iso9141,
+        replay,
+        exrom,
+        eeprom: eeprom_file,
+        ecu_rom,
+        ecu_adc: adc,
+        ecusim,
+        realtime,
+        rom_reads,
+        pcs: pcs_out,
+        continue_after_reset,
+    } = a;
+    let max = max.unwrap_or(u64::MAX);
+    let local_data: std::collections::BTreeMap<u8, Vec<u8>> = local.into_iter().collect();
+    let responses: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = respond.into_iter().collect();
+    let keys: Vec<KeyEvent> = key.into_iter().flatten().collect();
+    let iface_name = iface_choice(&iface, m);
+    // the ECU process runs in real time
+    let realtime = realtime || ecusim.is_some();
+    #[cfg(unix)]
+    let ecusim_sock: Option<std::path::PathBuf> = ecusim.map(|v| {
+        if v == "auto" {
+            ecusim::default_socket()
+        } else {
+            v.into()
         }
+    });
+    #[cfg(not(unix))]
+    if ecusim.is_some() {
+        return Err("--ecusim needs a Unix build (ecusim serve)".into());
     }
-    let rom_path = rom_path.ok_or("run needs a ROM path")?;
-    let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let replay = match replay {
+        Some(p) => {
+            let text = std::fs::read_to_string(&p).map_err(|e| format!("{p}: {e}"))?;
+            let rec = cascade_iface::replay::from_jsonl(&text).map_err(|e| format!("{p}: {e}"))?;
+            eprintln!(
+                "replay: {} answers to {} distinct requests from {p} (address {:02X?}, {} unanswered)",
+                rec.pairs(),
+                rec.sequences.len(),
+                rec.address,
+                rec.unanswered
+            );
+            Some(rec)
+        }
+        None => None,
+    };
+    let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
     let mut kwp_log = None;
     let inner: Box<dyn cascade_iface::Interface> = match iface_name {
@@ -378,7 +253,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
         cpu.queue_key(k);
     }
 
-    let mut out = match trace_path {
+    let mut out = match &trace_path {
         Some(p) => Some(BufWriter::new(
             File::create(p).map_err(|e| format!("{p}: {e}"))?,
         )),
@@ -484,19 +359,19 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             st.swt_interrupts, st.rand_reads, st.uart_tx
         );
     }
-    if let Some(dir) = dump_dir {
+    if let Some(dir) = &dump_dir {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         std::fs::write(format!("{dir}/dump"), cpu.ram()).map_err(|e| e.to_string())?;
         std::fs::write(format!("{dir}/dump.ram"), cpu.mapped_ram()).map_err(|e| e.to_string())?;
     }
-    if let Some(p) = line_log_path {
+    if let Some(p) = &line_log_path {
         let mut w = BufWriter::new(File::create(p).map_err(|e| format!("{p}: {e}"))?);
         for e in line_log.borrow().iter() {
             writeln!(w, "{} {:?}", e.at, e.event).map_err(|e| e.to_string())?;
         }
         w.flush().map_err(|e| e.to_string())?;
     }
-    if let Some(p) = kwp_log_path {
+    if let Some(p) = &kwp_log_path {
         let log = kwp_log.ok_or("--kwp-log needs --iface kwp")?;
         let mut w = BufWriter::new(File::create(p).map_err(|e| format!("{p}: {e}"))?);
         let hex = |b: &[u8]| {
@@ -523,10 +398,10 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
         }
         w.flush().map_err(|e| e.to_string())?;
     }
-    if let Some(p) = lcd_dump_path {
+    if let Some(p) = &lcd_dump_path {
         std::fs::write(p, cpu.lcd.memory()).map_err(|e| format!("{p}: {e}"))?;
     }
-    if let Some(p) = png_path {
+    if let Some(p) = &png_path {
         let lcd = &cpu.lcd;
         let img = png::encode(
             cascade_core::lcd::LCD_WIDTH,
@@ -546,22 +421,9 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     })
 }
 
-fn disasm(args: &[&str]) -> Result<ExitCode, String> {
+fn disasm(rom_path: &str, addr: u64, n: u64, bank: u64) -> Result<ExitCode, String> {
     use cascade_core::disasm::{Flow, decode};
-    let (mut rom_path, mut addr, mut n, mut bank) = (None, None, 40u64, 0xc000u64);
-    let mut it = args.iter();
-    while let Some(&a) = it.next() {
-        let mut val = || it.next().copied().ok_or(format!("{a} needs a value"));
-        match a {
-            "-n" => n = parse_num(val()?)?,
-            "--bank" => bank = parse_num(val()?)?,
-            _ if rom_path.is_none() => rom_path = Some(a),
-            _ if addr.is_none() => addr = Some(parse_num(a)? as u16),
-            _ => return Err(format!("unexpected argument {a:?}")),
-        }
-    }
-    let rom_path = rom_path.ok_or("disasm needs a ROM path")?;
-    let mut pc = addr.ok_or("disasm needs an address")?;
+    let mut pc = addr as u16;
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let phys = |v: u16| -> usize {
         if v >= 0xc000 {
@@ -595,16 +457,12 @@ fn disasm(args: &[&str]) -> Result<ExitCode, String> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = match args.as_slice() {
-        ["run", rest @ ..] => run(rest),
-        ["trace-diff", l, r] => trace_diff(l, r),
-        ["trace-stats", p] => trace_stats(p),
-        ["disasm", rest @ ..] => disasm(rest),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--kwp-p3-max MS] [--kwp-5baud-keybytes HEX] [--kwp-iso9141] [--replay KDIAG.jsonl] [--exrom F] [--eeprom F] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
-                  cascade trace-diff <left> <right>\n       cascade trace-stats <log>\n       cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]"
-            .into()),
+    let (cli, m) = cli::parse();
+    let result = match cli.cmd {
+        Cmd::Run(a) => run(*a, m.subcommand_matches("run").expect("run matches")),
+        Cmd::TraceDiff { left, right } => trace_diff(&left, &right),
+        Cmd::TraceStats { log } => trace_stats(&log),
+        Cmd::Disasm { rom, addr, n, bank } => disasm(&rom, addr, n, bank),
     };
     result.unwrap_or_else(|e| {
         eprintln!("cascade: {e}");

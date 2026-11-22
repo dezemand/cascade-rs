@@ -10,9 +10,10 @@ repository.workspace = true
 
 [[bin]]
 name = "kdiag"
-path = "src/bin/kdiag.rs"
+path = "src/bin/kdiag/main.rs"
 
 [dependencies]
+clap.workspace = true
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }
 cascade-j2534 = { path = "../cascade-j2534" }

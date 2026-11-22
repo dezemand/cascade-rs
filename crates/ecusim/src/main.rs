@@ -33,37 +33,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use clap::Parser;
+
+mod cli;
+use cli::{Cli, Cmd};
 use ecusim::client::Conn;
 use ecusim::proto::{ToClient, ToServer};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut socket = ecusim::default_socket();
-    let mut rom = None;
-    let mut follow = false;
-    let mut rest = Vec::new();
-    let mut it = args.iter().skip(1);
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--socket" => socket = it.next().map(PathBuf::from).unwrap_or(socket),
-            "--rom" => rom = it.next().map(PathBuf::from),
-            "--follow" => follow = true,
-            _ => rest.push(a.clone()),
-        }
-    }
-    let r = match args.first().map(String::as_str) {
-        Some("serve") => serve(rom, &socket),
-        Some("set") => set(&socket, &rest),
-        Some("status") => status(&socket, follow),
-        Some("can") => can(&socket, &rest),
-        Some("play") => match rest.first() {
-            Some(f) => play(&socket, f),
-            None => Err("play SCENARIO_FILE".into()),
-        },
-        _ => Err(
-            "usage: ecusim serve --rom ROM [--socket P] | set NAME VALUE... | status [--follow]"
-                .into(),
-        ),
+    let cli = Cli::parse();
+    let socket = cli.socket.unwrap_or_else(ecusim::default_socket);
+    let r = match cli.cmd {
+        Cmd::Serve { rom } => serve(rom, &socket),
+        Cmd::Set { pairs } => set(&socket, &pairs),
+        Cmd::Status { follow } => status(&socket, follow),
+        Cmd::Can { limit, send } => can(&socket, limit, &send),
+        Cmd::Play { file } => play(&socket, &file),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -74,8 +59,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn serve(rom: Option<PathBuf>, socket: &Path) -> Result<(), String> {
-    let rom = rom.ok_or("serve needs --rom ROM (a SIMK41 dump without immobiliser)")?;
+fn serve(rom: PathBuf, socket: &Path) -> Result<(), String> {
     let data = ecusim::server::load_rom(&rom).map_err(|e| e.to_string())?;
     eprintln!("ecusim: {} on {}", rom.display(), socket.display());
     // a fault profile beside the dump (tools/fault_sweep.py --csv), if any
@@ -145,24 +129,9 @@ fn status(socket: &Path, follow: bool) -> Result<(), String> {
 
 /// Print the engine CAN bus traffic, candump style; optionally send one
 /// frame first. `-n N` stops after N frames.
-fn can(socket: &Path, args: &[String]) -> Result<(), String> {
-    let mut limit = None;
-    let mut send = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "-n" {
-            limit = Some(
-                it.next()
-                    .ok_or("-n N")?
-                    .parse::<usize>()
-                    .map_err(|e| e.to_string())?,
-            );
-        } else {
-            send.push(a.as_str());
-        }
-    }
+fn can(socket: &Path, limit: Option<usize>, send: &[String]) -> Result<(), String> {
     let mut c = connect(socket)?;
-    let first = match send[..] {
+    let first = match send {
         [] => ToServer::CanSub,
         [id, data] => ToServer::parse(&format!("CAN {id} {data}"))?,
         _ => return Err("can [-n N] [ID HEX]".into()),

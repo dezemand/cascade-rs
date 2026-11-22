@@ -12,6 +12,7 @@ description = "A GK 2.0 engine ECU dump running in real time as its own process,
 workspace = true
 
 [dependencies]
+clap.workspace = true
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }
 cascade-can = { path = "../cascade-can" }
