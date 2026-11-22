@@ -20,20 +20,46 @@
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToServer {
-    Tx { us: u64, bytes: Vec<u8> },
-    Low { us: u64 },
-    High { us: u64 },
+    Tx {
+        us: u64,
+        bytes: Vec<u8>,
+    },
+    Low {
+        us: u64,
+    },
+    High {
+        us: u64,
+    },
     Baud(u32),
     Line(i32),
-    Slow { us: u64, addr: u8 },
-    Set { name: String, value: String },
+    Slow {
+        us: u64,
+        addr: u8,
+    },
+    Set {
+        name: String,
+        value: String,
+    },
     Watch,
     KLine,
+    /// Send a frame on the engine CAN bus (and receive its traffic):
+    /// `CAN id hex`, id in hex (8 digits: 29-bit).
+    Can {
+        id: u32,
+        data: Vec<u8>,
+    },
+    /// Receive the engine CAN bus traffic.
+    CanSub,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToClient {
     Rx(Vec<u8>),
+    /// A frame on the engine CAN bus: `CAN id hex`.
+    Can {
+        id: u32,
+        data: Vec<u8>,
+    },
     Status(Vec<(String, String)>),
     Err(String),
 }
@@ -50,6 +76,28 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
+}
+
+/// A CAN identifier as text: 3 hex digits, or 8 for a 29-bit one.
+fn can_id(id: u32) -> String {
+    if id & cascade_can::EXTENDED != 0 {
+        format!("{:08X}", id & !cascade_can::EXTENDED)
+    } else {
+        format!("{id:03X}")
+    }
+}
+
+fn can_args(id: Option<&&str>, data: Option<&&str>) -> Result<(u32, Vec<u8>), String> {
+    let id = cascade_can::parse_id(id.ok_or("missing CAN id")?)?;
+    // no data field: an empty frame
+    let data = match data {
+        Some(h) => unhex(h).ok_or("bad hex")?,
+        None => Vec::new(),
+    };
+    if data.len() > 8 {
+        return Err("a CAN frame carries at most 8 bytes".into());
+    }
+    Ok((id, data))
 }
 
 impl ToServer {
@@ -84,6 +132,11 @@ impl ToServer {
             },
             Some("WATCH") => ToServer::Watch,
             Some("KLINE") => ToServer::KLine,
+            Some("CANSUB") => ToServer::CanSub,
+            Some("CAN") => {
+                let (id, data) = can_args(f.get(1), f.get(2))?;
+                ToServer::Can { id, data }
+            }
             _ => return Err(format!("unknown message {line:?}")),
         })
     }
@@ -99,6 +152,8 @@ impl ToServer {
             ToServer::Set { name, value } => format!("SET {name} {value}"),
             ToServer::Watch => "WATCH".into(),
             ToServer::KLine => "KLINE".into(),
+            ToServer::CanSub => "CANSUB".into(),
+            ToServer::Can { id, data } => format!("CAN {} {}", can_id(*id), hex(data)),
         }
     }
 }
@@ -115,6 +170,11 @@ impl ToClient {
                     .collect(),
             ),
             "ERR" => ToClient::Err(rest.into()),
+            "CAN" => {
+                let f: Vec<&str> = rest.split_whitespace().collect();
+                let (id, data) = can_args(f.first(), f.get(1))?;
+                ToClient::Can { id, data }
+            }
             _ => return Err(format!("unknown message {line:?}")),
         })
     }
@@ -133,6 +193,7 @@ impl ToClient {
                 s
             }
             ToClient::Err(e) => format!("ERR {e}"),
+            ToClient::Can { id, data } => format!("CAN {} {}", can_id(*id), hex(data)),
         }
     }
 }
@@ -159,6 +220,15 @@ mod tests {
             },
             ToServer::Watch,
             ToServer::KLine,
+            ToServer::CanSub,
+            ToServer::Can {
+                id: 0x43f,
+                data: vec![0, 1],
+            },
+            ToServer::Can {
+                id: 0x18da_10f1 | cascade_can::EXTENDED,
+                data: vec![],
+            },
         ] {
             assert_eq!(ToServer::parse(&m.line()).unwrap(), m);
         }
@@ -166,6 +236,10 @@ mod tests {
             ToClient::Rx(vec![0x83, 0xf1]),
             ToClient::Status(vec![("rpm".into(), "800".into())]),
             ToClient::Err("x y".into()),
+            ToClient::Can {
+                id: 0x316,
+                data: vec![5, 0x5a],
+            },
         ] {
             assert_eq!(ToClient::parse(&m.line()).unwrap(), m);
         }

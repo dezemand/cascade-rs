@@ -113,6 +113,8 @@ struct Client {
     line: i32,
     /// (client us, model cycles) for the ABS/TCS/SRS models.
     mclock: Option<(u64, u64)>,
+    /// Receives the engine CAN bus traffic.
+    can: bool,
 }
 
 impl Client {
@@ -168,6 +170,47 @@ struct Ecu {
     rx_bytes: u64,
     /// Virtual time of the last injection event (CC0-CC3).
     inj_at: f64,
+    /// The other nodes on the engine CAN bus.
+    bus: Bus,
+    /// Frames on the bus since the last pass (the ECU's and the nodes'),
+    /// for subscribed clients.
+    can_out: Vec<cascade_can::Frame>,
+    /// Last frame per identifier the ECU sent, and how many.
+    can_seen: BTreeMap<u32, (Vec<u8>, u64)>,
+}
+
+/// The engine CAN bus's other nodes (500 kbit/s; identifiers and layouts
+/// from the OpenGK CAN database, periods [assumed]). Their frames are
+/// put on the bus on the ECU's own clock.
+#[derive(Clone, Default)]
+struct Bus {
+    esp: bool,
+    gearbox: bool,
+    /// Wheel speed the ESP reports.
+    kmh: f64,
+    /// Frames from socket clients, sent with the next pass.
+    inject: Vec<cascade_can::Frame>,
+    /// ECU cycle each node frame is next due: 153, 1F0, 43F.
+    next: [u64; 3],
+}
+
+/// ESP and gearbox frames: (identifier, period ms).
+const NODE_FRAMES: [(u32, u64); 3] = [(0x153, 10), (0x1f0, 20), (0x43f, 10)];
+
+impl Bus {
+    fn frame(&self, i: usize) -> Option<cascade_can::Frame> {
+        // ESP wheel speeds: 0.95439 km/h per bit (database)
+        let v = (self.kmh / 0.95439).round().clamp(0.0, 255.0) as u8;
+        let (id, _) = NODE_FRAMES[i];
+        let data = match id {
+            0x153 if self.esp => vec![0, 0, v, 0, 0, 0, 0],
+            0x1f0 if self.esp => vec![v, v, v, v, 0, 0, 0],
+            // gearbox frame layout unknown: present, all zero [assumed]
+            0x43f if self.gearbox => vec![0; 8],
+            _ => return None,
+        };
+        Some(cascade_can::Frame { id, data })
+    }
 }
 
 impl Ecu {
@@ -184,6 +227,9 @@ impl Ecu {
             inj: 0,
             rx_bytes: 0,
             inj_at: -1.0,
+            bus: Bus::default(),
+            can_out: Vec::new(),
+            can_seen: BTreeMap::new(),
         }
     }
 
@@ -196,7 +242,21 @@ impl Ecu {
             target = target.min(h);
         }
         let mut out = Vec::new();
+        for f in std::mem::take(&mut self.bus.inject) {
+            self.cpu.can.rx(&f);
+            self.can_out.push(f);
+        }
+        let ms = fcpu() / 1000;
         while self.stopped.is_none() && self.cpu.cycles < target {
+            for (i, &(_, period)) in NODE_FRAMES.iter().enumerate() {
+                if self.cpu.cycles >= self.bus.next[i] {
+                    self.bus.next[i] = self.cpu.cycles + period * ms;
+                    if let Some(f) = self.bus.frame(i) {
+                        self.cpu.can.rx(&f);
+                        self.can_out.push(f);
+                    }
+                }
+            }
             if let Err(e) = self.cpu.step() {
                 self.stopped = Some(e.to_string());
             }
@@ -218,6 +278,12 @@ impl Ecu {
                     _ => {}
                 }
             }
+        }
+        for (_, f) in self.cpu.can.tx.drain(..) {
+            let e = self.can_seen.entry(f.id).or_default();
+            e.0 = f.data.clone();
+            e.1 += 1;
+            self.can_out.push(f);
         }
         self.cpu
             .line
@@ -389,6 +455,15 @@ impl Server {
             }
             ToServer::Watch => c.watch = true,
             ToServer::KLine => c.kline = true,
+            ToServer::CanSub => c.can = true,
+            ToServer::Can { id, data } => {
+                c.can = true;
+                if let Some(e) = &mut self.ecu
+                    && !self.controls.faults.contains(&Fault::CanBusDead)
+                {
+                    e.bus.inject.push(cascade_can::Frame { id, data });
+                }
+            }
             ToServer::Baud(b) => c.baud = b.max(1),
             ToServer::Tx { .. } | ToServer::Low { .. } | ToServer::High { .. }
                 if !self.controls.ignition =>
@@ -504,12 +579,35 @@ impl Server {
         } else {
             0.0
         };
+        // the other CAN nodes follow the car; a subscribed client is a
+        // node too (it acknowledges frames)
+        let dead = eff.faults.contains(&Fault::CanBusDead);
+        e.bus.esp = !dead && !eff.faults.contains(&Fault::CanEspSilent);
+        e.bus.gearbox = !dead && !eff.faults.contains(&Fault::CanGearboxSilent);
+        e.bus.kmh = kmh;
+        let listeners = self.clients.values().any(|c| c.can);
+        let acked = e.bus.esp || e.bus.gearbox || (listeners && !dead);
+        if acked != e.cpu.can.acked {
+            let now = e.cpu.cycles;
+            e.cpu.can.set_acked(now, acked);
+        }
         // a held line (a lost HIGH) must not stall the ECU for long
         let wall = ((self.virt - e.on_virt).max(0.0) * fcpu() as f64) as u64;
         if e.hold.is_some_and(|h| wall > h + fcpu()) {
             e.hold = None;
         }
         let rx = e.run(self.virt, fcpu() / 50);
+        let frames = std::mem::take(&mut e.can_out);
+        if !frames.is_empty() {
+            for c in self.clients.values_mut().filter(|c| c.can) {
+                for f in &frames {
+                    c.send(&ToClient::Can {
+                        id: f.id,
+                        data: f.data.clone(),
+                    });
+                }
+            }
+        }
         // dumps without a mapped RAM layout are read over the K-line
         if self.controls.ignition && !ecu_view::layout_known(&e.cpu) {
             self.probe.tick(&mut e.cpu, fcpu(), &rx);
@@ -673,6 +771,55 @@ impl Server {
                 ));
                 kv.push(("inj_hz".into(), format!("{:.0}", e.inj as f64 / period_s)));
                 kv.push(("rx_bytes".into(), e.rx_bytes.to_string()));
+                // the engine CAN bus: the ECU's frames (id:count:data)
+                let nodes: Vec<&str> = [(e.bus.esp, "esp"), (e.bus.gearbox, "gearbox")]
+                    .iter()
+                    .filter(|(on, _)| *on)
+                    .map(|(_, n)| *n)
+                    .collect();
+                kv.push((
+                    "can_nodes".into(),
+                    if nodes.is_empty() {
+                        "none".into()
+                    } else {
+                        nodes.join(",")
+                    },
+                ));
+                kv.push((
+                    "can".into(),
+                    if e.can_seen.is_empty() {
+                        "none".into()
+                    } else {
+                        e.can_seen
+                            .iter()
+                            .map(|(id, (d, n))| format!("{id:03X}:{n}:{}", crate::proto::hex(d)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    },
+                ));
+                // decoded broadcasts: engine speed 0.25 rpm/bit [verified
+                // against the crank wheel in the emulator; the database
+                // says 0.15625], coolant 0.75 x - 48 and battery 0.1 V
+                // [database]
+                if let Some((d, _)) = e.can_seen.get(&0x316)
+                    && d.len() >= 4
+                {
+                    let rpm = u16::from_le_bytes([d[2], d[3]]) as f64 * 0.25;
+                    kv.push(("can_rpm".into(), format!("{rpm:.0}")));
+                }
+                if let Some((d, _)) = e.can_seen.get(&0x329)
+                    && d.len() >= 2
+                {
+                    kv.push((
+                        "can_coolant".into(),
+                        format!("{:.1}", d[1] as f64 * 0.75 - 48.0),
+                    ));
+                }
+                if let Some((d, _)) = e.can_seen.get(&0x545)
+                    && d.len() >= 4
+                {
+                    kv.push(("can_battery".into(), format!("{:.1}", d[3] as f64 * 0.1)));
+                }
                 // what the ECU itself holds (addresses known for one dump)
                 if ecu_view::layout_known(&e.cpu) {
                     let (rpm, kmh, coolant, battery) = ecu_view::readings(&e.cpu);

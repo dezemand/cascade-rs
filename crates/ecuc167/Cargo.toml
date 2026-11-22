@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 cascade-iface.workspace = true
+cascade-can = { path = "../cascade-can" }

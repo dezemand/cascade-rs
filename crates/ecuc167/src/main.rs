@@ -278,6 +278,10 @@ struct RunOpts {
     show_rx: bool,
     pokes: Vec<(u32, u32, Vec<u8>)>,
     watch_w: bool,
+    can_log: bool,
+    can_ack: bool,
+    /// Frames another node sends: (id, data, period ms).
+    can_rx: Vec<(u32, Vec<u8>, f64)>,
 }
 
 fn parse_run(a: &[String]) -> Result<RunOpts, String> {
@@ -313,6 +317,9 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
         show_rx: false,
         pokes: Vec::new(),
         watch_w: false,
+        can_log: false,
+        can_ack: false,
+        can_rx: Vec::new(),
     };
     let mut it = a.iter();
     let f = |s: &str| s.parse::<f64>().map_err(|e| format!("{s}: {e}"));
@@ -347,6 +354,19 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
                     .push((c.parse().map_err(|e| format!("{e}"))?, hexnum(val)? as u16));
             }
             "--watch-w" => o.watch_w = true,
+            "--can-log" => o.can_log = true,
+            "--can-ack" => o.can_ack = true,
+            "--can-rx" => {
+                let s = v()?;
+                let p: Vec<&str> = s.split(':').collect();
+                let [id, data, period] = p[..] else {
+                    return Err("--can-rx ID:HEX:PERIOD_MS".into());
+                };
+                o.can_rx
+                    .push((cascade_can::parse_id(id)?, hex_bytes(data)?, f(period)?));
+                // a node that sends also acknowledges
+                o.can_ack = true;
+            }
             "--watch" => {
                 let s = v()?;
                 let (l, h) = s.split_once('-').unwrap_or((&s, &s));
@@ -483,6 +503,8 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
         o.watch.clone()
     };
     c.watch_writes_only = o.watch_w;
+    c.can.acked = o.can_ack;
+    let mut can_next: Vec<u64> = vec![0; o.can_rx.len()];
     if o.prof {
         c.prof = Some(Default::default());
     }
@@ -590,6 +612,25 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
                             if enabled { "" } else { " (receiver off)" }
                         )
                     }
+                }
+            }
+        }
+        for (at, f) in c.can.tx.drain(..) {
+            if o.can_log {
+                println!("{:9.3} ms  CAN tx {f:?}", ms(at));
+            }
+        }
+        for (i, (id, data, period)) in o.can_rx.iter().enumerate() {
+            if c.cycles >= can_next[i] {
+                can_next[i] = c.cycles + (period * cpm) as u64;
+                let f = cascade_can::Frame::new(*id, data);
+                let taken = c.can.rx(&f);
+                if o.can_log {
+                    println!(
+                        "{:9.3} ms  CAN rx {f:?}{}",
+                        ms(c.cycles),
+                        if taken { "" } else { " (no object)" }
+                    );
                 }
             }
         }

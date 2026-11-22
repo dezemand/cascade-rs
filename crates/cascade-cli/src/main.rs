@@ -305,6 +305,15 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut kwp_log = None;
     let inner: Box<dyn cascade_iface::Interface> = match iface_name {
         "fake" => Box::new(cascade_iface::Fake::default()),
+        // experimental: the CAN Interface Module with a KWP2000-on-CAN ECU
+        "canmod" => Box::new(cascade_iface::canmod::CanModule::new(
+            cascade_iface::KwpConfig {
+                dtcs: dtcs.clone(),
+                local_data: local_data.clone(),
+                responses: responses.clone(),
+                ..Default::default()
+            },
+        )),
         "null" => Box::new(cascade_iface::Null),
         "kwp" => {
             let base = replay.as_ref().map(|r| r.config()).unwrap_or_default();
@@ -345,7 +354,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
         }
         other => {
             return Err(format!(
-                "unknown --iface {other:?} (fake, null, kwp, simk41, ecusim)"
+                "unknown --iface {other:?} (fake, null, kwp, canmod, simk41, ecusim)"
             ));
         }
     };

@@ -6,6 +6,8 @@
 //!                                           ecusim set ignition on starter on
 //! ecusim status [--follow]                  print the state line(s)
 //! ecusim play SCENARIO                      run a scenario file (below)
+//! ecusim can [-n N] [ID HEX]                show the engine CAN bus (and
+//!                                           send one frame first)
 //! ```
 //!
 //! Controls: ignition on|off, starter on|off, throttle 0-100 (%), coolant and
@@ -14,7 +16,8 @@
 //! ECU's memory), fault.NAME on|off (wiring faults: map_short, map_open,
 //! coolant_short, coolant_open, throttle_short, throttle_open, o2_front_open,
 //! o2_rear_open, evap_short, evap_open, battery_low, wheel_speed_circuit,
-//! cam_missing, abs_wheel_sensor_fl, abs_pump_motor, srs_driver_airbag,
+//! cam_missing, can_gearbox, can_esp, can_bus (CAN nodes silent / none),
+//! abs_wheel_sensor_fl, abs_pump_motor, srs_driver_airbag,
 //! srs_passenger_airbag, oil_temp_short, oil_temp_open; value on, off or
 //! intermittent), time 1-10 (time factor while no tester is connected),
 //! snapshot NAME / restore NAME (whole simulator state, in memory).
@@ -52,6 +55,7 @@ fn main() -> ExitCode {
         Some("serve") => serve(rom, &socket),
         Some("set") => set(&socket, &rest),
         Some("status") => status(&socket, follow),
+        Some("can") => can(&socket, &rest),
         Some("play") => match rest.first() {
             Some(f) => play(&socket, f),
             None => Err("play SCENARIO_FILE".into()),
@@ -135,6 +139,62 @@ fn status(socket: &Path, follow: bool) -> Result<(), String> {
             }
             Some(_) => {}
             None => return Err("no status from the server".into()),
+        }
+    }
+}
+
+/// Print the engine CAN bus traffic, candump style; optionally send one
+/// frame first. `-n N` stops after N frames.
+fn can(socket: &Path, args: &[String]) -> Result<(), String> {
+    let mut limit = None;
+    let mut send = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-n" {
+            limit = Some(
+                it.next()
+                    .ok_or("-n N")?
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?,
+            );
+        } else {
+            send.push(a.as_str());
+        }
+    }
+    let mut c = connect(socket)?;
+    let first = match send[..] {
+        [] => ToServer::CanSub,
+        [id, data] => ToServer::parse(&format!("CAN {id} {data}"))?,
+        _ => return Err("can [-n N] [ID HEX]".into()),
+    };
+    c.send(&first).map_err(|e| e.to_string())?;
+    let mut n = 0;
+    loop {
+        match c
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| e.to_string())?
+        {
+            Some(ToClient::Can { id, data }) => {
+                println!(
+                    "{}  [{}]  {}",
+                    ToClient::Can { id, data: vec![] }
+                        .line()
+                        .trim_start_matches("CAN ")
+                        .trim(),
+                    data.len(),
+                    data.iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                n += 1;
+                if limit.is_some_and(|l| n >= l) {
+                    return Ok(());
+                }
+            }
+            Some(ToClient::Err(e)) => return Err(e),
+            Some(_) => {}
+            None => return Err("no CAN traffic (ECU off or battery disconnected?)".into()),
         }
     }
 }

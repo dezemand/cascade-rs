@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+pub mod canmod;
 mod fake;
 pub mod iso14230;
 pub mod kwp;

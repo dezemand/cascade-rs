@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod can;
 pub mod cpu;
 pub mod iface;
 pub mod isa;

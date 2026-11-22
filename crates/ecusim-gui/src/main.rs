@@ -172,7 +172,7 @@ impl Panel {
                     self.last_error = Some(e);
                     changed = true;
                 }
-                ToClient::Rx(_) => {}
+                ToClient::Rx(_) | ToClient::Can { .. } => {}
             }
         }
         if changed {
@@ -303,6 +303,7 @@ impl Panel {
 enum Tab {
     Codes,
     Faults,
+    Can,
     Power,
 }
 
@@ -627,6 +628,14 @@ impl Panel {
                 })),
             )
             .child(
+                tab("tab-can", "CAN bus".into(), Tab::Can, self.tab).on_click(cx.listener(
+                    |v, _, _, cx| {
+                        v.tab = Tab::Can;
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
                 tab("tab-power", "Power & time".into(), Tab::Power, self.tab).on_click(
                     cx.listener(|v, _, _, cx| {
                         v.tab = Tab::Power;
@@ -637,6 +646,7 @@ impl Panel {
         let body = match self.tab {
             Tab::Codes => self.codes_view(),
             Tab::Faults => self.faults_view(cx),
+            Tab::Can => self.can_view(),
             Tab::Power => self.power_view(cx),
         };
         card().gap(px(12.)).flex_1().min_w(px(0.)).child(bar).child(
@@ -841,6 +851,106 @@ impl Panel {
                  running.",
             ))
             .child(grid)
+    }
+
+    fn can_view(&self) -> Div {
+        let name = |id: &str| match id {
+            "316" => "DME1 · engine speed, torque",
+            "329" => "DME2 · coolant, throttle",
+            "545" => "DME4 · status, battery",
+            "2A0" => "DME5",
+            _ => "",
+        };
+        let frames: Vec<(String, String, String)> = self
+            .get("can")
+            .split(',')
+            .filter_map(|e| {
+                let mut p = e.splitn(3, ':');
+                Some((p.next()?.into(), p.next()?.into(), p.next()?.into()))
+            })
+            .collect();
+        let row = |id: String, label: &'static str, data: String| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.))
+                .py(px(3.))
+                .child(
+                    div()
+                        .w(px(36.))
+                        .font_family("Menlo")
+                        .text_sm()
+                        .text_color(rgb(ACCENT))
+                        .child(id),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .font_family("Menlo")
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(data),
+                )
+                .child(caption(label))
+        };
+        let spaced = |h: &str| {
+            h.as_bytes()
+                .chunks(2)
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let list = if frames.is_empty() {
+            div().child(caption(
+                "No frames: ECU off, or the bus has no other node yet.",
+            ))
+        } else {
+            frames
+                .into_iter()
+                .fold(div().flex().flex_col(), |d, (id, _, data)| {
+                    let label = name(&id);
+                    d.child(row(id, label, spaced(&data)))
+                })
+        };
+        let nodes = self.get("can_nodes");
+        let decoded = format!(
+            "{} rpm · {} °C coolant · {} V battery",
+            self.get("can_rpm"),
+            self.get("can_coolant"),
+            self.get("can_battery")
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption("ENGINE ECU SENDS (500 kbit/s, every 10 ms)"))
+                    .child(list)
+                    .child(caption(decoded)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption("OTHER NODES"))
+                    .child(div().text_sm().text_color(rgb(TEXT)).child(match nodes {
+                        "esp,gearbox" => "ESP (153, 1F0) and gearbox computer (43F) sending",
+                        "esp" => "ESP sending; gearbox computer silent",
+                        "gearbox" => "Gearbox computer sending; ESP silent",
+                        _ => "None: nothing acknowledges the ECU's frames",
+                    }))
+                    .child(caption(
+                        "Silence them in Inject faults (CAN: ...). Automatic-gearbox dumps \
+                         then store P1602 or P0600 with the engine running. Watch the bus \
+                         with `ecusim can`.",
+                    )),
+            )
     }
 
     fn power_view(&self, cx: &mut Context<Self>) -> Div {

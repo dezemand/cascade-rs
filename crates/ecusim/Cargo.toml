@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }
+cascade-can = { path = "../cascade-can" }

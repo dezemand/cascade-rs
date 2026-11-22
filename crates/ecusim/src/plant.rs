@@ -100,10 +100,16 @@ pub enum Fault {
     SrsPassengerAirbag,
     OilTempShort,
     OilTempOpen,
+    /// The automatic gearbox computer stops sending on CAN.
+    CanGearboxSilent,
+    /// The ESP stops sending on CAN.
+    CanEspSilent,
+    /// No other node on the engine CAN bus (nothing acknowledges).
+    CanBusDead,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 19] = [
+    pub const ALL: [Fault; 22] = [
         Fault::MapShort,
         Fault::MapOpen,
         Fault::CoolantShort,
@@ -123,6 +129,9 @@ impl Fault {
         Fault::SrsPassengerAirbag,
         Fault::OilTempShort,
         Fault::OilTempOpen,
+        Fault::CanGearboxSilent,
+        Fault::CanEspSilent,
+        Fault::CanBusDead,
     ];
 
     /// Name used on the socket (`SET fault.NAME on`).
@@ -141,6 +150,9 @@ impl Fault {
             Fault::BatteryLow => "battery_low",
             Fault::WheelSpeedCircuit => "wheel_speed_circuit",
             Fault::CamMissing => "cam_missing",
+            Fault::CanGearboxSilent => "can_gearbox",
+            Fault::CanEspSilent => "can_esp",
+            Fault::CanBusDead => "can_bus",
             Fault::AbsWheelSensorFl => "abs_wheel_sensor_fl",
             Fault::AbsPumpMotor => "abs_pump_motor",
             Fault::SrsDriverAirbag => "srs_driver_airbag",
@@ -170,6 +182,9 @@ impl Fault {
             Fault::BatteryLow => "Battery sense line at 0 V",
             Fault::WheelSpeedCircuit => "Wheel speed signal line (ADC 12) open",
             Fault::CamMissing => "Cam sensor signal missing",
+            Fault::CanGearboxSilent => "CAN: gearbox computer silent",
+            Fault::CanEspSilent => "CAN: ESP silent",
+            Fault::CanBusDead => "CAN: no other node on the bus",
             Fault::AbsWheelSensorFl => "ABS: front-left wheel sensor open",
             Fault::AbsPumpMotor => "ABS: pump motor circuit",
             Fault::SrsDriverAirbag => "Airbag: driver bag resistance high",
@@ -195,6 +210,10 @@ impl Fault {
             Fault::BatteryLow => "P0560",
             Fault::WheelSpeedCircuit => "P1502",
             Fault::CamMissing => "P0340",
+            // P1602 on some dumps, P0600 on others; manual-gearbox dumps
+            // store nothing [verified in the emulator]
+            Fault::CanGearboxSilent | Fault::CanBusDead => "P1602/P0600",
+            Fault::CanEspSilent => "–",
             Fault::AbsWheelSensorFl => "C1200",
             Fault::AbsPumpMotor => "C2402",
             Fault::SrsDriverAirbag => "B1346",
@@ -222,6 +241,9 @@ impl Fault {
             Fault::BatteryLow => (4, 0),
             Fault::WheelSpeedCircuit => (12, 0x3FF),
             Fault::CamMissing
+            | Fault::CanGearboxSilent
+            | Fault::CanEspSilent
+            | Fault::CanBusDead
             | Fault::AbsWheelSensorFl
             | Fault::AbsPumpMotor
             | Fault::SrsDriverAirbag

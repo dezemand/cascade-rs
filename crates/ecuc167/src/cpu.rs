@@ -177,6 +177,8 @@ pub struct Cpu {
     /// Levels driven onto P2 input pins (wheels); reads merge them with the
     /// output latch by DP2.
     pub p2_in: u16,
+    /// The on-chip CAN controller (0xEF00-0xEFFF).
+    pub can: crate::can::Can,
 }
 
 /// A toothed wheel on a CAPCOM capture input: `teeth` positions per turn,
@@ -322,6 +324,7 @@ impl Cpu {
             wheels: Vec::new(),
             log_compares: false,
             p2_in: 0,
+            can: crate::can::Can::default(),
             compare_on_write: true,
         };
         // Reset values.
@@ -386,6 +389,7 @@ impl Cpu {
                 let dp = self.peek16(0xFFC2);
                 (self.peek16(P2) & dp) | (self.p2_in & !dp)
             }
+            a if crate::can::Can::contains(a) => self.can.read16(a),
             _ => self.peek16(a),
         };
         self.watch_hit(a, v, false);
@@ -410,6 +414,10 @@ impl Cpu {
     fn wr16(&mut self, a: u32, v: u16) {
         let a = a & 0xFF_FFFE;
         self.watch_hit(a, v, true);
+        if crate::can::Can::contains(a) {
+            self.can.write16(self.cycles, a, v);
+            return;
+        }
         if self.is_flash(a) {
             self.flash_writes += 1;
             return;
@@ -420,6 +428,18 @@ impl Cpu {
     }
 
     fn wr8(&mut self, a: u32, v: u8) {
+        if crate::can::Can::contains(a & 0xFF_FFFF) {
+            let a = a & 0xFF_FFFF;
+            let w = self.can.read16(a);
+            let shown = if a & 1 == 1 {
+                (w & 0x00FF) | ((v as u16) << 8)
+            } else {
+                (w & 0xFF00) | v as u16
+            };
+            self.watch_hit(a & !1, shown, true);
+            self.can.write8(self.cycles, a, v);
+            return;
+        }
         let w = self.peek16(a & !1);
         let nw = if a & 1 == 1 {
             (w & 0x00FF) | ((v as u16) << 8)
