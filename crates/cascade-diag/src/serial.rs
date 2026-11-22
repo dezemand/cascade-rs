@@ -168,6 +168,28 @@ impl Line for SerialLine {
         Ok(())
     }
 
+    fn five_baud(&mut self, addr: u8) -> io::Result<()> {
+        // Bit-banged with break (K low) and no break (K high), whatever the
+        // wake method: USB serial chips cannot run at 5 baud. Bits are 200 ms,
+        // so the USB latency of each break toggle (about 1 ms) is harmless.
+        let bit = Duration::from_millis(200);
+        let start = Instant::now();
+        let bits = std::iter::once(false)
+            .chain((0..8).map(|i| addr >> i & 1 == 1))
+            .chain(std::iter::once(true));
+        for (i, high) in bits.enumerate() {
+            if high {
+                self.port.clear_break().map_err(io::Error::from)?;
+            } else {
+                self.port.set_break().map_err(io::Error::from)?;
+            }
+            // sleep to the bit boundary, so toggle delays do not add up
+            precise_sleep((bit * (i as u32 + 1)).saturating_sub(start.elapsed()));
+        }
+        // a break can leave 00 bytes in the receive buffer
+        self.port.clear(ClearBuffer::Input).map_err(io::Error::from)
+    }
+
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.port.write_all(data)?;
         drain(&mut self.port, self.baud, data.len())?;

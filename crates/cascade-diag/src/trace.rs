@@ -44,6 +44,11 @@ impl<L: Line, W: Write> Line for TracedLine<L, W> {
         self.inner.wake_up(low, high)
     }
 
+    fn five_baud(&mut self, addr: u8) -> io::Result<()> {
+        self.event(&format!("\"ev\":\"five_baud\",\"addr\":{addr}"));
+        self.inner.five_baud(addr)
+    }
+
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.event(&format!("\"ev\":\"tx\",\"data\":\"{}\"", hex(data)));
         self.inner.write(data)
@@ -79,6 +84,9 @@ impl<T: Line + ?Sized> Line for Box<T> {
     }
     fn wake_up(&mut self, low: Duration, high: Duration) -> io::Result<()> {
         (**self).wake_up(low, high)
+    }
+    fn five_baud(&mut self, addr: u8) -> io::Result<()> {
+        (**self).five_baud(addr)
     }
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         (**self).write(data)

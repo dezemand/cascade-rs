@@ -16,6 +16,16 @@ pub trait Line {
     /// (high) for `high`.
     fn wake_up(&mut self, low: Duration, high: Duration) -> io::Result<()>;
 
+    /// ISO 9141 5-baud initialisation: send `addr` at 5 baud (start bit,
+    /// eight data bits LSB first, stop bit; 2 s in all) by driving K
+    /// directly. Lines that cannot do this return `Unsupported`.
+    fn five_baud(&mut self, _addr: u8) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this line cannot send a 5-baud address",
+        ))
+    }
+
     /// Send bytes. On a real K-line the adapter hears its own bytes; an
     /// implementation consumes that echo before returning.
     fn write(&mut self, data: &[u8]) -> io::Result<()>;

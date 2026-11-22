@@ -41,6 +41,10 @@ All dated 2026-11-21 (the first published version).
 - Upstream's side-effect-free mapped read (used by its disassembler) indexes
   the extended ROM without subtracting its base address, an out-of-bounds
   read; this port subtracts it.
+- EEPROM files hold all 128 words (256 bytes). Upstream writes and reads
+  only the first 128 bytes of its `.eep` files, so the second half was lost
+  between runs; its files still load (into the first half). Headless runs
+  start blank unless an EEPROM file is given.
 - The disassembler decodes instruction lengths correctly (byte immediates,
   the `FE` prefix); upstream's printer does not, which does not matter for
   its traces.
@@ -54,7 +58,9 @@ reads 16 bits.
 
 - Extended ROM (upstream `-x`; map_hi 0x10), ported 2026-11-22: Hyundai
   "TROUBLE SHOOTING PACK" images for the DTC HELP → FLOW screens.
-- Diagnostic-line backends: a KWP2000 ECU model, replay of recorded
+- EEPROM persistence (upstream's `ROM.eep`), ported 2026-11-22; the GUI also
+  keeps the EEPROM across power cycles.
+- Diagnostic-line backends: a KWP2000 ECU model (also 5-baud init and ISO 9141-2 framing), replay of recorded
   sessions, a real serial K-line (a port of upstream's `iface_kl_tty`), and
   an emulated engine ECU (`ecuc167`).
 - Tracing and analysis: oracle trace format and diff, line-event logs, ROM

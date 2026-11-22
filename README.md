@@ -11,7 +11,8 @@ plain data files, which drive `kdiag`, a small native diagnostic tool that
 needs neither the emulator nor any Hyundai software.
 
 The first target is a 2002 Hyundai Coupe / Tiburon (GK, 2.0 Beta) over
-K-line: engine, ABS and airbag fault codes, and live engine data.
+K-line: engine, ABS, airbag and traction control fault codes, and live
+engine, ABS and traction control data.
 
 > **Status:** experimental. Everything here has been developed against
 > emulated ECUs. **Nothing has been tested on a real car or a real adapter
@@ -24,7 +25,7 @@ K-line: engine, ABS and airbag fault codes, and live engine data.
 | `cascade-core` | The emulator: Intel 8XC196 CPU, memory banking, HSIO, UART, SED1335 LCD, keypad, EEPROM; plus an 8XC196 disassembler. Deterministic and cycle-counted. |
 | `cascade-iface` | The diagnostic-line interface between the emulated UART and the outside world: upstream's fake ECU, a KWP2000 ECU model, ISO 14230 framing, a tracer, and replay of recorded sessions. |
 | `cascade-cli` | `cascade`: run the emulator headless, script key presses, save screenshots, diff traces, disassemble. |
-| `cascade-diag` | `kdiag`: native KWP2000 client (ISO 14230 timing, read-only guard, CSV-driven parameter decoding), serial K-line backend (macOS), J2534 link, adapter self-test. |
+| `cascade-diag` | `kdiag`: native KWP2000 and ISO 9141-2 client (ISO 14230 timing, 5-baud init, read-only guard, CSV-driven parameter decoding), serial K-line backend (macOS), J2534 link, adapter self-test. |
 | `cascade-runner` | Runs the emulator on its own thread in real time, for front ends. |
 | `cascade-gui` | Desktop front end (GPUI via `gpui-kit`): a flat Hi-Scan layout with a live data view. macOS. |
 | `cascade-j2534` | Minimal SAE J2534 PassThru access for ISO 14230; vendor-DLL backend on Windows. |
@@ -87,6 +88,9 @@ Try `kdiag` without a car:
 kdiag dtc --sim                         # fault codes from the ECU model
 kdiag log --sim --duration-s 5          # live data as CSV
 kdiag log --sim --j2534-mock            # the same through the J2534 path
+kdiag dtc --sim --system srs            # airbag codes with the Hi-Scan's texts
+kdiag ident --sim --system srs          # airbag module identification
+kdiag log --sim --system tcs --duration-s 2   # traction control (ISO 9141-2)
 ```
 
 On a car, through a K-line adapter (macOS):
@@ -114,6 +118,12 @@ open target/Cascade.app --args roms/hyundai.his.dat --exrom roms/i-info.his.dat
 ```
 
 Without it the firmware reports "TROUBLE SHOOTING PACK NOT FOUND!".
+
+The handheld keeps settings and some state in a small serial EEPROM. The GUI
+saves it next to the ROM as `ROM.eep`, as the original does (`--eeprom PATH`
+for another file, `--no-eeprom` to keep it in memory), and keeps it across
+power cycles. `cascade run` starts blank unless given `--eeprom FILE`, so
+headless runs stay reproducible.
 
 ## Safety
 

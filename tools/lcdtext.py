@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Read the Hi-Scan screen as text from an LCD memory dump.
 
-The firmware draws text byte-aligned on a 20-pixel line pitch with the 8x16
-font stored in the ROM pack (16 bytes per glyph, indexed by character code).
+The firmware draws text on a 20-pixel line pitch with the 8x16
+font stored in the ROM pack (16 bytes per glyph, indexed by character code),
+usually byte-aligned; some lists (the DTC list) start a few pixels off the
+byte grid, so each line also tries horizontal bit offsets.
 Matching dump bytes against those glyphs gives exact text. The font is read
 from the ROM at runtime; nothing proprietary is stored here.
 
@@ -29,18 +31,28 @@ def load_font(rom):
 
 def screen_lines(rom, mem):
     glyphs = load_font(rom)
-    px = lambda y, c: mem[y * COLS + c] ^ mem[LAYER2 + y * COLS + c]
+    def raw(y, c):
+        if c >= COLS:
+            return 0
+        return mem[y * COLS + c] ^ mem[LAYER2 + y * COLS + c]
+
+    def px(y, c, xs):
+        # 8 pixels starting xs bits into byte c
+        if xs == 0:
+            return raw(y, c)
+        return ((raw(y, c) << xs) | (raw(y, c + 1) >> (8 - xs))) & 0xFF
+
     out = []
     for line in range(LINES):
         best = None
         # the glyph's first row sits a few pixels below the line start
-        for shift in range(0, 6):
+        for shift, xs in [(v, h) for v in range(0, 20) for h in range(0, 8)]:
             top = 20 * line + shift
             if top + ROWS > 240:
                 continue
             chars, hits = [], 0
             for c in range(COLS):
-                cell = bytes(px(top + i, c) for i in range(ROWS))
+                cell = bytes(px(top + i, c, xs) for i in range(ROWS))
                 code = glyphs.get(cell)
                 if code is None:
                     chars.append("?")

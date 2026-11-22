@@ -40,7 +40,25 @@ impl Default for Eeprom {
     }
 }
 
+/// Size of a saved EEPROM image: 128 words, little-endian.
+pub const IMAGE_BYTES: usize = 256;
+
 impl Eeprom {
+    /// The contents as a file image: 128 words, little-endian (upstream's
+    /// `.eep` format on the little-endian hosts it ran on).
+    pub fn to_image(&self) -> Vec<u8> {
+        self.mem.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Load contents from a file image. Upstream writes only the first 128
+    /// bytes (64 words) of its `.eep` files; such files load into the first
+    /// half and leave the rest as it was. Longer input is truncated.
+    pub fn load_image(&mut self, image: &[u8]) {
+        for (w, c) in self.mem.iter_mut().zip(image.chunks(2)) {
+            *w = u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or((*w >> 8) as u8)]);
+        }
+    }
+
     pub fn toggle_inputs(&mut self, ena: bool, clk: bool, bit: bool) -> R<()> {
         if !self.enable && ena {
             self.mode = Mode::Cmd;
@@ -123,5 +141,31 @@ impl Eeprom {
 
     pub fn erase(&mut self) {
         self.mem = [0; 128];
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_round_trip_and_upstream_half_files() {
+        let mut e = Eeprom::default();
+        for (i, w) in e.mem.iter_mut().enumerate() {
+            *w = 0x1000 + i as u16;
+        }
+        let img = e.to_image();
+        assert_eq!(img.len(), IMAGE_BYTES);
+        assert_eq!(&img[..4], &[0x00, 0x10, 0x01, 0x10], "little-endian words");
+        let mut f = Eeprom::default();
+        f.load_image(&img);
+        assert_eq!(f.mem, e.mem);
+        // an upstream .eep file: only the first 128 bytes
+        let mut g = Eeprom::default();
+        g.mem[100] = 0xbeef;
+        g.load_image(&img[..128]);
+        assert_eq!(g.mem[63], 0x1000 + 63);
+        assert_eq!(g.mem[64], 0, "second half untouched");
+        assert_eq!(g.mem[100], 0xbeef);
     }
 }

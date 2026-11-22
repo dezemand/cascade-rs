@@ -45,11 +45,26 @@ seen on the car. Menu paths: 09 TIBURON > 04 ANTI-LOCK BRAKE SYSTEM, and
 - DTCs: two requests, `18 00 FF 00` and `18 01 FF 00` (ReadDTCsByStatus,
   all groups, status filters 0x00 and 0x01). `58 00` shows NO TROUBLE CODE.
 - Record format with codes present: as the engine, `58 N` + N × (code
-  high, code low, status). B1102 (`11 02`) shows "BATTERY VOLTAGE LOW".
+  high, code low, status). The letter is in the top two bits of the code
+  (00 P, 01 C, 10 B, 11 U), so B1102 is `91 02` and shows "BATTERY VOLTAGE
+  LOW"; `11 02` would be P1102.
+- Code texts: `dtc-names-srs.csv`, 433 B codes, read off the Hi-Scan's
+  Tiburon SRS DTC screen for every code B1000-B2999
+  (`tools/dtc_names.py`); unknown codes show "%s Not Define Code". They
+  include the airbag circuits (DAB/PAB driver/passenger airbag, DSAB/PSAB
+  side airbags, DBPT/PBPT belt pretensioners, firing-circuit crosses,
+  impact sensors, B2500 SRI lamp).
+- Drawing many unknown codes takes the Hi-Scan about 6 s; with only
+  TesterPresent pending, a module with a 5 s P3max would end the session
+  ("COMMUNICATION ERROR"). Whether the real module does is unknown.
   Codes from both requests are listed and counted ("2 ITEMS" for one of
   each). Codes from `18 01` are marked H (history) whatever their status
   byte; codes from `18 00` are not, so `18 00` reads current and `18 01`
   stored codes.
+- Identification Check: `1A 80`. The Hi-Scan shows fields at these bytes of
+  the response (`5A` = 0): VEHICLE 1-6 (starting with the option byte
+  `80` itself), PART NO 7-17, PART NAME 18-37, ACU VERSION 68 "." 69.
+  Found by answering it with a position pattern; unverified on a module.
 - Crashing Information (front/side): `21 00 01` first; when answered
   `61 00 …` the firmware polls `21 00` continuously (refused: four tries,
   then `20`, an unsupported service, and back). Answered with a 40-byte

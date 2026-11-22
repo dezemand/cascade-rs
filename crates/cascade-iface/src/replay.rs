@@ -26,6 +26,10 @@ pub struct Recording {
     pub sequences: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
     /// Requests that got no (parsable) answer.
     pub unanswered: usize,
+    /// The session was an ISO 9141-2 one (5-baud init, `68 6A F1` frames).
+    pub iso9141: bool,
+    /// Key bytes the ECU sent after `55` in a 5-baud init.
+    pub slow_init_key_bytes: Option<[u8; 2]>,
 }
 
 impl Recording {
@@ -44,6 +48,10 @@ impl Recording {
             c.key_bytes = kb;
         }
         c.length_byte = self.length_byte;
+        c.iso9141 = self.iso9141;
+        if let Some(kb) = self.slow_init_key_bytes {
+            c.slow_init_key_bytes = kb;
+        }
         c.sequences = self.sequences.clone();
         c
     }
@@ -93,6 +101,44 @@ fn frames(mut bytes: &[u8]) -> Vec<iso14230::Frame> {
     out
 }
 
+/// Split received bytes into ISO 9141-2 response frames (`48 6B addr data
+/// sum`, no length): a frame ends where its checksum matches and the next
+/// header (or the end) follows. Returns each frame's data.
+fn frames_9141(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 < bytes.len() {
+        if bytes[i..i + 2] != [0x48, 0x6b] {
+            i += 1;
+            continue;
+        }
+        let end = (i + 4..bytes.len()).find(|&j| {
+            iso14230::checksum(&bytes[i..j]) == bytes[j]
+                && (j + 1 == bytes.len() || bytes[j + 1..].starts_with(&[0x48, 0x6b]))
+        });
+        match end {
+            Some(j) => {
+                out.push(bytes[i + 3..j].to_vec());
+                i = j + 1;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// An ISO 9141-2 request frame `68 6A F1 data sum`, as a frame to `6A`.
+fn parse_9141_request(tx: &[u8]) -> Option<iso14230::Frame> {
+    let (body, sum) = tx.split_at(tx.len().checked_sub(1)?);
+    (tx.len() >= 5 && tx[..3] == [0x68, 0x6a, 0xf1] && iso14230::checksum(body) == sum[0]).then(
+        || iso14230::Frame {
+            target: 0x6a,
+            source: 0xf1,
+            data: body[3..].to_vec(),
+        },
+    )
+}
+
 struct Pending {
     tx: Vec<u8>,
     req: iso14230::Frame,
@@ -106,6 +152,17 @@ fn finish(p: Pending, rec: &mut Recording) {
     // long frames (64+ bytes) always need it
     if rx.first() == Some(&0x80) && rx.get(3).is_some_and(|&n| n < 0x40) {
         rec.length_byte = true;
+    }
+    if rec.iso9141 {
+        // one answer per response frame (mode 03 can send several)
+        let answers = frames_9141(rx);
+        if answers.is_empty() {
+            rec.unanswered += 1;
+        }
+        for a in answers {
+            rec.sequences.entry(p.req.data.clone()).or_default().push(a);
+        }
+        return;
     }
     let sid = p.req.data.first().copied();
     let answer = frames(rx)
@@ -129,6 +186,8 @@ fn finish(p: Pending, rec: &mut Recording) {
 pub fn from_jsonl(text: &str) -> Result<Recording, String> {
     let mut rec = Recording::default();
     let mut cur: Option<Pending> = None;
+    // bytes received after a 5-baud address: 55, key bytes, inverted address
+    let mut slow: Option<Vec<u8>> = None;
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -143,8 +202,16 @@ pub fn from_jsonl(text: &str) -> Result<Recording, String> {
                 let tx = field(line, "data")
                     .and_then(unhex)
                     .ok_or_else(|| format!("line {}: bad tx data", n + 1))?;
+                if let Some([0x55, a, b, ..]) = slow.take().as_deref() {
+                    rec.slow_init_key_bytes = Some([*a, *b]);
+                }
                 // a tx that is not a whole frame (a wake byte) starts nothing
-                cur = iso14230::parse(&tx).map(|req| Pending {
+                let req = if rec.iso9141 {
+                    parse_9141_request(&tx)
+                } else {
+                    iso14230::parse(&tx)
+                };
+                cur = req.map(|req| Pending {
                     tx,
                     req,
                     rx: Vec::new(),
@@ -157,7 +224,20 @@ pub fn from_jsonl(text: &str) -> Result<Recording, String> {
                     .ok_or_else(|| format!("line {}: bad rx byte", n + 1))?;
                 if let Some(p) = &mut cur {
                     p.rx.push(b[0]);
+                } else if let Some(v) = &mut slow {
+                    v.push(b[0]);
                 }
+            }
+            "five_baud" => {
+                if let Some(p) = cur.take() {
+                    finish(p, &mut rec);
+                }
+                let addr = field(line, "addr")
+                    .and_then(|a| a.parse::<u8>().ok())
+                    .ok_or_else(|| format!("line {}: bad five_baud addr", n + 1))?;
+                rec.address = Some(addr);
+                rec.iso9141 = true;
+                slow = Some(Vec::new());
             }
             "wake" | "baud" => {
                 if let Some(p) = cur.take() {
@@ -205,6 +285,43 @@ mod tests {
         s += &tx(7, &iso14230::encode(0x11, 0xf1, &[0x1a, 0x8e]));
         s += "{\"t_us\":8,\"ev\":\"timeout\",\"after_us\":50000}\n";
         s
+    }
+
+    #[test]
+    fn iso9141_session_replays() {
+        let req = |d: &[u8]| {
+            let mut f = vec![0x68, 0x6a, 0xf1];
+            f.extend_from_slice(d);
+            f.push(iso14230::checksum(&f));
+            f
+        };
+        let resp = |d: &[u8]| {
+            let mut f = vec![0x48, 0x6b, 0x32];
+            f.extend_from_slice(d);
+            f.push(iso14230::checksum(&f));
+            f
+        };
+        let mut s = String::from("{\"t_us\":0,\"ev\":\"five_baud\",\"addr\":50}\n");
+        s += &rx(1, &[0x55, 0x08, 0x08]);
+        s += &tx(2, &[0xf7]);
+        s += &rx(3, &[0xcd]);
+        s += &tx(4, &req(&[0x03]));
+        let mut two = resp(&[0x43, 0x52, 0x00, 0x52, 0x03, 0x52, 0x06]);
+        two.extend(resp(&[0x43, 0x52, 0x09, 0x00, 0x00, 0x00, 0x00]));
+        s += &rx(5, &two);
+        s += &tx(6, &req(&[0xb1, 0x0e]));
+        s += &rx(7, &resp(&[0xf1, 0x0e, 10, 20, 30, 40]));
+        let r = from_jsonl(&s).unwrap();
+        assert!(r.iso9141);
+        assert_eq!(r.address, Some(0x32));
+        assert_eq!(r.slow_init_key_bytes, Some([0x08, 0x08]));
+        assert_eq!(r.sequences[&vec![0x03]].len(), 2, "one answer per frame");
+        assert_eq!(
+            r.sequences[&vec![0xb1, 0x0e]],
+            [vec![0xf1, 0x0e, 10, 20, 30, 40]]
+        );
+        let c = r.config();
+        assert!(c.iso9141 && c.address == 0x32);
     }
 
     #[test]

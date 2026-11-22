@@ -105,9 +105,49 @@ pub fn check(req: &[u8], allow_clear: bool) -> Result<(), Blocked> {
     }
 }
 
+/// Check a request to the traction control module (ISO 9141-2, address
+/// 0x32). Its manufacturer service B1 carries both reads and the actuation
+/// tests, so only the exact reads the Hi-Scan sends are let through.
+pub fn check_tcs(req: &[u8]) -> Result<(), Blocked> {
+    match req {
+        [0x03] => Ok(()),
+        // B1 01 keep-alive, B1 0E wheel speeds, B1 2C valve outputs
+        [0xb1, 0x01 | 0x0e | 0x2c] => Ok(()),
+        [0x04, ..] => Err(Blocked {
+            sid: 0x04,
+            reason: "clearing traction control codes is not supported",
+        }),
+        [sid, ..] => Err(Blocked {
+            sid: *sid,
+            reason: "not one of the known traction control reads",
+        }),
+        [] => Err(Blocked {
+            sid: 0,
+            reason: "empty request",
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcs_allows_only_known_reads() {
+        for req in [&[0x03][..], &[0xb1, 0x01], &[0xb1, 0x0e], &[0xb1, 0x2c]] {
+            assert_eq!(check_tcs(req), Ok(()), "{req:02X?}");
+        }
+        for req in [
+            &[0x04][..],
+            &[0xb1, 0x02],
+            &[0xb1, 0x0e, 0x00],
+            &[0xb1],
+            &[0x30, 0x01],
+            &[],
+        ] {
+            assert!(check_tcs(req).is_err(), "{req:02X?}");
+        }
+    }
 
     #[test]
     fn reads_and_session_pass() {

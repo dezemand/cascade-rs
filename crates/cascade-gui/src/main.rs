@@ -295,6 +295,7 @@ impl CascadeView {
         replay: Option<Result<Loaded, String>>,
         ecu: (Option<Result<EcuRom, String>>, bool),
         exrom: Option<(String, Vec<u8>)>,
+        eeprom: Option<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -318,6 +319,7 @@ impl CascadeView {
         let runner = Runner::spawn_full(
             rom,
             exrom.map(|(_, x)| x),
+            eeprom,
             first,
             cascade_runner::Speed::Real(1.0),
             None,
@@ -1418,7 +1420,7 @@ fn main() {
         .or_else(|| std::env::var("CASCADE_ROM").ok())
     else {
         eprintln!(
-            "usage: cascade-gui ROM [--exrom INFO.dat] [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_EXROM, CASCADE_ECU_ROM)"
+            "usage: cascade-gui ROM [--exrom INFO.dat] [--eeprom FILE | --no-eeprom] [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_EXROM, CASCADE_ECU_ROM)"
         );
         std::process::exit(2);
     };
@@ -1445,6 +1447,19 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let ecu_first = ecu_arg.is_some();
+    // EEPROM file, as upstream: ROM.eep next to the ROM unless --eeprom PATH
+    // names another or --no-eeprom keeps it in memory only
+    let eeprom = if args.iter().any(|a| a == "--no-eeprom") {
+        None
+    } else {
+        Some(
+            args.iter()
+                .position(|a| a == "--eeprom")
+                .and_then(|i| args.get(i + 1))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(format!("{path}.eep"))),
+        )
+    };
     // extended ROM (troubleshooting pack): --exrom PATH or CASCADE_EXROM
     let exrom = args
         .iter()
@@ -1494,7 +1509,15 @@ fn main() {
             };
             gpui_kit::open_window(opts, cx, |window, cx| {
                 cx.new(|cx| {
-                    CascadeView::new(rom, replay, (ecu, ecu_first), exrom.clone(), window, cx)
+                    CascadeView::new(
+                        rom,
+                        replay,
+                        (ecu, ecu_first),
+                        exrom.clone(),
+                        eeprom.clone(),
+                        window,
+                        cx,
+                    )
                 })
             })
             .expect("failed to open window");

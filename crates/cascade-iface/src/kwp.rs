@@ -69,6 +69,14 @@ pub struct KwpConfig {
     /// Always use the separate length byte (`80 tgt src len ...`), even
     /// for short responses.
     pub length_byte: bool,
+    /// Key bytes sent after `55` when woken by a 5-baud slow init (ISO
+    /// 9141 / ISO 14230 5-baud init) to `address`.
+    pub slow_init_key_bytes: [u8; 2],
+    /// ISO 9141-2 framing (`68 6A F1 data.. sum` in, `48 6B addr data.. sum`
+    /// out), frames ending on an inter-byte gap. Only exact `responses`
+    /// and recorded `sequences` are answered, one frame per request. Used by Hyundai modules woken with a 5-baud init and
+    /// key bytes 08 08.
+    pub iso9141: bool,
 }
 
 impl Default for KwpConfig {
@@ -86,6 +94,8 @@ impl Default for KwpConfig {
             responses: BTreeMap::new(),
             sequences: BTreeMap::new(),
             length_byte: false,
+            slow_init_key_bytes: [0x08, 0x08],
+            iso9141: false,
         }
     }
 }
@@ -107,6 +117,20 @@ pub struct KwpEcu {
     pending: Option<(Cycles, Vec<u8>)>,
     log: ExchangeLog,
     cursors: BTreeMap<Vec<u8>, usize>,
+    slow: Slow,
+}
+
+/// 5-baud init handshake: `55` and the key bytes, then the tester's inverted
+/// second key byte, then our inverted address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slow {
+    Idle,
+    /// Send `55` at this time.
+    Sync(Cycles),
+    /// Send the key bytes at this time.
+    KeyBytes(Cycles),
+    /// Waiting for the tester's inverted second key byte.
+    WaitInverted,
 }
 
 impl KwpEcu {
@@ -120,6 +144,7 @@ impl KwpEcu {
             pending: None,
             log: ExchangeLog::default(),
             cursors: BTreeMap::new(),
+            slow: Slow::Idle,
         }
     }
 
@@ -226,6 +251,34 @@ impl KwpEcu {
         }
     }
 
+    /// An ISO 9141-2 frame ended (inter-byte gap): answer from `responses`.
+    fn frame_complete_9141(&mut self, now: Cycles) {
+        let frame = std::mem::take(&mut self.rx_frame);
+        if frame.len() < 5
+            || iso14230::checksum(&frame[..frame.len() - 1]) != frame[frame.len() - 1]
+        {
+            return;
+        }
+        let data = frame[3..frame.len() - 1].to_vec();
+        let response = match self.config.responses.get(&data) {
+            Some(r) => Some(r.clone()),
+            None => self.next_recorded(&data),
+        };
+        if let Some(r) = &response {
+            let mut f = vec![0x48, 0x6b, self.config.address];
+            f.extend_from_slice(r);
+            f.push(iso14230::checksum(&f));
+            self.pending = Some((now + self.config.p2, f));
+        }
+        self.log.borrow_mut().push(Exchange {
+            at: now,
+            target: frame[1],
+            source: frame[2],
+            request: data,
+            response,
+        });
+    }
+
     fn frame_complete(&mut self, now: Cycles) {
         let frame = std::mem::take(&mut self.rx_frame);
         let Some(iso14230::Frame {
@@ -263,8 +316,42 @@ impl Interface for KwpEcu {
         // the emulated UART and this ECU always agree on speed
     }
 
+    fn send_slow_init(&mut self, now: Cycles, target: u8, _rx: &mut dyn RxBuf) {
+        if target == self.config.address {
+            // W1: 60-300 ms after the address
+            self.slow = Slow::Sync(now + 100 * CYCLES_PER_MS);
+            self.rx_frame.clear();
+        }
+    }
+
     fn send_byte(&mut self, now: Cycles, byte: u8, _rx: &mut dyn RxBuf) {
+        if self.slow == Slow::WaitInverted {
+            if byte == !self.config.slow_init_key_bytes[1] {
+                // W4: answer with the inverted address, then the session is up
+                self.pending = Some((now + 30 * CYCLES_PER_MS, vec![!self.config.address]));
+                self.active = true;
+                self.last_request_at = now;
+                self.log.borrow_mut().push(Exchange {
+                    at: now,
+                    target: self.config.address,
+                    source: 0,
+                    request: vec![byte],
+                    response: Some(vec![!self.config.address]),
+                });
+            }
+            self.slow = Slow::Idle;
+            return;
+        }
         // a gap longer than P4max-ish (20 ms) starts a new frame
+        if self.config.iso9141 {
+            // no length in the header: a gap longer than P4 ends the frame
+            if !self.rx_frame.is_empty() && now - self.last_byte_at > 15 * CYCLES_PER_MS {
+                self.frame_complete_9141(now);
+            }
+            self.last_byte_at = now;
+            self.rx_frame.push(byte);
+            return;
+        }
         if !self.rx_frame.is_empty() && now - self.last_byte_at > 20 * CYCLES_PER_MS {
             self.rx_frame.clear();
         }
@@ -276,6 +363,25 @@ impl Interface for KwpEcu {
     }
 
     fn poll_input(&mut self, now: Cycles, rx: &mut dyn RxBuf) {
+        if self.config.iso9141
+            && !self.rx_frame.is_empty()
+            && now.saturating_sub(self.last_byte_at) > 15 * CYCLES_PER_MS
+        {
+            self.frame_complete_9141(now);
+        }
+        match self.slow {
+            Slow::Sync(at) if now >= at => {
+                rx.push(0x55);
+                self.slow = Slow::KeyBytes(now + 10 * CYCLES_PER_MS);
+            }
+            Slow::KeyBytes(at) if now >= at => {
+                for b in self.config.slow_init_key_bytes {
+                    rx.push(b);
+                }
+                self.slow = Slow::WaitInverted;
+            }
+            _ => {}
+        }
         if let Some((at, _)) = &self.pending
             && now >= *at
         {

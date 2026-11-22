@@ -66,6 +66,13 @@ impl<I: Interface> Line for SimLine<I> {
         Ok(())
     }
 
+    fn five_baud(&mut self, addr: u8) -> io::Result<()> {
+        // 10 bits of 200 ms; the ECU model reacts once the address is complete
+        self.advance(Duration::from_millis(2000));
+        self.ecu.send_slow_init(self.now, addr, &mut self.rx);
+        Ok(())
+    }
+
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         for &b in data {
             self.advance(byte_time(self.baud));

@@ -160,14 +160,20 @@ impl Runner {
         speed: Speed,
         max_cycles: Option<u64>,
     ) -> Self {
-        Self::spawn_full(rom, None, iface, speed, max_cycles)
+        Self::spawn_full(rom, None, None, iface, speed, max_cycles)
     }
 
     /// As [`Runner::spawn_with`], plus an extended ROM (upstream `-x`), such
     /// as a Hyundai "TROUBLE SHOOTING PACK" behind the main pack.
+    ///
+    /// `eeprom`: a file that holds the 128-word EEPROM between runs, as
+    /// upstream's `ROM.eep`: loaded at start if it exists, written whenever
+    /// the contents change. The EEPROM also survives power cycles
+    /// ([`Command::Restart`]), as on the real tool.
     pub fn spawn_full(
         rom: Vec<u8>,
         exrom: Option<Vec<u8>>,
+        eeprom: Option<std::path::PathBuf>,
         iface: IfaceKind,
         speed: Speed,
         max_cycles: Option<u64>,
@@ -177,7 +183,7 @@ impl Runner {
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("cascade-emu".into())
-            .spawn(move || Emu::new(rom, exrom, iface, speed, max_cycles, s2).run(rx))
+            .spawn(move || Emu::new(rom, exrom, eeprom, iface, speed, max_cycles, s2).run(rx))
             .expect("spawn emulator thread");
         Self {
             tx,
@@ -213,6 +219,9 @@ impl Drop for Runner {
 struct Emu {
     rom: Vec<u8>,
     exrom: Option<Vec<u8>>,
+    eeprom_path: Option<std::path::PathBuf>,
+    /// EEPROM contents last written to `eeprom_path`.
+    eeprom_saved: [u16; 128],
     cpu: Cpu,
     log: EventLog,
     log_read: usize,
@@ -294,16 +303,33 @@ impl Emu {
     fn new(
         rom: Vec<u8>,
         exrom: Option<Vec<u8>>,
+        eeprom_path: Option<std::path::PathBuf>,
         iface: IfaceKind,
         speed: Speed,
         max_cycles: Option<u64>,
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
-        let (cpu, log, error) = build_cpu(&rom, exrom.as_deref(), &iface, max_cycles);
+        let (mut cpu, log, error) = build_cpu(&rom, exrom.as_deref(), &iface, max_cycles);
+        let mut eeprom_note = None;
+        if let Some(p) = &eeprom_path {
+            match std::fs::read(p) {
+                Ok(img) => {
+                    cpu.eeprom.load_image(&img);
+                    eeprom_note = Some(format!("EEPROM loaded from {}", p.display()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eeprom_note = Some(format!("EEPROM starts blank; saving to {}", p.display()));
+                }
+                Err(e) => eeprom_note = Some(format!("EEPROM {}: {e}", p.display())),
+            }
+        }
+        let eeprom_saved = cpu.eeprom.mem;
         let now = Instant::now();
         let mut emu = Self {
             rom,
             exrom,
+            eeprom_path,
+            eeprom_saved,
             cpu,
             log,
             log_read: 0,
@@ -332,6 +358,9 @@ impl Emu {
         };
         if let Some(e) = error {
             emu.note(e);
+        }
+        if let Some(n) = eeprom_note {
+            emu.note(n);
         }
         emu
     }
@@ -415,7 +444,10 @@ impl Emu {
             Command::Restart(iface) => {
                 let (cpu, log, error) =
                     build_cpu(&self.rom, self.exrom.as_deref(), &iface, self.max_cycles);
+                // a power cycle keeps the EEPROM, as on the real tool
+                let eeprom = self.cpu.eeprom.mem;
                 self.cpu = cpu;
+                self.cpu.eeprom.mem = eeprom;
                 self.log = log;
                 self.total_cycles = 0;
                 self.log_read = 0;
@@ -434,9 +466,29 @@ impl Emu {
                 }
                 self.reanchor();
             }
-            Command::Quit => return false,
+            Command::Quit => {
+                self.save_eeprom();
+                return false;
+            }
         }
         true
+    }
+
+    /// Write the EEPROM file if the contents changed since the last write.
+    fn save_eeprom(&mut self) {
+        let Some(p) = &self.eeprom_path else { return };
+        if self.cpu.eeprom.mem == self.eeprom_saved {
+            return;
+        }
+        match std::fs::write(p, self.cpu.eeprom.to_image()) {
+            Ok(()) => self.eeprom_saved = self.cpu.eeprom.mem,
+            Err(e) => {
+                let msg = format!("EEPROM not saved to {}: {e}", p.display());
+                // do not retry every slice
+                self.eeprom_saved = self.cpu.eeprom.mem;
+                self.note(msg);
+            }
+        }
     }
 
     /// Add a line to the displayed event log.
@@ -544,6 +596,12 @@ impl Emu {
     }
 
     fn run(mut self, rx: Receiver<Command>) {
+        self.run_loop(rx);
+        // however the loop ended (Quit, or the front end went away)
+        self.save_eeprom();
+    }
+
+    fn run_loop(&mut self, rx: Receiver<Command>) {
         // 5 ms of emulated time per slice at 1x
         const SLICE_MS: u64 = 5;
         self.publish();
@@ -602,6 +660,7 @@ impl Emu {
                 }
             }
             self.publish();
+            self.save_eeprom();
         }
     }
 }
@@ -628,6 +687,53 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The EEPROM file is written while running and when the runner ends,
+    /// and its contents survive a power cycle.
+    #[test]
+    fn eeprom_persists_to_file_and_across_power_cycles() {
+        let Some(rom) = rom() else {
+            eprintln!("CASCADE_ROM not set; skipping");
+            return;
+        };
+        let path =
+            std::env::temp_dir().join(format!("cascade-eeprom-test-{}.eep", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let r = Runner::spawn_full(
+            rom.clone(),
+            None,
+            Some(path.clone()),
+            IfaceKind::Null,
+            Speed::Max,
+            None,
+        );
+        // the Hyundai pack writes the EEPROM during boot
+        wait_for(&r, |s| s.total_cycles > 120_000_000);
+        r.send(Command::Restart(IfaceKind::Null));
+        wait_for(&r, |s| s.total_cycles > 1_000_000);
+        drop(r);
+        let img = std::fs::read(&path).expect("EEPROM file written");
+        assert_eq!(img.len(), cascade_core::eeprom::IMAGE_BYTES);
+        assert!(img.iter().any(|&b| b != 0), "firmware wrote something");
+
+        // a second runner loads the file; stopping at once leaves it intact
+        let r = Runner::spawn_full(
+            rom,
+            None,
+            Some(path.clone()),
+            IfaceKind::Null,
+            Speed::Max,
+            Some(1_000),
+        );
+        wait_for(&r, |s| s.stopped.is_some());
+        drop(r);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            img,
+            "load and save round trip"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Unpaced run to a cycle cap: the published frame equals the LCD of a

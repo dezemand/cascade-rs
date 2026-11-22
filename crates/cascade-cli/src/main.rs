@@ -18,10 +18,13 @@
 //!       --respond REQ=RESP (hex, SID first) answers one exact request;
 //!       --kwp-addr ADDR sets the ECU address (engine 0x11, ABS 0x28, SRS 0x58);
 //!       --kwp-keybytes HEX and --kwp-length-byte vary its StartComm reply;
+//!       --kwp-p3-max MS changes its session timeout (default 5000);
 //!       --pcs CYCLE:FILE writes every executed code address (physical for
 //!       the code window) from CYCLE on, with counts;
 //!       --rom-reads CYCLE:FILE writes every ROM offset read through the
 //!       data window from CYCLE on, with counts;
+//!       --eeprom F keeps the EEPROM in F between runs (loaded if it exists,
+//!       written at the end; upstream uses ROM.eep), otherwise it starts blank;
 //!       --exrom F (or -x F) loads an extended ROM, as upstream's -x: a
 //!       Hyundai "TROUBLE SHOOTING PACK" (i-info) behind the main pack;
 //!       --ecu-rom F runs a SIMK41 engine ECU dump (ecuc167) as the ECU
@@ -134,11 +137,15 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut replay = None;
     let mut ecu_rom: Option<String> = None;
     let mut exrom: Option<String> = None;
+    let mut eeprom_file: Option<String> = None;
     let mut adc: Vec<(usize, u16)> = Vec::new();
     let mut rom_reads: Option<(u64, String)> = None;
     let mut pcs_out: Option<(u64, String)> = None;
     let mut kwp_kb: Option<[u8; 2]> = None;
     let mut kwp_len_byte = false;
+    let mut kwp_p3_max: Option<u64> = None;
+    let mut kwp_5baud_kb: Option<[u8; 2]> = None;
+    let mut kwp_iso9141 = false;
     let mut stats = false;
     let mut continue_after_reset = false;
     let mut iface_name = "fake";
@@ -191,6 +198,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                 rom_reads = Some((parse_num(from)?, file.to_string()));
             }
             "--exrom" | "-x" => exrom = Some(val()?.to_string()),
+            "--eeprom" => eeprom_file = Some(val()?.to_string()),
             "--ecu-rom" => {
                 ecu_rom = Some(val()?.to_string());
                 iface_name = "simk41";
@@ -222,6 +230,15 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                 kwp_kb = Some(kb.try_into().map_err(|_| "--kwp-keybytes needs 2 bytes")?);
             }
             "--kwp-length-byte" => kwp_len_byte = true,
+            "--kwp-p3-max" => kwp_p3_max = Some(parse_num(val()?)?),
+            "--kwp-iso9141" => kwp_iso9141 = true,
+            "--kwp-5baud-keybytes" => {
+                let kb = parse_hex(val()?)?;
+                kwp_5baud_kb = Some(
+                    kb.try_into()
+                        .map_err(|_| "--kwp-5baud-keybytes needs 2 bytes")?,
+                );
+            }
             "--respond" => {
                 let v = val()?;
                 let (req, resp) = v
@@ -280,6 +297,9 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                 address: kwp_addr.unwrap_or(base.address),
                 key_bytes: kwp_kb.unwrap_or(base.key_bytes),
                 length_byte: kwp_len_byte || base.length_byte,
+                p3_max: kwp_p3_max.map_or(base.p3_max, |ms| ms * cascade_iface::kwp::CYCLES_PER_MS),
+                slow_init_key_bytes: kwp_5baud_kb.unwrap_or(base.slow_init_key_bytes),
+                iso9141: kwp_iso9141 || base.iso9141,
                 ..base
             };
             let ecu = cascade_iface::KwpEcu::new(config);
@@ -307,6 +327,13 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let line_log = traced.log_handle();
     let iface: Box<dyn cascade_iface::Interface> = Box::new(traced);
     let mut cpu = Cpu::new(rom, iface, false);
+    if let Some(p) = &eeprom_file {
+        match std::fs::read(p) {
+            Ok(img) => cpu.eeprom.load_image(&img),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{p}: {e}")),
+        }
+    }
     if let Some(p) = &exrom {
         let image = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
         cpu.load_extended_rom(image);
@@ -366,6 +393,9 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             Err(stop) => break Some(stop),
         }
     };
+    if let Some(p) = &eeprom_file {
+        std::fs::write(p, cpu.eeprom.to_image()).map_err(|e| format!("{p}: {e}"))?;
+    }
     if let Some(mut w) = out {
         w.flush().map_err(|e| e.to_string())?;
     }
@@ -529,7 +559,7 @@ fn main() -> ExitCode {
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
         ["disasm", rest @ ..] => disasm(rest),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--exrom F] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--kwp-p3-max MS] [--kwp-5baud-keybytes HEX] [--kwp-iso9141] [--replay KDIAG.jsonl] [--exrom F] [--eeprom F] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
                   cascade trace-diff <left> <right>\n       cascade trace-stats <log>\n       cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]"
             .into()),
     };

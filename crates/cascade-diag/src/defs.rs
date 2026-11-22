@@ -8,6 +8,81 @@ pub const TIBURON_2003_ENGINE_L4: &str =
 pub const TIBURON_2003_ABS: &str =
     include_str!("../../../protocol/tiburon-2003-abs-current-data.csv");
 
+/// The Tiburon traction control wheel speeds (`B1 0E` to 0x32), embedded.
+pub const TIBURON_2003_TCS_WHEEL_SPEEDS: &str =
+    include_str!("../../../protocol/tiburon-2003-tcs-wheel-speeds.csv");
+
+/// The Tiburon traction control valve outputs (`B1 2C` to 0x32), embedded.
+pub const TIBURON_2003_TCS_VALVES: &str =
+    include_str!("../../../protocol/tiburon-2003-tcs-valves.csv");
+
+/// Traction control (C) fault code texts, read off the Hi-Scan's Tiburon TCS
+/// screen. Not the same table as ABS.
+pub const TCS_DTC_NAMES: &str = include_str!("../../../protocol/dtc-names-tcs.csv");
+
+/// SRS fault code texts as the Hi-Scan shows them on the Tiburon's airbag
+/// screen (read off its display in the emulator), embedded.
+pub const SRS_DTC_NAMES: &str = include_str!("../../../protocol/dtc-names-srs.csv");
+
+/// Engine (P) fault code texts, read off the Hi-Scan's Tiburon engine screen.
+pub const ENGINE_DTC_NAMES: &str = include_str!("../../../protocol/dtc-names-engine.csv");
+
+/// ABS (C) fault code texts, read off the Hi-Scan's Tiburon ABS screen.
+pub const ABS_DTC_NAMES: &str = include_str!("../../../protocol/dtc-names-abs.csv");
+
+/// `code,text` CSV (`#` comments) into a lookup table ("B1346" -> text).
+pub fn dtc_texts(csv: &str) -> std::collections::BTreeMap<String, String> {
+    csv.lines()
+        .filter(|l| !l.starts_with('#') && !l.starts_with("code,"))
+        .filter_map(|l| {
+            let (code, text) = l.split_once(',')?;
+            Some((code.to_string(), text.trim_matches('"').to_string()))
+        })
+        .collect()
+}
+
+/// The SRS module's identification (`1A 80`), laid out as the Hi-Scan shows
+/// it. Byte positions count the response from its SID (`5A` = 0); found by
+/// answering the Hi-Scan with a pattern in the emulator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SrsIdent {
+    /// Bytes 1-6. The first is the option byte `80` itself.
+    pub vehicle: String,
+    /// Bytes 7-17.
+    pub part_no: String,
+    /// Bytes 18-37.
+    pub part_name: String,
+    /// Bytes 68 and 69, shown as "a.b".
+    pub acu_version: Option<String>,
+}
+
+pub fn parse_srs_ident(resp: &[u8]) -> SrsIdent {
+    let text = |a: usize, b: usize| -> String {
+        resp.get(a..b.min(resp.len()))
+            .unwrap_or(&[])
+            .iter()
+            .map(|&c| {
+                if (0x20..0x7f).contains(&c) {
+                    c as char
+                } else {
+                    '.'
+                }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    };
+    SrsIdent {
+        vehicle: text(1, 7),
+        part_no: text(7, 18),
+        part_name: text(18, 38),
+        acu_version: match (resp.get(68), resp.get(69)) {
+            (Some(&a), Some(&b)) => Some(format!("{}.{}", a as char, b as char)),
+            _ => None,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     U8,
@@ -135,5 +210,35 @@ mod tests {
             get("lt_fuel_trim_idle").decode(&block),
             Some(Value::Number(-1.0))
         );
+    }
+}
+
+#[cfg(test)]
+mod srs_tests {
+    use super::*;
+
+    #[test]
+    fn srs_names_are_embedded() {
+        let t = dtc_texts(SRS_DTC_NAMES);
+        assert!(t.len() > 400);
+        assert_eq!(t["B1102"], "BATTERY VOLTAGE LOW");
+        assert_eq!(t["B1346"], "DAB RESISTANCE-HIGH(1ST)");
+    }
+
+    #[test]
+    fn srs_ident_layout() {
+        // the pattern the Hi-Scan was probed with: A-Z, 0-9, then each
+        // position's own index digit
+        let mut r = vec![0x5a, 0x80];
+        r.extend(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+        while r.len() < 80 {
+            let i = r.len() - 1;
+            r.push(b'0' + (i % 10) as u8);
+        }
+        let id = parse_srs_ident(&r);
+        assert_eq!(id.vehicle, ".ABCDE");
+        assert_eq!(id.part_no, "FGHIJKLMNOP");
+        assert_eq!(id.part_name, "QRSTUVWXYZ0123456789");
+        assert_eq!(id.acu_version.as_deref(), Some("7.8"));
     }
 }

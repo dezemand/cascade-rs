@@ -1,9 +1,11 @@
 //! kdiag: K-line diagnostics for the 2002 Hyundai Coupe (Tiburon GK).
 //!
-//!   kdiag dtc  (--sim | --port DEV) [--system engine|abs|srs] [line options]
+//!   kdiag dtc  (--sim | --port DEV) [--system engine|abs|srs|tcs] [line options]
 //!   kdiag selftest --port DEV   (adapter checks, no ECU session)
+//!   kdiag ident (--sim | --port DEV) [--system engine|abs|srs]
+//!   kdiag crash (--sim | --port DEV) --system srs   (crash records, raw)
 //!   kdiag clear (--sim | --port DEV) [--system engine|abs] --allow-clear [--yes]
-//!   kdiag log  (--sim | --port DEV) [--system engine|abs] [--out FILE.csv]
+//!   kdiag log  (--sim | --port DEV) [--system engine|abs|tcs] [--out FILE.csv]
 //!              [--interval-ms N] [--duration-s N] [line options]
 //!
 //! Line options: --trace FILE.jsonl (every byte with a timestamp),
@@ -15,6 +17,8 @@
 //!   engine  0x11 on the K line (OBD pin 7)
 //!   abs     0x28 on OBD pin 8: the cable must connect pin 8 to K
 //!   srs     0x58 on OBD pin 12: the cable must connect pin 12 to K
+//!   tcs     0x32 on OBD pin 8 (traction control, 2003-): 5-baud init and
+//!           ISO 9141-2 frames; serial or --sim only, not J2534
 //!
 //! Read-only by default: every request passes `cascade_diag::guard`, which
 //! refuses anything but session handling and reads. `clear` is the one
@@ -44,6 +48,7 @@ use cascade_diag::kwp::{Client, Link, dtc_name, hex};
 use cascade_diag::line::Line;
 use cascade_diag::sim::SimLine;
 use cascade_diag::trace::{TracedLine, TracedLink};
+use cascade_diag::{guard, iso9141};
 use cascade_iface::{KwpConfig, KwpEcu};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,6 +56,7 @@ enum System {
     Engine,
     Abs,
     Srs,
+    Tcs,
 }
 
 impl System {
@@ -59,6 +65,7 @@ impl System {
             System::Engine => 0x11,
             System::Abs => 0x28,
             System::Srs => 0x58,
+            System::Tcs => 0x32,
         }
     }
 
@@ -73,6 +80,7 @@ impl System {
             System::Engine => Ok(defs::TIBURON_2003_ENGINE_L4),
             System::Abs => Ok(defs::TIBURON_2003_ABS),
             System::Srs => Err("no live data is known for SRS".into()),
+            System::Tcs => Err("traction control data is read by tcs_log".into()),
         }
     }
 }
@@ -139,7 +147,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     "engine" => System::Engine,
                     "abs" => System::Abs,
                     "srs" => System::Srs,
-                    s => return Err(format!("unknown --system {s:?} (engine, abs, srs)")),
+                    "tcs" => System::Tcs,
+                    s => return Err(format!("unknown --system {s:?} (engine, abs, srs, tcs)")),
                 }
             }
             "--interval-ms" => {
@@ -156,6 +165,9 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     let sources = o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8;
     if sources != 1 {
         return Err("give exactly one of --sim, --port DEV or --j2534 DLL|auto".into());
+    }
+    if o.system == System::Tcs && (o.j2534.is_some() || o.j2534_mock) {
+        return Err("traction control (ISO 9141-2, 5-baud init) is not done over J2534 yet".into());
     }
     if o.j2534_mock && !o.sim {
         return Err("--j2534-mock goes with --sim or --sim-ecu".into());
@@ -183,18 +195,159 @@ fn sim_config(system: System) -> KwpConfig {
     match system {
         System::Engine => {
             cfg.dtcs = vec![(0x0130, 0x20)];
+            // what the GK-20 SIMK41 code answers (ecuc167)
+            cfg.ecu_ident.insert(0x8e, b"G2T0MK2B----".to_vec());
             cfg.local_data
                 .insert(0x01, cascade_diag::sim::engine_idle_block());
         }
-        System::Abs | System::Srs => {
+        System::Abs => {
             cfg.key_bytes = [0xea, 0x8f];
             cfg.length_byte = true;
             cfg.local_data.insert(0x01, sim_abs_block());
             cfg.responses
-                .insert(vec![0x13, 0x40, 0x00], vec![0x53, 0x01, 0x50, 0x1f]);
+                .insert(vec![0x13, 0x40, 0x00], vec![0x53, 0x01, 0x52, 0x00]); // C1200
+        }
+        System::Srs => {
+            // an airbag module with one current and one stored code
+            cfg.key_bytes = [0xea, 0x8f];
+            cfg.length_byte = true;
+            cfg.responses.insert(
+                vec![0x18, 0x00, 0xff, 0x00],
+                vec![0x58, 0x01, 0x93, 0x46, 0x71], // B1346 DAB resistance high
+            );
+            cfg.responses.insert(
+                vec![0x18, 0x01, 0xff, 0x00],
+                vec![0x58, 0x01, 0x91, 0x02, 0x60], // B1102 battery voltage low
+            );
+            // laid out as the Hi-Scan reads it: vehicle 1-6 (from the option
+            // byte on), part no 7-17, part name 18-37, version at 68/69
+            let mut id = vec![0x5a, 0x80];
+            id.extend(b"GK-03");
+            id.extend(b"95910-2C000");
+            id.extend(b"SRSCM (SIMULATED)   ");
+            id.resize(68, b' ');
+            id.extend(b"12");
+            cfg.responses.insert(vec![0x1a, 0x80], id);
+            let mut crash = vec![0x61, 0x00];
+            crash.extend([0u8; 40]);
+            cfg.responses.insert(vec![0x21, 0x00, 0x01], crash.clone());
+            cfg.responses.insert(vec![0x21, 0x00], crash);
+        }
+        System::Tcs => {
+            // standing still, one stored code, valves off
+            cfg.iso9141 = true;
+            cfg.responses.insert(vec![0xb1, 0x01], vec![0xf1, 0x01]);
+            cfg.responses.insert(
+                vec![0x03],
+                vec![0x43, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00], // C1200
+            );
+            cfg.responses
+                .insert(vec![0xb1, 0x0e], vec![0xf1, 0x0e, 0, 0, 0, 0]);
+            cfg.responses.insert(vec![0xb1, 0x2c], vec![0xf1, 0x2c, 0]);
         }
     }
     cfg
+}
+
+/// Traction control session: 5-baud init, ISO 9141-2 frames, read-only
+/// allowlist of its own (`guard::check_tcs`).
+fn connect_tcs(o: &Opts) -> Result<iso9141::Client<Box<dyn Line>>, String> {
+    let mut c = iso9141::Client::new(open_line(o)?, System::Tcs.address(), guard::check_tcs);
+    let kb = c.start().map_err(|e| format!("5-baud init: {e}"))?;
+    // the Hi-Scan's keep-alive, also its first request; recorded so a
+    // replay can answer it
+    c.keep_alive()
+        .map_err(|e| format!("keep-alive B1 01: {e}"))?;
+    eprintln!("Tcs session up, key bytes {}", hex(&kb));
+    Ok(c)
+}
+
+fn tcs_dtc(o: &Opts) -> Result<(), String> {
+    let mut c = connect_tcs(o)?;
+    let names = defs::dtc_texts(defs::TCS_DTC_NAMES);
+    let codes = c.read_dtcs().map_err(|e| format!("DTCs: {e}"))?;
+    if codes.is_empty() {
+        println!("no stored DTCs");
+    }
+    for code in codes {
+        let name = dtc_name(code);
+        let text = names
+            .get(&name)
+            .map_or("(not in the Hi-Scan's list)", String::as_str);
+        println!("{name} {text}");
+    }
+    Ok(())
+}
+
+/// Wheel speeds (`B1 0E`) and valve outputs (`B1 2C`), one CSV row per pair.
+fn tcs_log(o: &Opts) -> Result<(), String> {
+    let speeds = defs::parse_csv(defs::TIBURON_2003_TCS_WHEEL_SPEEDS)?;
+    let valves = defs::parse_csv(defs::TIBURON_2003_TCS_VALVES)?;
+    let mut c = connect_tcs(o)?;
+    let mut w: Box<dyn Write> = match &o.out {
+        Some(p) => Box::new(BufWriter::new(
+            File::create(p).map_err(|e| format!("{p}: {e}"))?,
+        )),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let header: Vec<String> = speeds
+        .iter()
+        .chain(&valves)
+        .map(|p| format!("{}[{}]", p.name, p.unit))
+        .collect();
+    writeln!(w, "t_s,{},raw_b10e,raw_b12c", header.join(",")).map_err(|e| e.to_string())?;
+    let start = Line::elapsed(&c.line);
+    let mut errors = 0;
+    loop {
+        let t = Line::elapsed(&c.line) - start;
+        if o.duration.is_some_and(|d| t >= d) {
+            break;
+        }
+        let read = |c: &mut iso9141::Client<Box<dyn Line>>, req: &[u8]| {
+            c.request(req)
+                .map(|f| f.into_iter().next().unwrap_or_default().split_off(2))
+        };
+        match read(&mut c, &[0xb1, 0x0e]).and_then(|a| Ok((a, read(&mut c, &[0xb1, 0x2c])?))) {
+            Ok((a, b)) => {
+                errors = 0;
+                let cols: Vec<String> = speeds
+                    .iter()
+                    .map(|p| p.decode(&a))
+                    .chain(valves.iter().map(|p| p.decode(&b)))
+                    .map(|v| match v {
+                        Some(Value::Number(v)) => format!("{v:.3}"),
+                        Some(Value::Flag(f)) => (f as u8).to_string(),
+                        None => String::new(),
+                    })
+                    .collect();
+                let raw = |x: &[u8]| x.iter().map(|b| format!("{b:02X}")).collect::<String>();
+                writeln!(
+                    w,
+                    "{:.3},{},{},{}",
+                    t.as_secs_f64(),
+                    cols.join(","),
+                    raw(&a),
+                    raw(&b)
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!("{:.3}s: {e}", t.as_secs_f64());
+                if errors >= 3 {
+                    eprintln!("re-initialising session");
+                    c.start().map_err(|e| format!("restart: {e}"))?;
+                    errors = 0;
+                }
+            }
+        }
+        let spent = Line::elapsed(&c.line) - start - t;
+        if spent < o.interval {
+            Line::idle(&mut c.line, o.interval - spent);
+        }
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The diagnostic link: a byte-level line (simulated or serial), or a J2534
@@ -365,6 +518,9 @@ fn clear(o: &Opts) -> Result<(), String> {
         System::Srs => {
             return Err("clearing SRS codes is not supported (request not observed)".into());
         }
+        System::Tcs => {
+            return Err("clearing traction control codes is not supported".into());
+        }
     };
     if !o.allow_clear {
         return Err("clearing fault codes changes the ECU; rerun with --allow-clear".into());
@@ -388,19 +544,36 @@ fn clear(o: &Opts) -> Result<(), String> {
 }
 
 fn dtc(o: &Opts) -> Result<(), String> {
+    if o.system == System::Tcs {
+        return tcs_dtc(o);
+    }
     let mut c = connect(o)?;
+    // the texts the Hi-Scan shows for this system's codes
+    let names = defs::dtc_texts(match o.system {
+        System::Engine => defs::ENGINE_DTC_NAMES,
+        System::Abs => defs::ABS_DTC_NAMES,
+        System::Srs => defs::SRS_DTC_NAMES,
+        System::Tcs => unreachable!("handled by tcs_dtc"),
+    });
+    let named = |code: u16| -> String {
+        let name = dtc_name(code);
+        let text = names
+            .get(&name)
+            .map_or("(not in the Hi-Scan's list)", String::as_str);
+        format!("{name} {text}")
+    };
     let list: Vec<String> = match o.system {
         System::Engine => c
             .read_dtcs()
             .map_err(|e| format!("DTCs: {e}"))?
             .into_iter()
-            .map(|(code, st)| format!("{} status {st:02X}", dtc_name(code)))
+            .map(|(code, st)| format!("{} (status {st:02X})", named(code)))
             .collect(),
         System::Abs => c
             .read_dtcs_13(0x4000)
             .map_err(|e| format!("DTCs: {e}"))?
             .into_iter()
-            .map(dtc_name)
+            .map(named)
             .collect(),
         System::Srs => {
             // The Hi-Scan asks twice; it marks codes from filter 01 as
@@ -411,11 +584,12 @@ fn dtc(o: &Opts) -> Result<(), String> {
                     .read_dtcs_by_status(status, 0xff00)
                     .map_err(|e| format!("DTCs: {e}"))?
                 {
-                    v.push(format!("{} {kind}, status {st:02X}", dtc_name(code)));
+                    v.push(format!("{} ({kind}, status {st:02X})", named(code)));
                 }
             }
             v
         }
+        System::Tcs => unreachable!("handled by tcs_dtc"),
     };
     if list.is_empty() {
         println!("no stored DTCs");
@@ -427,7 +601,79 @@ fn dtc(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// ECU identification as the Hi-Scan asks for it.
+fn ident(o: &Opts) -> Result<(), String> {
+    if o.system == System::Tcs {
+        return Err("the Hi-Scan has no identification screen for traction control".into());
+    }
+    let mut c = connect(o)?;
+    let printable = |b: &[u8]| -> String {
+        b.iter()
+            .map(|&x| {
+                if (0x20..0x7f).contains(&x) {
+                    x as char
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    };
+    match o.system {
+        System::Engine => {
+            // the Hi-Scan's Identification Check: 1A 8E, shown as text
+            let r = c
+                .request(&[0x1a, 0x8e])
+                .map_err(|e| format!("1A 8E: {e}"))?;
+            println!("identification: {}", printable(r.get(2..).unwrap_or(&[])));
+            println!("raw: {}", hex(&r));
+        }
+        System::Srs => {
+            let r = c
+                .request(&[0x1a, 0x80])
+                .map_err(|e| format!("1A 80: {e}"))?;
+            let id = defs::parse_srs_ident(&r);
+            println!("vehicle:     {}", id.vehicle);
+            println!("part no:     {}", id.part_no);
+            println!("part name:   {}", id.part_name);
+            println!(
+                "ACU version: {}",
+                id.acu_version.as_deref().unwrap_or("(reply too short)")
+            );
+            println!("raw: {}", hex(&r));
+            println!("(layout as the Hi-Scan shows it; unverified on a real module)");
+        }
+        System::Abs => {
+            return Err("the ABS identification request has not been observed yet".into());
+        }
+        System::Tcs => unreachable!("refused above"),
+    }
+    let _ = c.stop();
+    Ok(())
+}
+
+/// SRS crash records (Hi-Scan "Crashing Information"): read-only, printed raw
+/// because the record layout is not known yet.
+fn crash(o: &Opts) -> Result<(), String> {
+    if o.system != System::Srs {
+        return Err("crash records are an SRS function: use --system srs".into());
+    }
+    let mut c = connect(o)?;
+    // the Hi-Scan sends 21 00 01 first, then polls 21 00
+    for req in [&[0x21, 0x00, 0x01][..], &[0x21, 0x00]] {
+        match c.request(req) {
+            Ok(r) => println!("{} -> {}", hex(req), hex(&r)),
+            Err(e) => println!("{} -> {e}", hex(req)),
+        }
+    }
+    println!("(record layout unknown: keep this output and the --trace file)");
+    let _ = c.stop();
+    Ok(())
+}
+
 fn log(o: &Opts) -> Result<(), String> {
+    if o.system == System::Tcs {
+        return tcs_log(o);
+    }
     let params = defs::parse_csv(o.system.data_defs()?)?;
     let mut c = connect(o)?;
     let mut w: Box<dyn Write> = match &o.out {
@@ -489,12 +735,14 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "dtc" => parse(rest).and_then(|o| dtc(&o)),
         Some((cmd, rest)) if cmd == "log" => parse(rest).and_then(|o| log(&o)),
         Some((cmd, rest)) if cmd == "clear" => parse(rest).and_then(|o| clear(&o)),
+        Some((cmd, rest)) if cmd == "ident" => parse(rest).and_then(|o| ident(&o)),
+        Some((cmd, rest)) if cmd == "crash" => parse(rest).and_then(|o| crash(&o)),
         Some((cmd, _)) if cmd == "j2534-list" => j2534_list(),
         Some((cmd, rest)) if cmd == "selftest" => match rest {
             [flag, dev] if flag == "--port" => selftest(dev),
             _ => Err("usage: kdiag selftest --port DEV".into()),
         },
-        _ => Err("usage: kdiag dtc|log|clear|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --j2534 DLL|auto) [--system engine|abs|srs] [--out F] \
+        _ => Err("usage: kdiag dtc|log|clear|ident|crash|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };

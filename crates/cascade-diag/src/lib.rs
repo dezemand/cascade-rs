@@ -6,6 +6,7 @@
 
 pub mod defs;
 pub mod guard;
+pub mod iso9141;
 pub mod j2534;
 #[cfg(all(feature = "serial", unix))]
 pub mod kline_iface;

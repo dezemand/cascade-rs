@@ -1,0 +1,6 @@
+# Tiburon traction control (2003-, address 0x32, ISO 9141-2): request B1 2C, answer F1 2C + data.
+# Emulator-derived from the Hi-Scan firmware (HP 701 USA, 09910-61000); not yet seen on the car.
+# offset: byte index after "F1 2C". The Hi-Scan needs 1 byte; set = ON. Other bits not shown.
+name,offset,size,signed,scale,add,unit,metric
+tc_fl_valve,0,bit0,no,,,flag,set = ON
+tc_fr_valve,0,bit2,no,,,flag,set = ON

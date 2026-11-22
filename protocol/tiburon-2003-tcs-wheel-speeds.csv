@@ -1,0 +1,9 @@
+# Tiburon traction control (2003-, address 0x32, ISO 9141-2): request B1 0E, answer F1 0E + data.
+# Emulator-derived from the Hi-Scan firmware (HP 701 USA, 09910-61000); not yet seen on the car.
+# offset: byte index after "F1 0E". The Hi-Scan needs at least these 4 bytes; it shows MPH.
+# Checked at 10, 20, 100, 200 and 255 km/h (6, 12, 62, 124, 158 mph on screen).
+name,offset,size,signed,scale,add,unit,metric
+wheel_speed_fl,0,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_fr,1,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_rl,2,1,no,0.621371,0,mph,1 km/h/bit
+wheel_speed_rr,3,1,no,0.621371,0,mph,1 km/h/bit
