@@ -56,8 +56,12 @@ pub struct KwpConfig {
     pub ecu_ident: BTreeMap<u8, Vec<u8>>,
     /// ReadDataByLocalIdentifier (0x21) answers by local identifier.
     pub local_data: BTreeMap<u8, Vec<u8>>,
-    /// Stored DTCs as (code, status) for ReadDTCsByStatus (0x18).
+    /// Stored DTCs as (code, status) for ReadDTCsByStatus (0x18), ReadDTCs
+    /// (0x13, codes only) and, in ISO 9141 mode, OBD mode 03. `18 01 ..`
+    /// (the Hi-Scan's "history" query) answers from `dtcs_history` instead.
     pub dtcs: Vec<(u16, u8)>,
+    /// Codes no longer present, for `18 01 ..` (SRS history).
+    pub dtcs_history: Vec<(u16, u8)>,
     /// Fixed responses for exact requests (service data, SID first),
     /// checked before the built-in services once a session is active.
     pub responses: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -91,6 +95,7 @@ impl Default for KwpConfig {
             ecu_ident: BTreeMap::new(),
             local_data: BTreeMap::new(),
             dtcs: Vec::new(),
+            dtcs_history: Vec::new(),
             responses: BTreeMap::new(),
             sequences: BTreeMap::new(),
             length_byte: false,
@@ -107,6 +112,7 @@ pub mod nrc {
     pub const REQUEST_OUT_OF_RANGE: u8 = 0x31;
 }
 
+#[derive(Clone)]
 pub struct KwpEcu {
     pub config: KwpConfig,
     rx_frame: Vec<u8>,
@@ -236,14 +242,27 @@ impl KwpEcu {
                 }
             }
             0x18 => {
-                let mut r = vec![0x58, self.config.dtcs.len() as u8];
-                for &(code, status) in &self.config.dtcs {
+                let list = if req.get(1) == Some(&0x01) {
+                    &self.config.dtcs_history
+                } else {
+                    &self.config.dtcs
+                };
+                let mut r = vec![0x58, list.len() as u8];
+                for &(code, status) in list {
                     r.extend_from_slice(&[(code >> 8) as u8, code as u8, status]);
+                }
+                Some(r)
+            }
+            0x13 => {
+                let mut r = vec![0x53, self.config.dtcs.len() as u8];
+                for &(code, _) in &self.config.dtcs {
+                    r.extend_from_slice(&[(code >> 8) as u8, code as u8]);
                 }
                 Some(r)
             }
             0x14 => {
                 self.config.dtcs.clear();
+                self.config.dtcs_history.clear();
                 let group = req.get(1..3).unwrap_or(&[0xff, 0x00]);
                 Some(vec![0x54, group[0], group[1]])
             }
@@ -262,7 +281,23 @@ impl KwpEcu {
         let data = frame[3..frame.len() - 1].to_vec();
         let response = match self.config.responses.get(&data) {
             Some(r) => Some(r.clone()),
-            None => self.next_recorded(&data),
+            None => match data.as_slice() {
+                // OBD-style stored codes: three per frame, 00 00 padding
+                [0x03] if self.config.sequences.is_empty() => {
+                    let mut r = vec![0x43];
+                    for i in 0..3 {
+                        let code = self.config.dtcs.get(i).map_or(0, |d| d.0);
+                        r.extend_from_slice(&code.to_be_bytes());
+                    }
+                    Some(r)
+                }
+                [0x04] if self.config.sequences.is_empty() => {
+                    self.config.dtcs.clear();
+                    self.config.dtcs_history.clear();
+                    Some(vec![0x44])
+                }
+                _ => self.next_recorded(&data),
+            },
         };
         if let Some(r) = &response {
             let mut f = vec![0x48, 0x6b, self.config.address];

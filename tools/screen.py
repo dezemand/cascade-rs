@@ -24,6 +24,8 @@ PATHS = {
     "tiburon-abs": ["enter"] + ["down"] * 8 + ["enter"] + ["down"] * 3 + ["enter"] + ["wait"] * 4,
     # SRS 2003-2006 function menu; needs --kwp-addr 0x58 and the same key bytes
     "tiburon-srs": ["enter"] + ["down"] * 8 + ["enter"] + ["down"] * 4 + ["enter", "down", "enter"] + ["wait"] * 4,
+    # traction control (2003-) function menu: 5-baud init to 0x32, ISO 9141-2
+    "tiburon-tcs": ["enter"] + ["down"] * 8 + ["enter"] + ["down"] * 7 + ["enter", "enter"] + ["wait"] * 4,
 }
 
 

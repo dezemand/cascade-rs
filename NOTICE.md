@@ -63,7 +63,9 @@ reads 16 bits.
 - Diagnostic-line backends: a KWP2000 ECU model (also 5-baud init and ISO 9141-2 framing), replay of recorded
   sessions, a real serial K-line (a port of upstream's `iface_kl_tty`), and
   an emulated engine ECU (`ecuc167`), and `ecusim`, which runs that ECU in
-  real time as a separate process with an engine model.
+  real time as a separate process with an engine model and models of the
+  car's other modules.
+- `kdiag elm`, an ELM327 front for OBD apps.
 - Tracing and analysis: oracle trace format and diff, line-event logs, ROM
   read and code coverage probes, a disassembler command.
 - `kdiag`, a native diagnostic tool that uses the protocol data learned with

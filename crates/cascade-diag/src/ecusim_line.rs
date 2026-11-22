@@ -21,9 +21,12 @@ pub struct EcusimLine {
 }
 
 impl EcusimLine {
-    pub fn connect(socket: &Path) -> io::Result<Self> {
+    /// Connect as a tester on a Hi-Scan line number (7 engine, 8 ABS/TCS,
+    /// 12 SRS).
+    pub fn connect(socket: &Path, line: i32) -> io::Result<Self> {
         let mut conn = Conn::connect(socket)?;
         conn.send(&ToServer::KLine)?;
+        conn.send(&ToServer::Line(line))?;
         Ok(Self {
             conn,
             start: Instant::now(),
@@ -86,6 +89,10 @@ impl Line for EcusimLine {
             }
             precise_sleep(Duration::from_micros(bit));
         }
+        self.conn.send(&ToServer::Slow {
+            us: t + 10 * bit,
+            addr,
+        })?;
         Ok(())
     }
 

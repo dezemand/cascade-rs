@@ -1,0 +1,6 @@
+# The throttle position sensor shorts to ground while idling (P0122).
+0    coolant 85
+0    ignition on
+2    starter on
+3    starter off
+15   fault.throttle_short on

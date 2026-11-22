@@ -121,6 +121,7 @@ impl std::fmt::Display for Stop {
     }
 }
 
+#[derive(Clone)]
 pub struct Cpu {
     pub mem: Vec<u8>,
     rom: Vec<u8>,
@@ -206,8 +207,9 @@ pub struct Wheel {
 #[derive(Clone, Debug)]
 pub struct Cam {
     pub targets: Vec<Pin>,
-    pub fall: u32,
-    pub rise: u32,
+    /// Low intervals (fall, rise) in crank tooth positions (0..2 x teeth);
+    /// several for a multi-tooth (CVVT) cam wheel.
+    pub lows: Vec<(u32, u32)>,
 }
 
 /// Timer inputs a wheel can drive.
@@ -336,13 +338,23 @@ impl Cpu {
 
     // ---------------------------------------------------------------- memory
 
-    fn is_flash(a: u32) -> bool {
-        a < 0x80000 && !(0xC000..0x10000).contains(&a)
+    /// Flash is CS0, mirrored up to 0x80000 for a 256 KB (2 Mbit, SIMK41)
+    /// image; a 512 KB (4 Mbit, SIMK43) image is also mapped at
+    /// 0x80000-0xFFFFF, where its boot block looks for the application
+    /// [verified: its validity marker sits at 0xA0000]. 0xC000-0xFFFF is RAM
+    /// and SFRs in both.
+    fn is_flash(&self, a: u32) -> bool {
+        if self.rom.len() > 0x40000 {
+            // SIMK43: CS3 (ADDRSEL3 0x00A0) is 4 KB of RAM at 0xA000
+            a < 0x100000 && !(0xA000..0xB000).contains(&a) && !(0xC000..0x10000).contains(&a)
+        } else {
+            a < 0x80000 && !(0xC000..0x10000).contains(&a)
+        }
     }
 
     pub fn peek8(&self, a: u32) -> u8 {
         let a = a & 0xFF_FFFF;
-        if Self::is_flash(a) {
+        if self.is_flash(a) {
             self.rom[(a as usize) & (self.rom.len() - 1)]
         } else {
             self.mem[a as usize]
@@ -398,7 +410,7 @@ impl Cpu {
     fn wr16(&mut self, a: u32, v: u16) {
         let a = a & 0xFF_FFFE;
         self.watch_hit(a, v, true);
-        if Self::is_flash(a) {
+        if self.is_flash(a) {
             self.flash_writes += 1;
             return;
         }
@@ -1527,13 +1539,15 @@ impl Cpu {
                 // cam edges at whole tooth positions (on the leading flank)
                 if !rising && let Some(cam) = &w.cam {
                     let p = w.pos720;
-                    let edge = if p == cam.fall {
-                        Some(false)
-                    } else if p == cam.rise {
-                        Some(true)
-                    } else {
-                        None
-                    };
+                    let edge = cam.lows.iter().find_map(|&(f, r)| {
+                        if p == f {
+                            Some(false)
+                        } else if p == r {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    });
                     if let Some(level) = edge {
                         for t in cam.targets.clone() {
                             self.pin_edge(t, level);

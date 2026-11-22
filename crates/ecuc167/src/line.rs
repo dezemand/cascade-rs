@@ -1,7 +1,7 @@
 //! The K-line as a wired-AND of the tester and the ECU: a merged list of
 //! intervals (in CPU cycles) during which someone pulls it low.
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Line {
     lows: Vec<(u64, u64)>,
     /// Bumped on every change, so readers can cache derived state.

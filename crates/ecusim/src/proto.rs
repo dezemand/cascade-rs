@@ -6,6 +6,9 @@
 //! - `LOW <us>` / `HIGH <us>`: the tester pulls K low / releases it (fast
 //!   init, 5-baud address bits).
 //! - `BAUD <n>`: the tester's bit rate (default 10,400).
+//! - `LINE <n>`: the diagnostic line the tester switched to (the Hi-Scan's
+//!   numbering: 7 engine K-line, 8 ABS/TCS, 12 or 10 SRS); default 7.
+//! - `SLOW <us> <addr>`: a complete 5-baud address (also sent as LOW/HIGH).
 //! - `SET <name> <value>`: a control (see [`crate::plant::Controls::set`]).
 //! - `WATCH`: send `STATUS` lines to this connection (every 100 ms).
 //! - `KLINE`: send `RX` lines to this connection.
@@ -21,6 +24,8 @@ pub enum ToServer {
     Low { us: u64 },
     High { us: u64 },
     Baud(u32),
+    Line(i32),
+    Slow { us: u64, addr: u8 },
     Set { name: String, value: String },
     Watch,
     KLine,
@@ -63,6 +68,16 @@ impl ToServer {
             Some("LOW") => ToServer::Low { us: num(f.get(1))? },
             Some("HIGH") => ToServer::High { us: num(f.get(1))? },
             Some("BAUD") => ToServer::Baud(num(f.get(1))? as u32),
+            Some("LINE") => ToServer::Line(
+                f.get(1)
+                    .ok_or("missing line")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?,
+            ),
+            Some("SLOW") => ToServer::Slow {
+                us: num(f.get(1))?,
+                addr: num(f.get(2))? as u8,
+            },
             Some("SET") if f.len() == 3 => ToServer::Set {
                 name: f[1].into(),
                 value: f[2].into(),
@@ -79,6 +94,8 @@ impl ToServer {
             ToServer::Low { us } => format!("LOW {us}"),
             ToServer::High { us } => format!("HIGH {us}"),
             ToServer::Baud(b) => format!("BAUD {b}"),
+            ToServer::Line(l) => format!("LINE {l}"),
+            ToServer::Slow { us, addr } => format!("SLOW {us} {addr}"),
             ToServer::Set { name, value } => format!("SET {name} {value}"),
             ToServer::Watch => "WATCH".into(),
             ToServer::KLine => "KLINE".into(),
@@ -134,6 +151,8 @@ mod tests {
             ToServer::Low { us: 5 },
             ToServer::High { us: 25_005 },
             ToServer::Baud(10_400),
+            ToServer::Line(12),
+            ToServer::Slow { us: 9, addr: 0x32 },
             ToServer::Set {
                 name: "ignition".into(),
                 value: "on".into(),

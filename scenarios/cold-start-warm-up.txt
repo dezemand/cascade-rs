@@ -1,0 +1,13 @@
+# Cold start at 5 degC, idle while the engine warms up, a short rev.
+0    coolant 5
+0    intake 5
+0    ignition on
+2    starter on
+3    starter off
+10   coolant 20
+20   coolant 40
+25   throttle 30
+27   throttle 0
+30   coolant 60
+40   coolant 80
+50   coolant 88

@@ -36,6 +36,44 @@ pub struct Controls {
     /// Stop the engine with the key left on (`SET engine stop`); taken by the
     /// next model step.
     pub stop_request: bool,
+    /// Which ECU family's sensor wiring to drive (set from the dump).
+    pub family: Family,
+    /// Faults that come and go (a loose connector).
+    pub intermittent: std::collections::BTreeSet<Fault>,
+    /// Time runs this much faster than the wall clock (1-10) while no
+    /// tester is connected.
+    pub time_factor: f64,
+    /// Engine model: closed loop on the ECU's own fuel, spark and idle air
+    /// when the dump supports it (`auto`), or always open loop.
+    pub open_loop_only: bool,
+}
+
+/// ECU families and how their sensors are wired (ADC channels; found with
+/// `tools/fault_sweep.py`, emulator-derived).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Family {
+    /// SIMK41 (256 KB): MAP on 0, front O2 on 2.
+    #[default]
+    Simk41,
+    /// SIMK43 (512 KB, CVVT): MAF on 0, oil temperature on 6, front O2 on 7.
+    Simk43,
+}
+
+impl Family {
+    pub fn for_rom(rom: &[u8]) -> Self {
+        if rom.len() > 256 * 1024 {
+            Family::Simk43
+        } else {
+            Family::Simk41
+        }
+    }
+
+    fn front_o2(self) -> usize {
+        match self {
+            Family::Simk41 => 2,
+            Family::Simk43 => 7,
+        }
+    }
 }
 
 /// A wiring fault the ECU can detect. The codes are what the
@@ -56,10 +94,16 @@ pub enum Fault {
     BatteryLow,
     WheelSpeedCircuit,
     CamMissing,
+    AbsWheelSensorFl,
+    AbsPumpMotor,
+    SrsDriverAirbag,
+    SrsPassengerAirbag,
+    OilTempShort,
+    OilTempOpen,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 13] = [
+    pub const ALL: [Fault; 19] = [
         Fault::MapShort,
         Fault::MapOpen,
         Fault::CoolantShort,
@@ -73,6 +117,12 @@ impl Fault {
         Fault::BatteryLow,
         Fault::WheelSpeedCircuit,
         Fault::CamMissing,
+        Fault::AbsWheelSensorFl,
+        Fault::AbsPumpMotor,
+        Fault::SrsDriverAirbag,
+        Fault::SrsPassengerAirbag,
+        Fault::OilTempShort,
+        Fault::OilTempOpen,
     ];
 
     /// Name used on the socket (`SET fault.NAME on`).
@@ -91,6 +141,12 @@ impl Fault {
             Fault::BatteryLow => "battery_low",
             Fault::WheelSpeedCircuit => "wheel_speed_circuit",
             Fault::CamMissing => "cam_missing",
+            Fault::AbsWheelSensorFl => "abs_wheel_sensor_fl",
+            Fault::AbsPumpMotor => "abs_pump_motor",
+            Fault::SrsDriverAirbag => "srs_driver_airbag",
+            Fault::SrsPassengerAirbag => "srs_passenger_airbag",
+            Fault::OilTempShort => "oil_temp_short",
+            Fault::OilTempOpen => "oil_temp_open",
         }
     }
 
@@ -101,8 +157,8 @@ impl Fault {
     /// What is wrong, for people.
     pub fn label(self) -> &'static str {
         match self {
-            Fault::MapShort => "MAP sensor shorted to ground",
-            Fault::MapOpen => "MAP sensor open circuit",
+            Fault::MapShort => "MAP/MAF sensor shorted to ground",
+            Fault::MapOpen => "MAP/MAF sensor open circuit",
             Fault::CoolantShort => "Coolant sensor shorted",
             Fault::CoolantOpen => "Coolant sensor open circuit",
             Fault::ThrottleShort => "Throttle sensor shorted",
@@ -114,6 +170,12 @@ impl Fault {
             Fault::BatteryLow => "Battery sense line at 0 V",
             Fault::WheelSpeedCircuit => "Wheel speed signal line (ADC 12) open",
             Fault::CamMissing => "Cam sensor signal missing",
+            Fault::AbsWheelSensorFl => "ABS: front-left wheel sensor open",
+            Fault::AbsPumpMotor => "ABS: pump motor circuit",
+            Fault::SrsDriverAirbag => "Airbag: driver bag resistance high",
+            Fault::SrsPassengerAirbag => "Airbag: passenger bag resistance high",
+            Fault::OilTempShort => "Oil temp sensor shorted (SIMK43)",
+            Fault::OilTempOpen => "Oil temp sensor open circuit (SIMK43)",
         }
     }
 
@@ -133,11 +195,17 @@ impl Fault {
             Fault::BatteryLow => "P0560",
             Fault::WheelSpeedCircuit => "P1502",
             Fault::CamMissing => "P0340",
+            Fault::AbsWheelSensorFl => "C1200",
+            Fault::AbsPumpMotor => "C2402",
+            Fault::SrsDriverAirbag => "B1346",
+            Fault::SrsPassengerAirbag => "B1352",
+            Fault::OilTempShort => "P0197",
+            Fault::OilTempOpen => "P0198",
         }
     }
 
     /// The ADC override (channel, value) for a wiring fault on a sensor.
-    pub fn adc(self) -> Option<(usize, u16)> {
+    pub fn adc(self, family: Family) -> Option<(usize, u16)> {
         Some(match self {
             Fault::MapShort => (0, 0),
             Fault::MapOpen => (0, 0x3FF),
@@ -145,13 +213,19 @@ impl Fault {
             Fault::CoolantOpen => (11, 0x3FF),
             Fault::ThrottleShort => (10, 0),
             Fault::ThrottleOpen => (10, 0x3FF),
-            Fault::O2FrontOpen => (2, 0x3FF),
+            Fault::O2FrontOpen => (family.front_o2(), 0x3FF),
+            Fault::OilTempShort => (6, 0),
+            Fault::OilTempOpen => (6, 0x3FF),
             Fault::O2RearOpen => (3, 0x3FF),
             Fault::EvapShort => (8, 0),
             Fault::EvapOpen => (8, 0x3FF),
             Fault::BatteryLow => (4, 0),
             Fault::WheelSpeedCircuit => (12, 0x3FF),
-            Fault::CamMissing => return None,
+            Fault::CamMissing
+            | Fault::AbsWheelSensorFl
+            | Fault::AbsPumpMotor
+            | Fault::SrsDriverAirbag
+            | Fault::SrsPassengerAirbag => return None,
         })
     }
 }
@@ -171,6 +245,10 @@ impl Default for Controls {
             battery_connected: true,
             faults: Default::default(),
             stop_request: false,
+            family: Family::Simk41,
+            intermittent: Default::default(),
+            time_factor: 1.0,
+            open_loop_only: false,
         }
     }
 }
@@ -202,6 +280,12 @@ impl Controls {
             "idle" => self.idle_rpm = num(500.0, 2000.0)?,
             "rpm" => self.rpm_override = num(0.0, 7000.0)?,
             "battery_connected" => self.battery_connected = on()?,
+            "time" => self.time_factor = num(1.0, 10.0)?,
+            "model" => match value {
+                "auto" | "closed" => self.open_loop_only = false,
+                "open" => self.open_loop_only = true,
+                v => return Err(format!("model: auto or open, got {v:?}")),
+            },
             "engine" if value == "stop" => self.stop_request = true,
             "engine" => return Err(format!("engine: only `stop`, got {value:?}")),
             n if n.starts_with("fault.") => {
@@ -209,10 +293,12 @@ impl Controls {
                     let all: Vec<&str> = Fault::ALL.iter().map(|f| f.name()).collect();
                     format!("unknown fault {:?} ({})", &n[6..], all.join(", "))
                 })?;
-                if on()? {
+                self.faults.remove(&f);
+                self.intermittent.remove(&f);
+                if value == "intermittent" {
+                    self.intermittent.insert(f);
+                } else if on()? {
                     self.faults.insert(f);
-                } else {
-                    self.faults.remove(&f);
                 }
             }
             n => return Err(format!("unknown control {n:?}")),
@@ -245,6 +331,14 @@ pub struct Plant {
     pub rpm: f64,
     cranked_s: f64,
     t: f64,
+    /// Closed loop: the last step used the ECU's outputs.
+    pub closed_loop: bool,
+    /// Closed loop state: manifold pressure (kPa), mixture (lambda), front
+    /// O2 voltage (mV), and a fuel cut until this time (engine stop).
+    pub map_kpa: f64,
+    pub lambda: f64,
+    o2_mv: f64,
+    cut_until: f64,
 }
 
 /// Sensor values the ECU sees, as engineering values and ADC counts.
@@ -266,6 +360,11 @@ impl Default for Plant {
             rpm: 0.0,
             cranked_s: 0.0,
             t: 0.0,
+            closed_loop: false,
+            map_kpa: 101.0,
+            lambda: 1.0,
+            o2_mv: 450.0,
+            cut_until: 0.0,
         }
     }
 }
@@ -314,6 +413,75 @@ impl Plant {
         }
     }
 
+    /// Advance by `dt` seconds on the ECU's own outputs [assumed physics,
+    /// calibrated to the GK 2.0 2003 dump: at 32 kPa its injection is 3.07
+    /// ms, and torque balances friction at 830 rpm, its target idle, with
+    /// its own 27 % idle air]. `fueled`: the ECU fired its injectors in the
+    /// last 0.3 s.
+    pub fn step_closed(
+        &mut self,
+        c: &Controls,
+        dt: f64,
+        o: &crate::ecu_view::Outputs,
+        fueled: bool,
+    ) {
+        self.t += dt;
+        self.closed_loop = true;
+        // engine stop: no combustion until it is cranked again
+        if c.stop_request && !c.starter {
+            self.cut_until = f64::INFINITY;
+        }
+        if c.starter {
+            self.cut_until = 0.0;
+        }
+        // manifold: throttle plus idle air against the engine's pumping
+        let a = (c.throttle / 100.0).powf(1.5) * 25.0 + o.idle_air_pct / 100.0 * 1.43 + 0.02;
+        let target = 101.0 * a / (a + self.rpm.max(0.0) / 1000.0);
+        self.map_kpa += (target - self.map_kpa) * (dt / 0.08).min(1.0);
+        // mixture: air from pressure, fuel from the ECU's injection time
+        let fuel = o.injection_ms + 0.65;
+        let burning = c.ignition && fueled && self.t >= self.cut_until && fuel > 0.7;
+        self.lambda = if burning {
+            (self.map_kpa / 32.7 * breathing(self.rpm)) / (fuel / 3.83)
+        } else {
+            9.9
+        };
+        let eff_mix = (1.0 - ((self.lambda - 1.0) / 0.6).powi(2)).clamp(0.0, 1.0);
+        let eff_spark = (1.0 - ((o.advance_deg - 14.0) / 45.0).powi(2)).clamp(0.3, 1.0);
+        let torque = if burning && self.rpm > 80.0 {
+            1.4 * self.map_kpa / 32.0 * eff_mix * eff_spark
+        } else {
+            0.0
+        };
+        // friction, steeper past 6500 rpm
+        let friction = if self.rpm > 0.0 {
+            0.4 + 0.6 * self.rpm / 830.0 + ((self.rpm - 6500.0).max(0.0) / 200.0).powi(2)
+        } else {
+            0.0
+        };
+        self.rpm += 600.0 * (torque - friction) * dt;
+        if c.ignition && c.starter && self.rpm < CRANK_RPM {
+            self.rpm += (CRANK_RPM - self.rpm) * (dt / 0.2).min(1.0);
+        }
+        self.rpm = self.rpm.max(0.0);
+        self.engine = if burning && self.rpm > 400.0 {
+            Engine::Running
+        } else if c.ignition && c.starter {
+            Engine::Cranking
+        } else {
+            Engine::Off
+        };
+        // front O2: rich above 1 V-ish, lean below, a little lag
+        let o2 = if !burning {
+            450.0
+        } else if self.lambda < 1.0 {
+            800.0
+        } else {
+            100.0
+        };
+        self.o2_mv += (o2 - self.o2_mv) * (dt / 0.06).min(1.0);
+    }
+
     /// Sensor values for the controls and the current state.
     pub fn sensors(&self, c: &Controls) -> Sensors {
         let running = self.engine == Engine::Running;
@@ -323,13 +491,22 @@ impl Plant {
             Engine::Running => (c.battery_v + 1.5).max(13.8),
             Engine::Off => c.battery_v - 0.2,
         };
-        let map_kpa = match self.engine {
-            Engine::Off => 101.0,
-            Engine::Cranking => 90.0,
-            Engine::Running => 32.0 + c.throttle * 0.69,
+        let map_kpa = if self.closed_loop {
+            self.map_kpa
+        } else {
+            match self.engine {
+                Engine::Off => 101.0,
+                Engine::Cranking => 90.0,
+                Engine::Running => 32.0 + c.throttle * 0.69,
+            }
         };
         let warm = c.coolant_c > 40.0;
-        let o2_front_mv = if running && warm {
+        // The SIMK43 sets P0101 when the front O2 switches on its own: its
+        // trim learning expects the sensor to follow its fuel corrections
+        // (closed loop, not modelled yet), so it gets a steady signal.
+        let o2_front_mv = if self.closed_loop {
+            self.o2_mv
+        } else if running && warm && c.family == Family::Simk41 {
             // closed loop switching about once a second
             if ((self.t * 2.0) as u64).is_multiple_of(2) {
                 120.0
@@ -341,9 +518,22 @@ impl Plant {
         };
         let o2_rear_mv = if running && warm { 650.0 } else { 450.0 };
         let throttle_deg = c.throttle / 100.0 * 82.0;
+        // SIMK43: a MAF sensor instead of MAP (about 1 V standing, rising
+        // with load [assumed curve]), oil temperature like the coolant
+        let maf_v = if running {
+            1.3 + c.throttle / 100.0 * 2.8 + plant_rpm_volts(self.rpm)
+        } else {
+            1.0
+        };
+        let first = match c.family {
+            Family::Simk41 => vec![(0, adc_map(map_kpa)), (2, adc_o2(o2_front_mv))],
+            Family::Simk43 => vec![
+                (0, clamp10(maf_v / 5.0 * 1023.0)),
+                (6, adc_ntc(c.coolant_c)),
+                (7, adc_o2(o2_front_mv)),
+            ],
+        };
         let adc = vec![
-            (0, adc_map(map_kpa)),
-            (2, adc_o2(o2_front_mv)),
             (3, adc_o2(o2_rear_mv)),
             (4, adc_battery(battery_v)),
             (10, adc_throttle(throttle_deg)),
@@ -354,9 +544,9 @@ impl Plant {
             (8, 0x200),
             (12, 0x200),
         ];
-        let mut adc = adc;
+        let mut adc: Vec<(usize, u16)> = first.into_iter().chain(adc).collect();
         for f in &c.faults {
-            if let Some((ch, v)) = f.adc()
+            if let Some((ch, v)) = f.adc(c.family)
                 && let Some(slot) = adc.iter_mut().find(|(c, _)| *c == ch)
             {
                 slot.1 = v;
@@ -429,6 +619,38 @@ pub fn adc_ntc(c: f64) -> u16 {
         }
     }
     NTC[14].0
+}
+
+/// Air per cycle at constant manifold pressure, relative to 800 rpm: the
+/// ECU's own fuel per cycle at 32.7 kPa across engine speed (GK 2.0 2003
+/// dump, warm, trims at zero), so that its steady-state mixture is
+/// stoichiometric. Below 700 rpm the ECU is not regulating idle yet.
+fn breathing(rpm: f64) -> f64 {
+    const PTS: [(f64, f64); 8] = [
+        (400.0, 0.92),
+        (500.0, 0.89),
+        (650.0, 0.86),
+        (800.0, 1.0),
+        (1200.0, 1.03),
+        (2000.0, 1.01),
+        (3000.0, 1.04),
+        (4500.0, 1.20),
+    ];
+    if rpm <= PTS[0].0 {
+        return PTS[0].1;
+    }
+    for w in PTS.windows(2) {
+        let ((r0, v0), (r1, v1)) = (w[0], w[1]);
+        if rpm <= r1 {
+            return v0 + (v1 - v0) * (rpm - r0) / (r1 - r0);
+        }
+    }
+    PTS[7].1
+}
+
+/// Extra MAF voltage from engine speed (more air at higher rpm) [assumed].
+fn plant_rpm_volts(rpm: f64) -> f64 {
+    (rpm / 6500.0).clamp(0.0, 1.0) * 0.8
 }
 
 #[cfg(test)]
@@ -509,6 +731,47 @@ mod tests {
         }
         assert_eq!((p.engine, p.rpm), (Engine::Off, 0.0));
         assert!(c.ignition, "key still on");
+    }
+
+    /// A stand-in ECU: injects for the measured air (stoichiometric) and
+    /// holds idle at 830 rpm with its idle air, as the dump does.
+    fn ecu(p: &Plant, isc: &mut f64) -> crate::ecu_view::Outputs {
+        if p.rpm > 700.0 {
+            *isc = (*isc + (830.0 - p.rpm) * 0.0005).clamp(5.0, 60.0);
+        }
+        crate::ecu_view::Outputs {
+            injection_ms: p.map_kpa / 32.7 * breathing(p.rpm) * 3.83 - 0.65,
+            advance_deg: 12.0,
+            idle_air_pct: *isc,
+            target_idle: 830.0,
+        }
+    }
+
+    #[test]
+    fn closed_loop_starts_idles_and_stops() {
+        let (mut p, mut isc) = (Plant::default(), 27.0);
+        let mut c = Controls {
+            ignition: true,
+            starter: true,
+            ..Default::default()
+        };
+        let dt = 0.002;
+        for i in 0..20_000 {
+            if i == 1000 {
+                c.starter = false;
+            }
+            let o = ecu(&p, &mut isc);
+            p.step_closed(&c, dt, &o, true);
+        }
+        assert_eq!(p.engine, Engine::Running);
+        assert!((p.rpm - 830.0).abs() < 40.0, "idles near target: {}", p.rpm);
+        assert!((p.lambda - 1.0).abs() < 0.05, "stoichiometric: {}", p.lambda);
+        // no fuel: it stalls
+        for _ in 0..3000 {
+            let o = ecu(&p, &mut isc);
+            p.step_closed(&c, dt, &o, false);
+        }
+        assert_eq!((p.engine, p.rpm), (Engine::Off, 0.0));
     }
 
     #[test]

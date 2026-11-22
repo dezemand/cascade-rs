@@ -28,8 +28,10 @@
 pub mod client;
 pub mod ecu_view;
 pub mod plant;
+pub mod probe;
 pub mod proto;
 pub mod server;
+pub mod vehicle;
 
 /// Default socket path.
 pub fn default_socket() -> std::path::PathBuf {

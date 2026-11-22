@@ -52,6 +52,7 @@ struct Panel {
     last_error: Option<String>,
     controls: Vec<Control>,
     cranking: bool,
+    tab: Tab,
     _subs: Vec<Subscription>,
 }
 
@@ -112,6 +113,7 @@ impl Panel {
             last_error: None,
             controls,
             cranking: false,
+            tab: Tab::Codes,
             _subs: subs,
         }
     }
@@ -201,19 +203,142 @@ impl Panel {
             cx.notify();
         }
     }
+}
 
-    fn stat(&self, label: &'static str, value: String, unit: &'static str) -> impl IntoElement {
+impl Panel {
+    /// Time factor buttons and snapshots (save, restore by name).
+    fn time_and_snapshots(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chip = |id: String, label: String, active: bool| {
+            div()
+                .id(SharedString::from(id))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(rgb(if active { ACCENT } else { EDGE }))
+                .bg(rgb(CARD))
+                .text_xs()
+                .text_color(rgb(if active { ACCENT } else { TEXT }))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(0x1f2024)))
+                .child(label)
+        };
+        let time = self.get("time").to_string();
+        let times = ["1", "2", "4", "8"].into_iter().fold(
+            div().flex().flex_row().gap(px(6.)).items_center().child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .w(px(70.))
+                    .child("Time"),
+            ),
+            |d, t| {
+                d.child(
+                    chip(format!("time-{t}"), format!("{t}×"), time == t).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.set("time", t);
+                            cx.notify();
+                        },
+                    )),
+                )
+            },
+        );
+        let snaps: Vec<String> = self
+            .get("snapshots")
+            .split(',')
+            .filter(|s| !s.is_empty() && *s != "none" && *s != "–")
+            .map(String::from)
+            .collect();
+        let next = format!("S{}", snaps.len() + 1);
+        let snap_row = snaps.iter().fold(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(6.))
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .w(px(70.))
+                        .child("Snapshots"),
+                )
+                .child(
+                    chip("snap-save".into(), "Save".into(), false).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.set("snapshot", &next);
+                            cx.notify();
+                        },
+                    )),
+                ),
+            |d, name| {
+                let n = name.clone();
+                d.child(
+                    chip(format!("snap-{name}"), format!("↺ {name}"), false).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.set("restore", &n);
+                            cx.notify();
+                        },
+                    )),
+                )
+            },
+        );
         div()
             .flex()
             .flex_col()
+            .gap(px(8.))
+            .child(times)
+            .child(snap_row)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(DIM))
+                    .child("Fast-forward drops to 1× while a tester is connected."),
+            )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Codes,
+    Faults,
+    Power,
+}
+
+/// A small bordered card.
+fn card() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .p(px(12.))
+        .rounded(px(10.))
+        .bg(rgb(CARD))
+        .border_1()
+        .border_color(rgb(EDGE))
+}
+
+fn caption(text: impl Into<SharedString>) -> Div {
+    div().text_xs().text_color(rgb(DIM)).child(text.into())
+}
+
+/// Entries of a comma list in the status ("none" and "–" are empty).
+fn list(v: &str) -> Vec<String> {
+    v.split(',')
+        .filter(|f| !f.is_empty() && *f != "none" && *f != "–")
+        .map(String::from)
+        .collect()
+}
+
+impl Panel {
+    /// A compact reading: caption over value and unit.
+    fn gauge(&self, label: &'static str, value: String, unit: &'static str) -> Div {
+        card()
             .gap(px(2.))
-            .p(px(10.))
-            .rounded(px(8.))
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(EDGE))
-            .min_w(px(110.))
-            .child(div().text_xs().text_color(rgb(DIM)).child(label))
+            .py(px(8.))
+            .min_w(px(96.))
+            .flex_1()
+            .child(caption(label))
             .child(
                 div()
                     .flex()
@@ -224,65 +349,29 @@ impl Panel {
                     .child(div().text_xs().text_color(rgb(DIM)).child(unit)),
             )
     }
-}
 
-impl Render for Panel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&self, cx: &mut Context<Self>) -> Div {
         let connected = self.conn.is_some() && !self.status.is_empty();
         let ign = self.get("ignition") == "on";
-        let engine = self.get("engine").to_string();
-        let ecu = self.get("ecu").to_string();
-        let rpm = self.get("rpm").to_string();
-
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_lg().text_color(rgb(TEXT)).child("GK 2.0 engine"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child("SIMK41 dump in ecusim · open-loop engine model"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(div().size(px(8.)).rounded_full().bg(rgb(if connected {
-                        OK
-                    } else {
-                        WARN
-                    })))
-                    .child(div().text_xs().text_color(rgb(DIM)).child(if connected {
-                        format!("ECU {ecu}")
-                    } else {
-                        "not connected".into()
-                    })),
-            );
-
-        // ignition and start
-        let key_btn = div()
-            .id("ignition")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(150.))
-            .h(px(56.))
-            .rounded(px(10.))
+        let running = matches!(self.get("engine"), "running" | "cranking");
+        let btn = |id: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .h(px(44.))
+                .px(px(16.))
+                .rounded(px(8.))
+                .text_sm()
+                .cursor_pointer()
+        };
+        let key = btn("ignition")
             .border_1()
             .border_color(rgb(if ign { ACCENT } else { EDGE }))
             .bg(rgb(CARD))
             .text_color(rgb(if ign { ACCENT } else { TEXT }))
-            .cursor_pointer()
             .hover(|s| s.bg(rgb(0x1f2024)))
             .child(if ign { "IGNITION ON" } else { "IGNITION OFF" })
             .on_click(cx.listener(move |v, _, _, cx| {
@@ -292,45 +381,19 @@ impl Render for Panel {
                 }
                 cx.notify();
             }));
-        let running = matches!(self.get("engine"), "running" | "cranking");
-        let stop_btn = div()
-            .id("stop")
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(120.))
-            .h(px(56.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(rgb(EDGE))
-            .bg(rgb(CARD))
-            .text_color(rgb(TEXT))
-            .when(!running, |d| d.opacity(0.4))
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x1f2024)))
-            .child("STOP ENGINE")
-            .on_click(cx.listener(move |v, _, _, cx| {
-                if running {
-                    v.set("engine", "stop");
-                }
-                cx.notify();
-            }));
-        let start_btn = div()
-            .id("start")
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .w(px(150.))
-            .h(px(56.))
-            .rounded(px(10.))
+        let start = btn("start")
+            .min_w(px(120.))
             .bg(rgb(if self.cranking { 0xd99c17 } else { ACCENT }))
             .text_color(rgb(ACCENT_TEXT))
             .font_weight(FontWeight::SEMIBOLD)
             .when(!ign, |d| d.opacity(0.4))
-            .cursor_pointer()
             .child("START")
-            .child(div().text_xs().child("hold to crank"))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::NORMAL)
+                    .child("hold to crank"),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |v, _, _, cx| {
@@ -343,307 +406,523 @@ impl Render for Panel {
                 MouseButton::Left,
                 cx.listener(|v, _, _, cx| v.starter(false, cx)),
             );
-
-        let engine_color = match engine.as_str() {
-            "running" => OK,
-            "cranking" => ACCENT,
-            _ => DIM,
-        };
-        let big = div()
-            .flex()
-            .flex_row()
-            .items_end()
-            .justify_between()
-            .p(px(16.))
-            .rounded(px(10.))
-            .bg(rgb(CARD))
+        let stop = btn("stop")
             .border_1()
             .border_color(rgb(EDGE))
+            .bg(rgb(CARD))
+            .text_color(rgb(TEXT))
+            .when(!running, |d| d.opacity(0.4))
+            .hover(|s| s.bg(rgb(0x1f2024)))
+            .child("STOP")
+            .on_click(cx.listener(move |v, _, _, cx| {
+                if running {
+                    v.set("engine", "stop");
+                }
+                cx.notify();
+            }));
+        let model = if self.get("model") == "closed" {
+            "runs on the ECU's fuel and spark"
+        } else {
+            "open-loop engine model"
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(DIM))
-                            .child("ENGINE SPEED (model)"),
-                    )
+                    .gap(px(2.))
+                    .child(div().text_lg().text_color(rgb(TEXT)).child("GK 2.0 engine"))
                     .child(
                         div()
                             .flex()
                             .flex_row()
-                            .items_baseline()
+                            .items_center()
                             .gap(px(6.))
-                            .child(div().text_3xl().text_color(rgb(TEXT)).child(rpm))
-                            .child(div().text_sm().text_color(rgb(DIM)).child("rpm")),
+                            .child(div().size(px(7.)).rounded_full().bg(rgb(if connected {
+                                OK
+                            } else {
+                                WARN
+                            })))
+                            .child(caption(if connected {
+                                format!(
+                                    "{} · ECU {} · {model}",
+                                    self.get("family").to_uppercase(),
+                                    self.get("ecu")
+                                )
+                            } else {
+                                "not connected to ecusim".to_string()
+                            })),
                     ),
             )
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(engine_color))
-                    .child(engine.to_uppercase()),
-            );
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .child(key)
+                    .child(start)
+                    .child(stop),
+            )
+    }
 
-        let stats = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(8.))
-            .child(self.stat("Battery", self.get("battery").into(), "V"))
-            .child(self.stat("MAP", self.get("map").into(), "kPa"))
-            .child(self.stat("Front O2", self.get("o2_front").into(), "mV"))
-            .child(self.stat("Testers", self.get("testers").into(), ""));
-
-        // what the ECU itself holds, read from its memory
+    fn gauges(&self) -> Div {
+        let engine = self.get("engine").to_string();
+        let color = match engine.as_str() {
+            "running" => OK,
+            "cranking" => ACCENT,
+            _ => DIM,
+        };
         let ecu_on = self.get("ecu") == "on";
-        let ecu_val = |k: &str| {
+        let ecu = |k: &str| {
             if ecu_on {
                 self.get(k).to_string()
             } else {
                 "–".into()
             }
         };
-        let ecu_stats = div()
+        let speed = card()
+            .gap(px(2.))
+            .py(px(8.))
+            .min_w(px(170.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(caption("ENGINE SPEED"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color))
+                            .child(engine.to_uppercase()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_2xl()
+                            .text_color(rgb(TEXT))
+                            .child(self.get("rpm").to_string()),
+                    )
+                    .child(div().text_xs().text_color(rgb(DIM)).child("rpm")),
+            );
+        div()
             .flex()
             .flex_row()
-            .flex_wrap()
             .gap(px(8.))
-            .child(self.stat("Engine speed", ecu_val("ecu_rpm"), "rpm"))
-            .child(self.stat("Road speed", ecu_val("ecu_speed"), "km/h"))
-            .child(self.stat("Coolant", ecu_val("ecu_coolant"), "°C"))
-            .child(self.stat("Battery", ecu_val("ecu_battery"), "V"))
-            .child(self.stat("Running for", ecu_val("ecu_s"), "s"));
-        let codes: Vec<(String, bool)> = self
-            .get("dtcs")
-            .split(',')
-            .filter_map(|e| e.split_once(':'))
-            .map(|(code, st)| {
-                let present = u8::from_str_radix(st, 16).is_ok_and(|b| b & 0x40 != 0);
-                (code.to_string(), present)
+            .child(speed)
+            .child(self.gauge("Battery", self.get("battery").into(), "V"))
+            .child(self.gauge("MAP", self.get("map").into(), "kPa"))
+            .child(self.gauge("Front O2", self.get("o2_front").into(), "mV"))
+            .when(self.get("model") == "closed" && engine == "running", |d| {
+                d.child(self.gauge("Mixture λ", self.get("lambda").into(), ""))
             })
-            .collect();
-        let code_list = if !ecu_on {
-            div()
-                .text_sm()
-                .text_color(rgb(DIM))
-                .child("ECU off (battery disconnected)")
-        } else if codes.is_empty() {
-            div()
-                .text_sm()
-                .text_color(rgb(OK))
-                .child("No stored fault codes")
-        } else {
-            codes
-                .iter()
-                .fold(div().flex().flex_col().gap(px(4.)), |d, (code, present)| {
-                    d.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .font_family("Menlo")
-                                    .text_sm()
-                                    .text_color(rgb(if *present { WARN } else { TEXT }))
-                                    .child(code.clone()),
-                            )
-                            .child(div().text_xs().text_color(rgb(DIM)).child(if *present {
-                                "present now"
-                            } else {
-                                "stored"
-                            })),
-                    )
-                })
-        };
-        let ecu_card = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .p(px(12.))
-            .rounded(px(10.))
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(EDGE))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(DIM))
-                    .child("ECU (its own readings and fault memory)"),
-            )
-            .child(ecu_stats)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(DIM))
-                    .child("Stored fault codes"),
-            )
-            .child(code_list);
+            .child(self.gauge("ECU coolant", ecu("ecu_coolant"), "°C"))
+            .child(self.gauge("ECU road speed", ecu("ecu_speed"), "km/h"))
+    }
 
+    fn drive(&self, cx: &mut Context<Self>) -> Div {
         let sliders = self
             .controls
             .iter()
             .fold(div().flex().flex_col().gap(px(10.)), |d, c| {
                 let v = c.state.read(cx).value().start();
-                // road speed only matters when the ECU reads the speed input
                 let unused = c.name == "speed" && self.get("speed_input") == "none";
                 d.child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
+                        .gap(px(3.))
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
                                 .justify_between()
-                                .child(div().text_sm().text_color(rgb(TEXT)).child(if unused {
-                                    format!("{} (not read by this ECU)", c.label)
-                                } else {
-                                    c.label.to_string()
-                                }))
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(rgb(DIM))
-                                        .child(format!("{:.*} {}", c.decimals, v, c.unit)),
-                                ),
+                                        .text_color(rgb(if unused { DIM } else { TEXT }))
+                                        .child(c.label),
+                                )
+                                .child(div().text_sm().text_color(rgb(DIM)).child(if unused {
+                                    "not read".to_string()
+                                } else {
+                                    format!("{:.*} {}", c.decimals, v, c.unit)
+                                })),
                         )
                         .child(Slider::new(&c.state).disabled(unused)),
                 )
             });
+        card()
+            .gap(px(12.))
+            .w(px(340.))
+            .flex_none()
+            .child(caption("DRIVE"))
+            .child(sliders)
+    }
 
-        let footer = div()
-            .text_xs()
-            .text_color(rgb(DIM))
-            .child(match &self.last_error {
-                Some(e) => e.clone(),
-                None => format!(
-                    "Testers: Hi-Scan GUI line \"Process\", or kdiag --ecusim auto. ADC {}",
-                    self.get("adc")
-                ),
-            });
-
-        // faults: wiring faults the ECU detects by itself
-        let active: Vec<String> = self
-            .get("faults")
-            .split(',')
-            .filter(|f| !f.is_empty() && *f != "none" && *f != "–")
-            .map(String::from)
-            .collect();
-        let faults = Fault::ALL
-            .into_iter()
-            .fold(div().flex().flex_col().gap(px(6.)), |d, f| {
-                let on = active.iter().any(|a| a == f.name());
-                d.child(
-                    div()
-                        .id(SharedString::from(format!("fault-{}", f.name())))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .px(px(10.))
-                        .py(px(7.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(if on { ACCENT } else { EDGE }))
-                        .bg(rgb(CARD))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x1f2024)))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(if on { ACCENT } else { TEXT }))
-                                .child(f.label()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family("Menlo")
-                                .text_color(rgb(DIM))
-                                .child(f.code()),
-                        )
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            v.set(
-                                &format!("fault.{}", f.name()),
-                                if on { "off" } else { "on" },
-                            );
-                            cx.notify();
-                        })),
+    fn tabs(&self, cx: &mut Context<Self>) -> Div {
+        let codes = list(self.get("dtcs"));
+        let module_codes: usize = ["abs_dtcs", "tcs_dtcs", "srs_dtcs"]
+            .iter()
+            .map(|k| list(self.get(k)).len())
+            .sum();
+        let n_faults = list(self.get("faults")).len() + list(self.get("intermittent")).len();
+        let tab = |id: &'static str, label: String, t: Tab, active: Tab| {
+            let on = t == active;
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .text_sm()
+                .text_color(rgb(if on { ACCENT } else { DIM }))
+                .when(on, |d| d.bg(rgb(0x1f2024)))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(TEXT)))
+                .child(label)
+        };
+        let count = |n: usize| {
+            if n > 0 {
+                format!(" ({n})")
+            } else {
+                String::new()
+            }
+        };
+        let bar = div()
+            .flex()
+            .flex_row()
+            .gap(px(4.))
+            .child(
+                tab(
+                    "tab-codes",
+                    format!("Fault codes{}", count(codes.len() + module_codes)),
+                    Tab::Codes,
+                    self.tab,
                 )
-            });
+                .on_click(cx.listener(|v, _, _, cx| {
+                    v.tab = Tab::Codes;
+                    cx.notify();
+                })),
+            )
+            .child(
+                tab(
+                    "tab-faults",
+                    format!("Inject faults{}", count(n_faults)),
+                    Tab::Faults,
+                    self.tab,
+                )
+                .on_click(cx.listener(|v, _, _, cx| {
+                    v.tab = Tab::Faults;
+                    cx.notify();
+                })),
+            )
+            .child(
+                tab("tab-power", "Power & time".into(), Tab::Power, self.tab).on_click(
+                    cx.listener(|v, _, _, cx| {
+                        v.tab = Tab::Power;
+                        cx.notify();
+                    }),
+                ),
+            );
+        let body = match self.tab {
+            Tab::Codes => self.codes_view(),
+            Tab::Faults => self.faults_view(cx),
+            Tab::Power => self.power_view(cx),
+        };
+        card().gap(px(12.)).flex_1().min_w(px(0.)).child(bar).child(
+            div()
+                .id("tab-body")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(body),
+        )
+    }
+
+    fn codes_view(&self) -> Div {
+        let ecu_on = self.get("ecu") == "on";
+        let dtcs = self.get("dtcs").to_string();
+        let row = |code: String, note: &'static str, warn: bool| {
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .py(px(3.))
+                .child(
+                    div()
+                        .font_family("Menlo")
+                        .text_sm()
+                        .text_color(rgb(if warn { WARN } else { TEXT }))
+                        .child(code),
+                )
+                .child(caption(note))
+        };
+        let engine = if !ecu_on {
+            div().child(caption("ECU off (battery disconnected)"))
+        } else if dtcs == "reading" {
+            div().child(caption("Reading the ECU over the K-line…"))
+        } else {
+            let codes: Vec<(String, bool)> = dtcs
+                .split(',')
+                .filter_map(|e| e.split_once(':'))
+                .map(|(c, st)| {
+                    (
+                        c.to_string(),
+                        u8::from_str_radix(st, 16).is_ok_and(|b| b & 0x40 != 0),
+                    )
+                })
+                .collect();
+            if codes.is_empty() {
+                div()
+                    .text_sm()
+                    .text_color(rgb(OK))
+                    .child("No stored fault codes")
+            } else {
+                codes
+                    .into_iter()
+                    .fold(div().flex().flex_col(), |d, (c, present)| {
+                        d.child(row(
+                            c,
+                            if present { "present now" } else { "stored" },
+                            present,
+                        ))
+                    })
+            }
+        };
+        let source = if self.get("ecu_source") == "kline" {
+            "ENGINE ECU · read over its K-line while no tester is connected"
+        } else {
+            "ENGINE ECU · from its fault memory"
+        };
+        let modules = [
+            ("abs_dtcs", "ABS"),
+            ("tcs_dtcs", "Traction control"),
+            ("srs_dtcs", "Airbag"),
+        ]
+        .into_iter()
+        .fold(div().flex().flex_col().gap(px(2.)), |d, (key, name)| {
+            let codes = list(self.get(key));
+            d.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .py(px(3.))
+                    .child(div().text_sm().text_color(rgb(TEXT)).child(name))
+                    .child(if codes.is_empty() {
+                        div().text_sm().text_color(rgb(OK)).child("no codes")
+                    } else {
+                        div()
+                            .font_family("Menlo")
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .child(codes.join("  ").replace(':', " "))
+                    }),
+            )
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption(source))
+                    .child(engine),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption("OTHER MODULES (models)"))
+                    .child(modules),
+            )
+            .child(caption(
+                "Read and erase them with the Hi-Scan (line \"Process\"; ERAS with key on, \
+                 engine off) or kdiag --ecusim auto. Codes stay through key cycles.",
+            ))
+    }
+
+    fn faults_view(&self, cx: &mut Context<Self>) -> Div {
+        let active = list(self.get("faults"));
+        let flickering = list(self.get("intermittent"));
+        let profile: BTreeMap<String, String> = self
+            .get("fault_codes")
+            .split(',')
+            .filter_map(|e| e.split_once(':'))
+            .map(|(k, v)| (k.to_string(), v.replace('+', " ")))
+            .collect();
+        let grid =
+            Fault::ALL
+                .into_iter()
+                .fold(div().flex().flex_row().flex_wrap().gap(px(6.)), |d, f| {
+                    let on = active.iter().any(|a| a == f.name());
+                    let flicker = flickering.iter().any(|a| a == f.name());
+                    let code = match profile.get(f.name()) {
+                        Some(c) if c == "none" => "–".to_string(),
+                        Some(c) => c.clone(),
+                        None => f.code().to_string(),
+                    };
+                    d.child(
+                        div()
+                            .id(SharedString::from(format!("fault-{}", f.name())))
+                            .w(relative(0.493))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(rgb(if on {
+                                ACCENT
+                            } else if flicker {
+                                0x8a6d1f
+                            } else {
+                                EDGE
+                            }))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x1f2024)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(if on || flicker { ACCENT } else { TEXT }))
+                                    .child(if flicker {
+                                        format!("{} · intermittent", f.label())
+                                    } else {
+                                        f.label().to_string()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family("Menlo")
+                                    .text_color(rgb(DIM))
+                                    .child(code),
+                            )
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                // off -> on -> intermittent -> off
+                                v.set(
+                                    &format!("fault.{}", f.name()),
+                                    if on {
+                                        "intermittent"
+                                    } else if flicker {
+                                        "off"
+                                    } else {
+                                        "on"
+                                    },
+                                );
+                                cx.notify();
+                            })),
+                    )
+                });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(caption(
+                "Click: on → intermittent → off. The ECU detects the fault itself and stores \
+                 the code shown (this dump's profile, if there is one); some need the engine \
+                 running.",
+            ))
+            .child(grid)
+    }
+
+    fn power_view(&self, cx: &mut Context<Self>) -> Div {
         let battery_on = self.get("battery_connected") != "off";
-        let battery_btn = div()
+        let battery = div()
             .id("battery")
             .flex()
             .items_center()
             .justify_center()
-            .h(px(40.))
+            .h(px(36.))
+            .px(px(14.))
             .rounded(px(8.))
             .border_1()
             .border_color(rgb(if battery_on { EDGE } else { WARN }))
-            .bg(rgb(CARD))
             .text_sm()
             .text_color(rgb(if battery_on { TEXT } else { WARN }))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(0x1f2024)))
             .child(if battery_on {
-                "Disconnect battery (wipes the ECU's memory)"
+                "Disconnect battery"
             } else {
-                "Battery disconnected: reconnect"
+                "Battery disconnected · reconnect"
             })
             .on_click(cx.listener(move |v, _, _, cx| {
                 v.set("battery_connected", if battery_on { "off" } else { "on" });
                 cx.notify();
             }));
-        let right = div()
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .w(px(330.))
-            .flex_none()
-            .child(div().text_sm().text_color(rgb(TEXT)).child("Faults"))
-            .child(div().text_xs().text_color(rgb(DIM)).child(
-                "Wiring faults the ECU detects itself; it stores the code shown (takes \
-                 a few seconds, some need the engine running). Fault codes stay \
-                 through key cycles. Clear them with the Hi-Scan (ERAS) or kdiag.",
-            ))
-            .child(faults)
-            .child(battery_btn);
-
-        let left = div()
+        div()
             .flex()
             .flex_col()
             .gap(px(14.))
-            .flex_1()
-            .min_w(px(0.))
-            .overflow_hidden()
-            .child(header)
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .gap(px(10.))
-                    .child(key_btn)
-                    .child(start_btn)
-                    .child(stop_btn),
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(caption("BATTERY"))
+                    .child(div().flex().flex_row().child(battery))
+                    .child(caption(
+                        "A disconnect power-cycles the ECU and wipes its memory, fault codes \
+                         included.",
+                    )),
             )
-            .child(big)
-            .child(ecu_card)
-            .child(stats)
-            .child(sliders)
-            .child(footer);
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(caption("TIME AND SNAPSHOTS"))
+                    .child(self.time_and_snapshots(cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption("ECU"))
+                    .child(caption(format!(
+                        "running for {} s · testers connected: {} · ADC {}",
+                        self.get("ecu_s"),
+                        self.get("testers"),
+                        self.get("adc")
+                    ))),
+            )
+    }
+}
 
+impl Render for Panel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let footer = caption(match &self.last_error {
+            Some(e) => e.clone(),
+            None => "Testers: Hi-Scan GUI line \"Process\" · kdiag --ecusim auto · \
+                     kdiag elm --ecusim auto"
+                .to_string(),
+        });
         div()
             .id("root")
             .size_full()
             .flex()
-            .flex_row()
-            .gap(px(18.))
-            .p(px(18.))
+            .flex_col()
+            .gap(px(12.))
+            .p(px(16.))
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             // a release anywhere stops the starter
@@ -651,8 +930,26 @@ impl Render for Panel {
                 MouseButton::Left,
                 cx.listener(|v, _, _, cx| v.starter(false, cx)),
             )
-            .child(left)
-            .child(right)
+            .child(self.top_bar(cx))
+            .child(self.gauges())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(12.))
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .id("drive-scroll")
+                            .flex_none()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .child(self.drive(cx)),
+                    )
+                    .child(self.tabs(cx)),
+            )
+            .child(footer)
     }
 }
 
@@ -695,9 +992,10 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            let bounds = Bounds::centered(None, size(px(940.), px(1040.)), cx);
+            let bounds = Bounds::centered(None, size(px(1080.), px(680.)), cx);
             let opts = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(900.), px(560.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("GK 2.0 engine".into()),
                     ..Default::default()

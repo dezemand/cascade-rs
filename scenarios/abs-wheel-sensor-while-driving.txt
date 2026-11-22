@@ -1,0 +1,11 @@
+# Driving at 50 km/h, the front-left wheel sensor drops out intermittently
+# (C1200 in the ABS and traction control modules).
+0    ignition on
+2    starter on
+3    starter off
+5    throttle 20
+6    speed 50
+10   fault.abs_wheel_sensor_fl intermittent
+70   fault.abs_wheel_sensor_fl off
+75   speed 0
+75   throttle 0

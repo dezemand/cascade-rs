@@ -1,0 +1,6 @@
+# Airbag warning light: the passenger airbag circuit reads high (B1352).
+# Engine codes stay clean; read the airbag module (Hi-Scan SRS, kdiag --system srs).
+0    ignition on
+2    starter on
+3    starter off
+5    fault.srs_passenger_airbag on

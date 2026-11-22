@@ -7,6 +7,7 @@
 pub mod defs;
 #[cfg(all(feature = "serial", unix))]
 pub mod ecusim_line;
+pub mod elm;
 pub mod guard;
 pub mod iso9141;
 pub mod j2534;

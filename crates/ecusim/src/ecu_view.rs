@@ -35,6 +35,13 @@ impl Stored {
     }
 }
 
+/// Whether this dump has the layout these addresses come from: its
+/// fault-path table must start with the throttle (P0123) and have the
+/// coolant sensor (P0118) as path 9.
+pub fn layout_known(cpu: &Cpu) -> bool {
+    cpu.peek16(CODE_TABLE) == 0x0123 && cpu.peek16(CODE_TABLE + 9 * CODE_ROW) == 0x0118
+}
+
 /// The ECU's stored fault codes, in its own order.
 pub fn stored_codes(cpu: &Cpu) -> Vec<Stored> {
     let n = cpu.peek8(COUNT) as u32;
@@ -86,4 +93,44 @@ mod tests {
         assert_eq!(dtc_name(0x4200), "C0200");
         assert_eq!(dtc_name(0x9346), "B1346");
     }
+}
+
+/// Where the ECU copies its `21 01` block from: one RAM address per byte,
+/// a table in flash (found by its first entry F8A4, the battery, and entry
+/// 19 E354, engine speed; GK 2.0 2003 SIMK41).
+const BLOCK_TABLE: u32 = 0x11204;
+
+/// A byte of the ECU's `21 01` block, read through its address table.
+fn block_byte(cpu: &Cpu, offset: u32) -> u8 {
+    cpu.peek8(cpu.peek16(BLOCK_TABLE + 2 * offset) as u32)
+}
+
+fn block_u16(cpu: &Cpu, offset: u32) -> u16 {
+    u16::from_le_bytes([block_byte(cpu, offset), block_byte(cpu, offset + 1)])
+}
+
+/// What the ECU commands, for the closed-loop engine model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Outputs {
+    /// Injection time per injection, ms.
+    pub injection_ms: f64,
+    /// Ignition advance, degrees BTDC.
+    pub advance_deg: f64,
+    /// Idle air valve duty, %.
+    pub idle_air_pct: f64,
+    /// Target idle speed, rpm.
+    pub target_idle: f64,
+}
+
+/// The ECU's commanded fuel, spark and idle air (mapped dump only).
+pub fn outputs(cpu: &Cpu) -> Option<Outputs> {
+    if !layout_known(cpu) || cpu.peek16(BLOCK_TABLE) != 0xF8A4 {
+        return None;
+    }
+    Some(Outputs {
+        injection_ms: block_u16(cpu, 42) as f64 * 0.004,
+        advance_deg: 72.0 - block_byte(cpu, 30) as f64 * 0.375,
+        idle_air_pct: block_u16(cpu, 57) as f64 * 0.00153,
+        target_idle: block_u16(cpu, 21) as i16 as f64,
+    })
 }

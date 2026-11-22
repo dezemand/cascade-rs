@@ -23,8 +23,9 @@
 //! - `--wheel PINS:TEETH:MISSING:RPM` a toothed wheel on timer inputs, `+`
 //!   separated: `t0in`, `t7in`, `capin`, `cc0`..`cc31` (e.g.
 //!   `t0in+capin:60:2:800`; `cc30` is the vehicle speed input)
-//! - `--cam PINS:FALL:RISE` a cam level locked to the last wheel: low from
-//!   crank tooth position FALL to RISE over 720 degrees (0..2 x teeth)
+//! - `--cam PINS:FALL:RISE[:FALL:RISE...]` a cam level locked to the last
+//!   wheel: low from crank tooth position FALL to RISE over 720 degrees
+//!   (0..2 x teeth), several intervals for a multi-tooth cam
 //! - `--compares` print every CAPCOM compare match
 //! - `--ram-in FILE@ADDR` / `--ram-out FILE@ADDR:LEN` load memory before
 //!   reset / save it at the end (keep-alive RAM across power cycles)
@@ -393,24 +394,24 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
                 o.rpm_at.push((num(t)?, num(r)?));
             }
             "--cam" => {
-                // PINS:FALL:RISE in crank tooth positions over 720 degrees,
-                // locked to the last --wheel
+                // PINS:FALL:RISE[:FALL:RISE...] in crank tooth positions over
+                // 720 degrees, locked to the last --wheel
                 let a = v()?;
                 let f: Vec<&str> = a.split(':').collect();
-                let [pins, fall, rise] = f[..] else {
-                    return Err("--cam PINS:FALL:RISE".into());
-                };
-                let targets = pins
+                if f.len() < 3 || f.len().is_multiple_of(2) {
+                    return Err("--cam PINS:FALL:RISE[:FALL:RISE...]".into());
+                }
+                let targets = f[0]
                     .split('+')
                     .map(str::parse)
                     .collect::<Result<Vec<cpu::Pin>, _>>()?;
                 let n = |x: &str| x.parse::<u32>().map_err(|e| format!("--cam {x}: {e}"));
+                let lows = f[1..]
+                    .chunks(2)
+                    .map(|c| Ok((n(c[0])?, n(c[1])?)))
+                    .collect::<Result<Vec<_>, String>>()?;
                 let w = o.wheels.last_mut().ok_or("--cam needs a --wheel first")?;
-                w.cam = Some(cpu::Cam {
-                    targets,
-                    fall: n(fall)?,
-                    rise: n(rise)?,
-                });
+                w.cam = Some(cpu::Cam { targets, lows });
             }
             "--wheel" => {
                 // PINS:TEETH:MISSING:RPM, e.g. t0in+capin:60:2:800

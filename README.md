@@ -30,7 +30,7 @@ engine, ABS and traction control data.
 | `cascade-gui` | Desktop front end (GPUI via `gpui-kit`): a flat Hi-Scan layout with a live data view. macOS. |
 | `cascade-j2534` | Minimal SAE J2534 PassThru access for ISO 14230; vendor-DLL backend on Windows. |
 | `ecuc167` | Infineon C167 disassembler and emulator for running an engine ECU dump offline behind the same interface. |
-| `ecusim` | The engine ECU dump running in real time as its own process (`ecusim serve`), with an open-loop engine model and a socket that testers connect to. |
+| `ecusim` | The simulated car: an engine ECU dump running in real time as its own process (`ecusim serve`), ABS/TCS/SRS models, an engine model that runs on the ECU's own fuel and spark, faults, scenarios, and a socket testers connect to. |
 | `ecusim-gui` | Control panel for `ecusim`: ignition, starter, throttle, temperatures, battery, road speed (GPUI). macOS. |
 | `ecu8051` | Siemens 80C517-class 8051 emulator, used to analyse an older engine ECU ROM. |
 
@@ -128,52 +128,86 @@ for another file, `--no-eeprom` to keep it in memory), and keeps it across
 power cycles. `cascade run` starts blank unless given `--eeprom FILE`, so
 headless runs stay reproducible.
 
-## A running engine ECU
+## A simulated car
 
-`ecusim` runs a GK 2.0 SIMK41 engine ECU dump in real time, as a separate
-process. It powers the ECU with the ignition, turns a 60-2 crank wheel and
-the cam, and feeds the sensors from an engine model. The Hi-Scan GUI (line
-option "Process"), `kdiag --ecusim auto` and `cascade run --ecusim auto`
-connect to it as testers.
+`ecusim` runs a GK 2.0 engine ECU dump in real time, as a separate process,
+and puts models of the ABS, traction control and airbag modules beside it.
+It powers the ECU from the battery, turns a 60-2 crank wheel and the cam,
+and drives the sensors. Testers connect to it like to a car: the Hi-Scan GUI
+(line option "Process"), `kdiag --ecusim auto`, `cascade run --ecusim auto`,
+and, through `kdiag elm`, ELM327 OBD apps.
 
 ```sh
 tools/bundle-ecusim.sh
-open target/EcuSim.app --args --rom path/to/simk41-without-immobiliser.bin
+open target/EcuSim.app --args --rom path/to/simk4x-without-immobiliser.bin
 kdiag log --ecusim auto --duration-s 5
 ```
 
-Or headless: `ecusim serve --rom ROM`, then `ecusim set ignition on`,
+Headless: `ecusim serve --rom ROM`, then `ecusim set ignition on`,
 `ecusim set starter on`, `ecusim set throttle 20`, `ecusim status`.
+
+**The engine.** With the GK 2.0 2003 SIMK41 dump the engine runs on the
+ECU's own outputs: its injection time, ignition advance and idle-air duty
+(read through the ECU's own data-block address table) drive a small engine
+model, so the engine catches on the ECU's fuel, its idle controller holds
+it at its 830 rpm target, the front O2 switches as its fuel feedback trims,
+and a fuel cut stalls it. The physics is invented and calibrated to that
+dump [assumed]; other dumps use an open-loop model (engine speed follows the
+starter and throttle). `ecusim set model open` forces open loop.
+
+**The dumps.** All from the OpenGK collection, immobiliser disabled:
+
+| Dump | Family | Notes |
+|---|---|---|
+| GK 2.0 2003 | SIMK41, 256 KB, 16 MHz | fully mapped: closed loop, memory readout, fault catalogue |
+| Elantra XD 2001 | SIMK41 | older code set (P0105, P0115, P0120); stores P1602 (automatic gearbox link) |
+| GK 2.0 CVVT 2003 | SIMK43, 512 KB, 24 MHz | MAF instead of MAP, oil temperature input; stores P1602 |
+| GK 2.0 CVVT 2005, Tucson 2005 | SIMK43 | as above; store P0600 (no CAN bus emulated) |
+
+Each identifies itself, keeps crank sync and sets and clears its own codes.
+The clock and the sensor wiring follow the dump size.
+`tools/fault_sweep.py DUMP --csv DUMP.faults.csv` maps which code a dump
+stores for each sensor fault; `ecusim` reads that profile from beside the
+dump and the panel shows its codes. For dumps whose memory is not mapped,
+an internal tester reads the ECU over its K-line while no outside tester
+uses it.
 
 - Use a dump **without immobiliser**. With one, the ECU stops crank
   processing when its immobiliser does not answer; this project does not
   work around that.
-- The sensor curves were measured by sweeping each input through the
-  ROM. The engine model itself is open loop and invented: engine speed
-  follows the starter and the throttle, not the ECU's injection and ignition,
-  which are not decoded yet.
-- Fault codes: the panel (or `ecusim set fault.coolant_open on`) injects
-  wiring faults on sensors and the cam signal; the ECU's own code detects
-  them and stores its code, which the Hi-Scan reads and erases (ERAS, with
-  key on and engine off) like on the car. Codes stay through key cycles; a
-  battery disconnect wipes them, since the ECU is modelled as powered from
-  the battery (its own non-volatile store is not emulated). The panel shows
-  what the ECU itself holds, read from its memory: its stored codes
-  (present now or stored) and its own engine speed, road speed, coolant and
-  battery readings. STOP ENGINE stalls the engine with the key on, the
-  state the Hi-Scan asks for before erasing. Faults and the
-  codes this dump stores for them: MAP P0107/P0108, coolant P0117/P0118,
-  throttle P0122/P0123, front/rear O2 P0132/P0138, EVAP pressure
-  P0452/P0453, battery sense P0560, wheel-speed line P1502, cam signal
-  P0340. Faults can also set follow-on codes (an open coolant sensor with a
-  cold engine model also gave P0130).
-- On the Hi-Scan use TIBURON → ENGINE L4 → **2003**: that is the data
-  layout this ECU sends. Other model years expect another layout and show
-  nonsense (a negative engine speed, for example).
-- Road speed goes to whichever input the running software reads: CC30 on
-  the GK-20 dump, CC13 on the non-immobiliser one.
-- The crank is a 60-2 wheel on CC15/T7IN plus GPT2 CAPIN, the cam on CC14.
-  The ECU's engine speed follows it steadily from 250 to 6000 rpm.
+- Crank: 60-2 on CC15/T7IN, T0IN and GPT2 CAPIN; cam on CC14, low from tooth
+  50 to 110 of the 720° cycle (the one pattern every dump syncs to without a
+  cam code). Road speed goes to the input the running software reads (CC30
+  or CC13).
+- On the Hi-Scan use TIBURON → ENGINE L4 → **2003** for the SIMK41 and
+  **2004** for the SIMK43 data layout; other entries expect another layout.
+
+**Fault codes.** The panel (or `ecusim set fault.coolant_open on`) injects
+wiring faults: engine sensors and the cam signal, the ABS front-left wheel
+sensor and pump motor, the driver and passenger airbags. Faults can be on,
+off or intermittent. The ECU's own code (or the module model) stores the
+code, and the Hi-Scan reads and erases it like on the car (ERAS with key
+on, engine off; STOP ENGINE stalls the engine with the key on). Codes stay
+through key cycles; a battery disconnect wipes them, as the ECU is modelled
+as powered from the battery (its own non-volatile store is not emulated).
+The panel shows what the ECU holds, read from its memory: stored codes and
+its own readings.
+
+**Scenarios and time.** `ecusim set time 4` runs the simulator four times
+faster while no tester is connected. `ecusim set snapshot NAME` /
+`restore NAME` save and restore the whole state (in memory). `ecusim play
+scenarios/loose-coolant-connector.txt` runs a timed scenario; see
+`scenarios/`.
+
+**Tools against the simulated car.**
+
+- `tools/car_day_rehearsal.sh`: every read-only kdiag step of the first car
+  session, for all four systems, against the running simulator.
+- `kdiag elm --ecusim auto` serves ELM327 on 127.0.0.1:35000 for OBD apps,
+  through kdiag's read-only guard (`--allow-clear` lets mode 04 through).
+- `kdiag ... --ecusim auto --j2534-mock` runs kdiag's J2534 path against
+  the simulator. A virtual J2534 DLL for Windows software was not built: it
+  could not be tested here.
 
 ## Safety
 

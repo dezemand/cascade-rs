@@ -28,14 +28,18 @@ fn engine_speed_tracks_the_crank_without_dropouts() {
     };
     let mut c = Cpu::new(rom, FCPU);
     let mut crank = Wheel::new(
-        vec![Pin::Cc { unit: 0, ch: 15 }, Pin::T7In, Pin::CapIn],
+        vec![
+            Pin::Cc { unit: 0, ch: 15 },
+            Pin::T7In,
+            Pin::T0In,
+            Pin::CapIn,
+        ],
         60,
         2,
     );
     crank.cam = Some(Cam {
         targets: vec![Pin::Cc { unit: 0, ch: 14 }],
-        fall: 30,
-        rise: 90,
+        lows: vec![(50, 110)],
     });
     c.wheels = vec![crank];
     let mut t = 3000;

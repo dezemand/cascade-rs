@@ -1,0 +1,8 @@
+# A coolant sensor connector that works loose now and then: the engine runs
+# fine, the code comes and goes (P0118, stored as history once it is gone).
+0    coolant 85
+0    ignition on
+2    starter on
+3    starter off
+5    fault.coolant_open intermittent
+60   fault.coolant_open off

@@ -4,6 +4,8 @@
 //!   kdiag selftest --port DEV   (adapter checks, no ECU session)
 //!   kdiag ident (--sim | --port DEV) [--system engine|abs|srs]
 //!   kdiag crash (--sim | --port DEV) --system srs   (crash records, raw)
+//!   kdiag elm  (--sim | --port DEV | --ecusim auto) [--listen 127.0.0.1:35000]
+//!              ELM327 over TCP for OBD apps, through the read-only guard
 //!   kdiag clear (--sim | --port DEV) [--system engine|abs] --allow-clear [--yes]
 //!   kdiag log  (--sim | --port DEV) [--system engine|abs|tcs] [--out FILE.csv]
 //!              [--interval-ms N] [--duration-s N] [line options]
@@ -105,6 +107,8 @@ struct Opts {
     yes: bool,
     /// Socket of an `ecusim` server (the ECU dump as its own process).
     ecusim: Option<String>,
+    /// `elm`: where to serve ELM327 clients.
+    listen: String,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -124,6 +128,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         allow_clear: false,
         yes: false,
         ecusim: None,
+        listen: "127.0.0.1:35000".into(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -137,6 +142,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--j2534" => o.j2534 = Some(val()?),
             "--j2534-mock" => o.j2534_mock = true,
             "--ecusim" => o.ecusim = Some(val()?),
+            "--listen" => o.listen = val()?,
             "--sim-ecu" => {
                 o.sim_ecu = Some(val()?);
                 o.sim = true;
@@ -179,8 +185,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     if o.system == System::Tcs && (o.j2534.is_some() || o.j2534_mock) {
         return Err("traction control (ISO 9141-2, 5-baud init) is not done over J2534 yet".into());
     }
-    if o.j2534_mock && !o.sim {
-        return Err("--j2534-mock goes with --sim or --sim-ecu".into());
+    if o.j2534_mock && !o.sim && o.ecusim.is_none() {
+        return Err("--j2534-mock goes with --sim, --sim-ecu or --ecusim".into());
     }
     Ok(o)
 }
@@ -447,7 +453,13 @@ fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
             None => Box::new(SimLine::new(KwpEcu::new(sim_config(o.system)))),
         }
     } else if let Some(sock) = &o.ecusim {
-        open_ecusim(sock)?
+        // the Hi-Scan's line numbers: engine 7, ABS and TCS 8, SRS 12
+        let line = match o.system {
+            System::Engine => 7,
+            System::Abs | System::Tcs => 8,
+            System::Srs => 12,
+        };
+        open_ecusim(sock, line)?
     } else {
         open_serial(o)?
     };
@@ -461,19 +473,19 @@ fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
 }
 
 #[cfg(all(feature = "serial", unix))]
-fn open_ecusim(sock: &str) -> Result<Box<dyn Line>, String> {
+fn open_ecusim(sock: &str, line: i32) -> Result<Box<dyn Line>, String> {
     let path = if sock == "auto" {
         ecusim::default_socket()
     } else {
         sock.into()
     };
-    let l = cascade_diag::ecusim_line::EcusimLine::connect(&path)
+    let l = cascade_diag::ecusim_line::EcusimLine::connect(&path, line)
         .map_err(|e| format!("{}: {e} (is `ecusim serve` running?)", path.display()))?;
     Ok(Box::new(l))
 }
 
 #[cfg(not(all(feature = "serial", unix)))]
-fn open_ecusim(_sock: &str) -> Result<Box<dyn Line>, String> {
+fn open_ecusim(_sock: &str, _line: i32) -> Result<Box<dyn Line>, String> {
     Err("--ecusim needs a Unix build with the `serial` feature".into())
 }
 
@@ -758,6 +770,44 @@ fn log(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// Serve ELM327 clients (OBD apps) on `--listen`, through the read-only
+/// guard (`--allow-clear` lets mode 04 through).
+fn elm(o: &Opts) -> Result<(), String> {
+    if o.system != System::Engine {
+        return Err("elm talks to the engine ECU (KWP2000)".into());
+    }
+    if !o.listen.starts_with("127.") && !o.listen.starts_with("localhost") {
+        eprintln!("kdiag: elm listens on {} (not only this machine)", o.listen);
+    }
+    let mut c = Client::new(open_link(o)?);
+    c.allow_clear = o.allow_clear;
+    let sock = o.ecusim.clone();
+    let battery = move || -> Option<f64> { ecusim_battery(sock.as_deref()?) };
+    cascade_diag::elm::serve(&mut c, &battery, &o.listen).map_err(|e| e.to_string())
+}
+
+/// Battery voltage from an ecusim server's status (for ATRV).
+#[cfg(all(feature = "serial", unix))]
+fn ecusim_battery(sock: &str) -> Option<f64> {
+    use ecusim::proto::{ToClient, ToServer};
+    let path = if sock == "auto" {
+        ecusim::default_socket()
+    } else {
+        sock.into()
+    };
+    let mut c = ecusim::client::Conn::connect(&path).ok()?;
+    c.send(&ToServer::Watch).ok()?;
+    match c.recv_timeout(Duration::from_millis(300)).ok()?? {
+        ToClient::Status(kv) => kv.iter().find(|(k, _)| k == "battery")?.1.parse().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(not(all(feature = "serial", unix)))]
+fn ecusim_battery(_sock: &str) -> Option<f64> {
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.split_first() {
@@ -766,12 +816,13 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "clear" => parse(rest).and_then(|o| clear(&o)),
         Some((cmd, rest)) if cmd == "ident" => parse(rest).and_then(|o| ident(&o)),
         Some((cmd, rest)) if cmd == "crash" => parse(rest).and_then(|o| crash(&o)),
+        Some((cmd, rest)) if cmd == "elm" => parse(rest).and_then(|o| elm(&o)),
         Some((cmd, _)) if cmd == "j2534-list" => j2534_list(),
         Some((cmd, rest)) if cmd == "selftest" => match rest {
             [flag, dev] if flag == "--port" => selftest(dev),
             _ => Err("usage: kdiag selftest --port DEV".into()),
         },
-        _ => Err("usage: kdiag dtc|log|clear|ident|crash|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
+        _ => Err("usage: kdiag dtc|log|clear|ident|crash|elm|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };

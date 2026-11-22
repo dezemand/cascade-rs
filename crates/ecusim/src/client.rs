@@ -80,8 +80,16 @@ pub struct SocketKLine {
     path: PathBuf,
     conn: Option<Conn>,
     baud: Option<u32>,
+    line: Option<i32>,
     pending: Vec<u8>,
     retry_at: Instant,
+    /// Line level last sent (LOW/HIGH go out on changes only).
+    level: bool,
+    /// 5-baud address being clocked out, one call per bit as in
+    /// `cascade_core`'s own decoding: (bits so far, address).
+    slow: Option<(u8, u8)>,
+    /// When the last bit came (5-baud bits are 200 ms apart).
+    slow_at: Cycles,
 }
 
 fn open_kline(path: &Path) -> io::Result<Conn> {
@@ -96,8 +104,12 @@ impl SocketKLine {
             path: path.to_path_buf(),
             conn: Some(open_kline(path)?),
             baud: None,
+            line: None,
             pending: Vec::new(),
             retry_at: Instant::now(),
+            level: true,
+            slow: None,
+            slow_at: 0,
         })
     }
 
@@ -108,8 +120,12 @@ impl SocketKLine {
             path: path.to_path_buf(),
             conn: None,
             baud: None,
+            line: None,
             pending: Vec::new(),
             retry_at: Instant::now(),
+            level: true,
+            slow: None,
+            slow_at: 0,
         };
         l.reconnect();
         l
@@ -128,6 +144,9 @@ impl SocketKLine {
         if let Ok(mut c) = open_kline(&self.path) {
             if let Some(b) = self.baud {
                 let _ = c.send(&ToServer::Baud(b));
+            }
+            if let Some(l) = self.line {
+                let _ = c.send(&ToServer::Line(l));
             }
             self.conn = Some(c);
         }
@@ -184,12 +203,40 @@ impl Interface for SocketKLine {
         }
     }
 
+    fn select_line(&mut self, _now: Cycles, line: i32) {
+        self.line = Some(line);
+        self.send(ToServer::Line(line));
+    }
+
     fn send_slow_init_bitwise(&mut self, now: Cycles, bit: bool, _rx: &mut dyn RxBuf) -> bool {
-        self.send(if bit {
-            ToServer::High { us: us(now) }
-        } else {
-            ToServer::Low { us: us(now) }
-        });
+        if bit != self.level {
+            self.level = bit;
+            self.send(if bit {
+                ToServer::High { us: us(now) }
+            } else {
+                ToServer::Low { us: us(now) }
+            });
+        }
+        // the firmware writes one bit per bit time: start, 8 data, stop; a
+        // gap longer than a 5-baud bit (a fast init) starts afresh
+        if now.saturating_sub(self.slow_at) > 3_000_000 {
+            self.slow = None;
+        }
+        self.slow_at = now;
+        self.slow = match self.slow {
+            None if !bit => Some((0, 0)),
+            None => None,
+            Some((n, a)) if n < 8 => Some((n + 1, (a >> 1) | if bit { 0x80 } else { 0 })),
+            Some((_, a)) => {
+                if bit {
+                    self.send(ToServer::Slow {
+                        us: us(now),
+                        addr: a,
+                    });
+                }
+                None
+            }
+        };
         true
     }
 }
