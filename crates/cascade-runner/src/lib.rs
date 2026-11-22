@@ -160,12 +160,24 @@ impl Runner {
         speed: Speed,
         max_cycles: Option<u64>,
     ) -> Self {
+        Self::spawn_full(rom, None, iface, speed, max_cycles)
+    }
+
+    /// As [`Runner::spawn_with`], plus an extended ROM (upstream `-x`), such
+    /// as a Hyundai "TROUBLE SHOOTING PACK" behind the main pack.
+    pub fn spawn_full(
+        rom: Vec<u8>,
+        exrom: Option<Vec<u8>>,
+        iface: IfaceKind,
+        speed: Speed,
+        max_cycles: Option<u64>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("cascade-emu".into())
-            .spawn(move || Emu::new(rom, iface, speed, max_cycles, s2).run(rx))
+            .spawn(move || Emu::new(rom, exrom, iface, speed, max_cycles, s2).run(rx))
             .expect("spawn emulator thread");
         Self {
             tx,
@@ -200,6 +212,7 @@ impl Drop for Runner {
 
 struct Emu {
     rom: Vec<u8>,
+    exrom: Option<Vec<u8>>,
     cpu: Cpu,
     log: EventLog,
     log_read: usize,
@@ -231,6 +244,7 @@ struct Emu {
 /// not be built (the machine then has nothing on the line).
 fn build_cpu(
     rom: &[u8],
+    exrom: Option<&[u8]>,
     iface: &IfaceKind,
     max_cycles: Option<u64>,
 ) -> (Cpu, EventLog, Option<String>) {
@@ -250,6 +264,9 @@ fn build_cpu(
     let traced = Traced::new(inner);
     let log = traced.log_handle();
     let mut cpu = Cpu::new(rom.to_vec(), Box::new(traced), false);
+    if let Some(x) = exrom {
+        cpu.load_extended_rom(x.to_vec());
+    }
     if let Some(m) = max_cycles {
         cpu.max_cycles = m;
     }
@@ -276,15 +293,17 @@ fn format_event(e: &cascade_iface::Stamped) -> String {
 impl Emu {
     fn new(
         rom: Vec<u8>,
+        exrom: Option<Vec<u8>>,
         iface: IfaceKind,
         speed: Speed,
         max_cycles: Option<u64>,
         shared: Arc<Mutex<Snapshot>>,
     ) -> Self {
-        let (cpu, log, error) = build_cpu(&rom, &iface, max_cycles);
+        let (cpu, log, error) = build_cpu(&rom, exrom.as_deref(), &iface, max_cycles);
         let now = Instant::now();
         let mut emu = Self {
             rom,
+            exrom,
             cpu,
             log,
             log_read: 0,
@@ -394,7 +413,8 @@ impl Emu {
                 self.reanchor();
             }
             Command::Restart(iface) => {
-                let (cpu, log, error) = build_cpu(&self.rom, &iface, self.max_cycles);
+                let (cpu, log, error) =
+                    build_cpu(&self.rom, self.exrom.as_deref(), &iface, self.max_cycles);
                 self.cpu = cpu;
                 self.log = log;
                 self.total_cycles = 0;

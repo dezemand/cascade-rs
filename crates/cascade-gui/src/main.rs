@@ -284,6 +284,8 @@ struct CascadeView {
     live_snap: live::LiveSnap,
     /// Port for live data (None = simulator).
     live_port: Option<String>,
+    /// Extended ROM (troubleshooting pack) behind the main pack, if any.
+    exrom_name: Option<String>,
     _refresh: Task<()>,
 }
 
@@ -292,6 +294,7 @@ impl CascadeView {
         rom: Vec<u8>,
         replay: Option<Result<Loaded, String>>,
         ecu: (Option<Result<EcuRom, String>>, bool),
+        exrom: Option<(String, Vec<u8>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -311,7 +314,14 @@ impl CascadeView {
             (None, Some(r)) if ecu_first => ecu_iface(r),
             _ => iface_kind(0),
         };
-        let runner = Runner::spawn(rom, first);
+        let exrom_name = exrom.as_ref().map(|(n, _)| n.clone());
+        let runner = Runner::spawn_full(
+            rom,
+            exrom.map(|(_, x)| x),
+            first,
+            cascade_runner::Speed::Real(1.0),
+            None,
+        );
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         // poll the emulator about 60 times a second; redraw only on change
@@ -372,6 +382,7 @@ impl CascadeView {
             live: None,
             live_snap: live::LiveSnap::default(),
             live_port: None,
+            exrom_name,
             _refresh: refresh,
         }
     }
@@ -1307,7 +1318,13 @@ impl CascadeView {
                     .child(kv("PC", format!("{:04X}", s.pc)))
                     .child(kv("Firmware resets", s.resets.to_string()))
                     .child(kv("UART TX", s.uart_tx.to_string()))
-                    .child(kv("Line", s.iface.clone())),
+                    .child(kv("Line", s.iface.clone()))
+                    .child(kv(
+                        "Extended ROM",
+                        self.exrom_name
+                            .as_deref()
+                            .map_or("none".into(), |n| n.chars().take(18).collect()),
+                    )),
             )
             .when_some(s.stopped.clone(), |d, why| {
                 d.child(
@@ -1401,7 +1418,7 @@ fn main() {
         .or_else(|| std::env::var("CASCADE_ROM").ok())
     else {
         eprintln!(
-            "usage: cascade-gui ROM [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_ECU_ROM)"
+            "usage: cascade-gui ROM [--exrom INFO.dat] [--replay KDIAG.jsonl] [--ecu-rom SIMK41.bin]   (or set CASCADE_ROM, CASCADE_EXROM, CASCADE_ECU_ROM)"
         );
         std::process::exit(2);
     };
@@ -1428,6 +1445,25 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let ecu_first = ecu_arg.is_some();
+    // extended ROM (troubleshooting pack): --exrom PATH or CASCADE_EXROM
+    let exrom = args
+        .iter()
+        .position(|a| a == "--exrom")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| std::env::var("CASCADE_EXROM").ok())
+        .and_then(|p| match std::fs::read(&p) {
+            Ok(x) => {
+                let name = std::path::Path::new(&p)
+                    .file_name()
+                    .map_or(p.clone(), |n| n.to_string_lossy().into());
+                Some((name, x))
+            }
+            Err(e) => {
+                eprintln!("cascade-gui: {p}: {e}");
+                None
+            }
+        });
     let ecu = ecu_arg
         .or_else(|| std::env::var("CASCADE_ECU_ROM").ok())
         .map(|p| {
@@ -1457,7 +1493,9 @@ fn main() {
                 ..Default::default()
             };
             gpui_kit::open_window(opts, cx, |window, cx| {
-                cx.new(|cx| CascadeView::new(rom, replay, (ecu, ecu_first), window, cx))
+                cx.new(|cx| {
+                    CascadeView::new(rom, replay, (ecu, ecu_first), exrom.clone(), window, cx)
+                })
             })
             .expect("failed to open window");
             cx.on_window_closed(|cx, _| cx.quit()).detach();

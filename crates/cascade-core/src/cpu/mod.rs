@@ -48,6 +48,8 @@ enum Window {
     Rom(u32),
     /// Offset into the 512 KB mapped RAM.
     MappedRam(u32),
+    /// Offset into the extended ROM (upstream `-x`), if one is loaded.
+    ExRom(u32),
 }
 
 /// Something that happened during a step that the caller may care about.
@@ -103,6 +105,9 @@ pub struct Cpu {
     /// recording is on ([`Cpu::record_rom_reads`]). Analysis aid.
     rom_reads: std::cell::RefCell<Option<std::collections::BTreeMap<u32, u64>>>,
     rom: Vec<u8>,
+    /// Extended ROM image (upstream `-x`): banks with map_hi 0x10. Hyundai
+    /// "TROUBLE SHOOTING PACK" images (`i-info`) are used this way.
+    exrom: Option<Vec<u8>>,
     ram: Vec<u8>,
     mapped_ram: Vec<u8>,
     code_win: u32,
@@ -164,6 +169,7 @@ impl Cpu {
         let mut cpu = Self {
             stats: Stats::default(),
             rom,
+            exrom: None,
             ram,
             mapped_ram: vec![0; MAPPED_RAM_SIZE],
             code_win: 0,
@@ -287,6 +293,12 @@ impl Cpu {
         self.rom_reads.borrow_mut().take().unwrap_or_default()
     }
 
+    /// Load an extended ROM (upstream `-x`): the image behind map_hi 0x10.
+    /// Load it before the firmware first maps the window (at construction).
+    pub fn load_extended_rom(&mut self, image: Vec<u8>) {
+        self.exrom = Some(image);
+    }
+
     pub fn pc(&self) -> u16 {
         self.pc
     }
@@ -340,6 +352,8 @@ impl Cpu {
             1..=6 => 0x40_0000 * hi as i64 + lo_i * 0x4000 + off,
             8 if lo <= 0x1f => MAPPED_RAM_BASE as i64 + lo_i * 0x4000 + off,
             // no extended ROM is loaded, so map_hi 0x10 falls back to plain ROM
+            // map_hi 0x10 is the extended ROM; without one it falls back to plain ROM
+            0x10 if self.exrom.is_some() => EXROM_BASE as i64 + lo_i * 0x4000 + off,
             0x10 => lo_i * 0x4000 + off,
             7 | 0x1e | 0x1f => MAPPED_RAM_BASE as i64 + (lo_i % 0x20) * 0x4000 + off,
             _ => return unimp(format!("memory mapping {hi:02X}/{lo:02X}")),
@@ -374,6 +388,17 @@ impl Cpu {
                     base as usize + off
                 )),
             },
+            Window::ExRom(base) => match self
+                .exrom
+                .as_deref()
+                .and_then(|x| x.get(base as usize + off))
+            {
+                Some(b) => Ok(*b),
+                None => oob(format!(
+                    "data window read past extended ROM at {:#x}",
+                    base as usize + off
+                )),
+            },
             Window::MappedRam(base) => match self.mapped_ram.get(base as usize + off) {
                 Some(b) => Ok(*b),
                 None => oob(format!(
@@ -390,6 +415,10 @@ impl Cpu {
         let (buf, i) = match self.data_win {
             Window::Rom(base) => (&mut self.rom, base as usize + off),
             Window::MappedRam(base) => (&mut self.mapped_ram, base as usize + off),
+            Window::ExRom(base) => match self.exrom.as_mut() {
+                Some(x) => (x, base as usize + off),
+                None => return oob("data window write to an extended ROM that is not loaded"),
+            },
         };
         match buf.get_mut(i) {
             Some(b) => {
@@ -423,7 +452,10 @@ impl Cpu {
         let got = if p >= MAPPED_RAM_BASE {
             self.mapped_ram.get((p - MAPPED_RAM_BASE) as usize)
         } else if p >= EXROM_BASE {
-            None
+            // upstream reads exrom[p] here without subtracting the base
+            self.exrom
+                .as_deref()
+                .and_then(|x| x.get((p - EXROM_BASE) as usize))
         } else {
             self.rom.get(p as usize)
         };
@@ -653,4 +685,35 @@ fn upstream_contains(hay: &[u8], needle: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod exrom_tests {
+    use super::*;
+
+    /// map_hi 0x10 selects the extended ROM (upstream `-x`) once one is
+    /// loaded; without one it falls back to the plain ROM, as upstream does.
+    #[test]
+    fn data_window_reaches_the_extended_rom() {
+        let mut rom = vec![0u8; 0x10000];
+        rom[0x4000 * 2 + 5] = 0xaa; // plain ROM bank 2, offset 5
+        let mut exrom = vec![0u8; 0x10000];
+        exrom[0x4000 * 2 + 5] = 0x55; // extended ROM bank 2, offset 5
+
+        let mut cpu = Cpu::with_null_interface(rom.clone());
+        cpu.io_write8(0x273, 0x10).unwrap();
+        cpu.io_write8(0x272, 0x02).unwrap();
+        assert_eq!(cpu.rd8(0xc005).unwrap(), 0xaa, "no extended ROM: plain ROM");
+
+        let mut cpu = Cpu::with_null_interface(rom);
+        cpu.load_extended_rom(exrom);
+        cpu.io_write8(0x273, 0x10).unwrap();
+        cpu.io_write8(0x272, 0x02).unwrap();
+        assert_eq!(cpu.rd8(0xc005).unwrap(), 0x55, "map_hi 0x10: extended ROM");
+        // the disassembler's side-effect-free path agrees
+        assert_eq!(cpu.mapped_read8(0xc005, false).unwrap(), 0x55);
+        // other banks are unaffected
+        cpu.io_write8(0x273, 0x00).unwrap();
+        assert_eq!(cpu.rd8(0xc005).unwrap(), 0xaa);
+    }
 }

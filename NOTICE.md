@@ -38,6 +38,9 @@ All dated 2026-11-21 (the first published version).
   backends the UART receive buffer explicitly.
 - Key presses are stamped with emulated cycles, so scripted sessions are
   reproducible; front ends release held keys after a firmware reset.
+- Upstream's side-effect-free mapped read (used by its disassembler) indexes
+  the extended ROM without subtracting its base address, an out-of-bounds
+  read; this port subtracts it.
 - The disassembler decodes instruction lengths correctly (byte immediates,
   the `FE` prefix); upstream's printer does not, which does not matter for
   its traces.
@@ -49,6 +52,8 @@ reads 16 bits.
 
 ### Added
 
+- Extended ROM (upstream `-x`; map_hi 0x10), ported 2026-11-22: Hyundai
+  "TROUBLE SHOOTING PACK" images for the DTC HELP → FLOW screens.
 - Diagnostic-line backends: a KWP2000 ECU model, replay of recorded
   sessions, a real serial K-line (a port of upstream's `iface_kl_tty`), and
   an emulated engine ECU (`ecuc167`).

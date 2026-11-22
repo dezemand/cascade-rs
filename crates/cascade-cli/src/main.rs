@@ -22,6 +22,8 @@
 //!       the code window) from CYCLE on, with counts;
 //!       --rom-reads CYCLE:FILE writes every ROM offset read through the
 //!       data window from CYCLE on, with counts;
+//!       --exrom F (or -x F) loads an extended ROM, as upstream's -x: a
+//!       Hyundai "TROUBLE SHOOTING PACK" (i-info) behind the main pack;
 //!       --ecu-rom F runs a SIMK41 engine ECU dump (ecuc167) as the ECU
 //!       (implies --iface simk41); --ecu-adc CH=VAL sets its ADC inputs (hex
 //!       with 0x, 10 bit; default 0x200 = 2.5 V);
@@ -131,6 +133,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut kwp_addr: Option<u8> = None;
     let mut replay = None;
     let mut ecu_rom: Option<String> = None;
+    let mut exrom: Option<String> = None;
     let mut adc: Vec<(usize, u16)> = Vec::new();
     let mut rom_reads: Option<(u64, String)> = None;
     let mut pcs_out: Option<(u64, String)> = None;
@@ -187,6 +190,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                     .ok_or_else(|| format!("bad --rom-reads {v:?}, want FROM_CYCLE:FILE"))?;
                 rom_reads = Some((parse_num(from)?, file.to_string()));
             }
+            "--exrom" | "-x" => exrom = Some(val()?.to_string()),
             "--ecu-rom" => {
                 ecu_rom = Some(val()?.to_string());
                 iface_name = "simk41";
@@ -303,6 +307,10 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let line_log = traced.log_handle();
     let iface: Box<dyn cascade_iface::Interface> = Box::new(traced);
     let mut cpu = Cpu::new(rom, iface, false);
+    if let Some(p) = &exrom {
+        let image = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+        cpu.load_extended_rom(image);
+    }
     cpu.max_cycles = max;
     for k in keys {
         cpu.queue_key(k);
@@ -521,7 +529,7 @@ fn main() -> ExitCode {
         ["trace-diff", l, r] => trace_diff(l, r),
         ["trace-stats", p] => trace_stats(p),
         ["disasm", rest @ ..] => disasm(rest),
-        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
+        _ => Err("usage: cascade run <rom> [-m N] [--trace F] [--dump DIR] [--key C:NAME[:HOLD]] [--screen] [--png F] [--line-log F] [--stats] [--iface fake|null|kwp] [--kwp-log F] [--dtc C:S] [--local ID=HEX] [--respond REQ=RESP] [--kwp-addr A] [--kwp-keybytes HEX] [--kwp-length-byte] [--replay KDIAG.jsonl] [--exrom F] [--ecu-rom F] [--ecu-adc CH=VAL] [--rom-reads CYCLE:FILE] [--pcs CYCLE:FILE] [--continue-after-reset]\n       \
                   cascade trace-diff <left> <right>\n       cascade trace-stats <log>\n       cascade disasm <rom> <ADDR> [-n N] [--bank PHYS]"
             .into()),
     };

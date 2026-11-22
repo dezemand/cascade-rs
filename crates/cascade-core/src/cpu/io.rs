@@ -1,6 +1,6 @@
 //! SFR and board I/O (port of `cpu_io.cpp`).
 
-use super::{Cpu, MAPPED_RAM_BASE, Window};
+use super::{Cpu, EXROM_BASE, MAPPED_RAM_BASE, Window};
 use crate::hsio::{HSI_TIME_HI, HSI_TIME_LO, HSO_TIME_HI, HSO_TIME_LO};
 use crate::stop::{R, unimp};
 
@@ -341,6 +341,8 @@ impl Cpu {
                 let phys = self.virt_to_phys_slow(0xc000, false)?;
                 self.data_win = if phys >= MAPPED_RAM_BASE {
                     Window::MappedRam(phys - MAPPED_RAM_BASE)
+                } else if phys >= EXROM_BASE {
+                    Window::ExRom(phys - EXROM_BASE)
                 } else if (phys as u64) + 0x4000 <= self.rom.len() as u64 {
                     // oracle patch 0002: upstream checks rom_size - 0xc000
                     Window::Rom(phys)
@@ -355,6 +357,8 @@ impl Cpu {
                 // no bounds check upstream; window_read reports misuse
                 self.data_win = if phys >= MAPPED_RAM_BASE {
                     Window::MappedRam(phys - MAPPED_RAM_BASE)
+                } else if phys >= EXROM_BASE {
+                    Window::ExRom(phys - EXROM_BASE)
                 } else {
                     Window::Rom(phys)
                 };

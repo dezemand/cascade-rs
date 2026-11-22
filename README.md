@@ -104,6 +104,17 @@ original firmware shows the car's data:
 python3 -I tools/screen.py roms/hyundai.his.dat --path tiburon-l4 down enter wait --replay log.jsonl
 ```
 
+Hyundai packs can show official troubleshooting flowcharts (DTC screen →
+HELP → FLOW). They live in a separate "TROUBLE SHOOTING PACK" image, which
+the emulator loads as an extended ROM, as the original's `-x` option does:
+
+```sh
+cascade run roms/hyundai.his.dat --exrom roms/i-info.his.dat …
+open target/Cascade.app --args roms/hyundai.his.dat --exrom roms/i-info.his.dat
+```
+
+Without it the firmware reports "TROUBLE SHOOTING PACK NOT FOUND!".
+
 ## Safety
 
 - `kdiag` is **read-only**. Every request passes an allowlist (session
