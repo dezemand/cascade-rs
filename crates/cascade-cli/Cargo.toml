@@ -17,5 +17,8 @@ cascade-core.workspace = true
 cascade-iface.workspace = true
 ecuc167 = { path = "../ecuc167" }
 
+[target.'cfg(unix)'.dependencies]
+ecusim = { path = "../ecusim" }
+
 [lints]
 workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "ecusim-gui"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+authors.workspace = true
+description = "Control panel for the ecusim ECU process: ignition, starter, throttle and sensors (GPUI via gpui-kit)"
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ecusim-gui"
+path = "src/main.rs"
+
+[dependencies]
+ecusim = { path = "../ecusim" }
+gpui-kit = "0.10.0"
+
+[lints]
+workspace = true

@@ -18,6 +18,9 @@ ecuc167 = { path = "../ecuc167" }
 cascade-j2534 = { path = "../cascade-j2534" }
 serialport = { version = "4.10.1", default-features = false, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+ecusim = { path = "../ecusim" }
+
 [lints]
 workspace = true
 

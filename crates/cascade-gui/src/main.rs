@@ -101,13 +101,29 @@ fn kwp_engine() -> KwpConfig {
     cfg
 }
 
-const IFACES: [&str; 6] = ["Fake", "KWP", "ECU", "None", "Port", "Replay"];
+const IFACES: [&str; 7] = ["Fake", "KWP", "ECU", "None", "Port", "Replay", "Process"];
 /// Index of "ECU" (the engine ECU's own code, a SIMK41 dump in ecuc167).
 const ECU: usize = 2;
 /// Index of the serial adapter ("Port") in IFACES.
 const ADAPTER: usize = 4;
 /// Index of "Replay" (a `kdiag --trace` recording) in IFACES.
 const REPLAY: usize = 5;
+/// Index of "Process": an `ecusim serve` process (the ECU dump running in
+/// real time with an engine model) on its default socket.
+const PROCESS: usize = 6;
+
+/// The line to an `ecusim` server (connected inside the emulator thread).
+fn process_iface() -> IfaceKind {
+    let sock = ecusim::default_socket();
+    let label = "ECU process (ecusim)".to_string();
+    // waits for (and survives restarts of) the server, like a cable that
+    // gets plugged in later
+    let make: cascade_runner::IfaceFactory = std::sync::Arc::new(move || {
+        Ok(Box::new(ecusim::client::SocketKLine::waiting(&sock))
+            as Box<dyn cascade_iface::Interface>)
+    });
+    IfaceKind::Custom { label, make }
+}
 
 /// An engine ECU dump for the "ECU" line option. Proprietary; loaded from
 /// outside the repository at run time.
@@ -414,6 +430,7 @@ impl CascadeView {
                 Some(l) => IfaceKind::Kwp(l.config.clone()),
                 None => IfaceKind::Null,
             },
+            (PROCESS, _) => process_iface(),
             (i, _) => iface_kind(i),
         }
     }
@@ -1185,7 +1202,7 @@ impl CascadeView {
                 .bg(rgb(CARD)),
             |d, (i, name)| {
                 d.child(
-                    // six options as a 3 × 2 grid of equal buttons
+                    // the options as a grid of equal buttons, three per row
                     {
                         let b = Button::new(SharedString::from(format!("iface-{i}")))
                             .label(*name)
@@ -1208,6 +1225,10 @@ impl CascadeView {
                             } else {
                                 v.open_ecu(cx);
                             }
+                        } else if i == PROCESS {
+                            // a real-time partner: run at real time
+                            v.runner.send(Command::Speed(Speed::Real(1.0)));
+                            v.runner.send(Command::Restart(v.current_iface()));
                         } else if i == REPLAY {
                             if v.replay.is_some() {
                                 v.runner.send(Command::Restart(v.current_iface()));

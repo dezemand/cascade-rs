@@ -1,0 +1,16 @@
+[package]
+name = "ecusim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+license-file.workspace = true
+description = "A GK 2.0 engine ECU dump running in real time as its own process, with an engine model and a socket for K-line testers and controls"
+
+[lints]
+workspace = true
+
+[dependencies]
+cascade-iface.workspace = true
+ecuc167 = { path = "../ecuc167" }

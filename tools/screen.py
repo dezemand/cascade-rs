@@ -49,7 +49,7 @@ def main():
     for a in it:
         if a == "--path":
             keys += PATHS[next(it)]
-        elif a in ("--local", "--dtc", "--kwp-log", "--respond", "--line-log", "--kwp-addr", "--kwp-keybytes", "--png", "--replay", "--rom-reads", "--pcs", "--ecu-rom", "--ecu-adc", "--iface", "--exrom", "--kwp-p3-max", "--kwp-5baud-keybytes"):
+        elif a in ("--local", "--dtc", "--kwp-log", "--respond", "--line-log", "--kwp-addr", "--kwp-keybytes", "--png", "--replay", "--rom-reads", "--pcs", "--ecu-rom", "--ecu-adc", "--iface", "--exrom", "--kwp-p3-max", "--kwp-5baud-keybytes", "--ecusim"):
             extra += [a, next(it)]
         elif a in ("--kwp-length-byte", "--kwp-iso9141"):
             extra.append(a)

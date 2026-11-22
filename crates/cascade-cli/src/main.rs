@@ -27,6 +27,9 @@
 //!       written at the end; upstream uses ROM.eep), otherwise it starts blank;
 //!       --exrom F (or -x F) loads an extended ROM, as upstream's -x: a
 //!       Hyundai "TROUBLE SHOOTING PACK" (i-info) behind the main pack;
+//!       --ecusim SOCKET|auto talks to `ecusim serve` (the ECU dump running in
+//!       real time as its own process; implies --realtime); --realtime paces
+//!       the emulator to wall time
 //!       --ecu-rom F runs a SIMK41 engine ECU dump (ecuc167) as the ECU
 //!       (implies --iface simk41); --ecu-adc CH=VAL sets its ADC inputs (hex
 //!       with 0x, 10 bit; default 0x200 = 2.5 V);
@@ -136,6 +139,8 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut kwp_addr: Option<u8> = None;
     let mut replay = None;
     let mut ecu_rom: Option<String> = None;
+    let mut ecusim_sock: Option<std::path::PathBuf> = None;
+    let mut realtime = false;
     let mut exrom: Option<String> = None;
     let mut eeprom_file: Option<String> = None;
     let mut adc: Vec<(usize, u16)> = Vec::new();
@@ -203,6 +208,19 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
                 ecu_rom = Some(val()?.to_string());
                 iface_name = "simk41";
             }
+            #[cfg(unix)]
+            "--ecusim" => {
+                let v = val()?;
+                ecusim_sock = Some(if v == "auto" {
+                    ecusim::default_socket()
+                } else {
+                    v.into()
+                });
+                iface_name = "ecusim";
+                // the ECU process runs in real time
+                realtime = true;
+            }
+            "--realtime" => realtime = true,
             "--ecu-adc" => {
                 let v = val()?;
                 let (ch, x) = v
@@ -317,9 +335,17 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             }
             Box::new(ecu)
         }
+        #[cfg(unix)]
+        "ecusim" => {
+            let p = ecusim_sock.ok_or("--iface ecusim needs --ecusim SOCKET")?;
+            Box::new(
+                ecusim::client::SocketKLine::connect(&p)
+                    .map_err(|e| format!("{}: {e} (is `ecusim serve` running?)", p.display()))?,
+            )
+        }
         other => {
             return Err(format!(
-                "unknown --iface {other:?} (fake, null, kwp, simk41)"
+                "unknown --iface {other:?} (fake, null, kwp, simk41, ecusim)"
             ));
         }
     };
@@ -363,6 +389,7 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
     let mut reset_seen = false;
     let mut reads_on = false;
     let mut pcs = std::collections::BTreeMap::<u32, u64>::new();
+    let started = std::time::Instant::now();
     let stop = loop {
         if let Some((from, _)) = &rom_reads
             && !reads_on
@@ -377,6 +404,13 @@ fn run(args: &[&str]) -> Result<ExitCode, String> {
             let pc = cpu.pc();
             *pcs.entry(cpu.code_phys(pc).unwrap_or(pc as u32))
                 .or_default() += 1;
+        }
+        // real time: 10,000 cycles per ms, checked every 10,000 cycles
+        if realtime && cpu.cycles() % 10_000 < 8 {
+            let ahead = (cpu.cycles() / 10).saturating_sub(started.elapsed().as_micros() as u64);
+            if ahead > 2_000 {
+                std::thread::sleep(std::time::Duration::from_micros(ahead));
+            }
         }
         let t: Option<&mut dyn FnMut(&Record)> = if tracing { Some(&mut sink) } else { None };
         match cpu.step(t) {

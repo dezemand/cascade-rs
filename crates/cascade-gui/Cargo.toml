@@ -18,6 +18,7 @@ cascade-iface.workspace = true
 cascade-runner.workspace = true
 cascade-diag.workspace = true
 ecuc167 = { path = "../ecuc167" }
+ecusim = { path = "../ecusim" }
 gpui-kit = "0.10.0"
 
 [lints]

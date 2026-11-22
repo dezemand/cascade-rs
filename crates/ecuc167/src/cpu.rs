@@ -15,6 +15,7 @@
 use crate::isa::{self, Alu, BitOp, Div, Ext, Insn, Jb, Op, Shift, bitoff_addr, decode, reg_addr};
 
 pub const PSW: u32 = 0xFF10;
+pub const P2: u32 = 0xFFC0;
 pub const SP: u32 = 0xFE12;
 pub const CP: u32 = 0xFE10;
 pub const CSP: u32 = 0xFE08;
@@ -89,6 +90,9 @@ pub enum ExtMode {
 /// Something the caller may want to log or react to.
 #[derive(Clone, Debug)]
 pub enum Event {
+    /// A CAPCOM compare match (channel in compare mode 1-3 or with its
+    /// interrupt) at this time: unit 0/1, channel 0-15, mode bits.
+    Compare { at: u64, unit: u8, ch: u8, mode: u8 },
     /// The ECU finished sending a byte on ASC0.
     Tx { at: u64, byte: u8 },
     /// S0BG/S0CON changed.
@@ -161,6 +165,105 @@ pub struct Cpu {
     pub watch_log: Vec<(u64, u32, u32, u16, bool)>,
     pub cur_pc: u32,
     pub watch_writes_only: bool,
+    /// Toothed wheels driving capture inputs (crank, cam).
+    pub wheels: Vec<Wheel>,
+    /// Report CAPCOM compare matches as events.
+    pub log_compares: bool,
+    /// Compare matches also when software writes a CAPCOM timer (default on).
+    pub compare_on_write: bool,
+    /// Levels driven onto P2 input pins (wheels); reads merge them with the
+    /// output latch by DP2.
+    pub p2_in: u16,
+}
+
+/// A toothed wheel on a CAPCOM capture input: `teeth` positions per turn,
+/// the last `missing` of them without a tooth. Each tooth gives a falling
+/// edge at its leading flank and a rising edge half a pitch later.
+#[derive(Clone, Debug)]
+pub struct Wheel {
+    /// Where the wheel's edges go.
+    pub targets: Vec<Pin>,
+    pub teeth: u32,
+    pub missing: u32,
+    /// Revolutions per minute of this wheel; 0 stops it.
+    pub rpm: f64,
+    /// Next tooth position and edge (false = falling) and when.
+    pos: u32,
+    rising: bool,
+    next_at: u64,
+    /// Edges delivered so far.
+    pub edges: u64,
+    /// A cam signal locked to this (crank) wheel over two turns.
+    pub cam: Option<Cam>,
+    /// Position over two turns (0..2 * teeth).
+    pos720: u32,
+}
+
+/// A cam level over a 720° cycle, in crank tooth positions (0..2 * teeth,
+/// position 0 is the first tooth after the gap): low from `fall` to `rise`.
+#[derive(Clone, Debug)]
+pub struct Cam {
+    pub targets: Vec<Pin>,
+    pub fall: u32,
+    pub rise: u32,
+}
+
+/// Timer inputs a wheel can drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pin {
+    /// A CAPCOM channel's pin (unit 0 = CAPCOM1, 1 = CAPCOM2; channel 0-15).
+    Cc { unit: u8, ch: u8 },
+    /// T0IN (CAPCOM1 T0 counter input).
+    T0In,
+    /// T7IN (CAPCOM2 T7 counter input).
+    T7In,
+    /// GPT2 CAPIN (T5 capture into CAPREL).
+    CapIn,
+}
+
+impl std::str::FromStr for Pin {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "t0in" => Pin::T0In,
+            "t7in" => Pin::T7In,
+            "capin" => Pin::CapIn,
+            cc => {
+                let n: u8 = cc
+                    .strip_prefix("cc")
+                    .and_then(|n| n.parse().ok())
+                    .filter(|&n| n < 32)
+                    .ok_or_else(|| format!("unknown pin {s:?} (t0in, t7in, capin, cc0..cc31)"))?;
+                Pin::Cc {
+                    unit: n / 16,
+                    ch: n % 16,
+                }
+            }
+        })
+    }
+}
+
+impl Wheel {
+    pub fn new(targets: Vec<Pin>, teeth: u32, missing: u32) -> Self {
+        Self {
+            targets,
+            teeth,
+            missing,
+            rpm: 0.0,
+            pos: 0,
+            rising: false,
+            next_at: 0,
+            edges: 0,
+            cam: None,
+            pos720: 0,
+        }
+    }
+
+    /// Half a tooth pitch in CPU cycles at the current speed.
+    fn half_pitch(&self, fcpu: u64) -> Option<u64> {
+        (self.rpm > 0.0)
+            .then(|| (fcpu as f64 * 60.0 / (self.rpm * self.teeth as f64) / 2.0).max(1.0) as u64)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +314,10 @@ impl Cpu {
             watch_log: Vec::new(),
             cur_pc: 0,
             watch_writes_only: false,
+            wheels: Vec::new(),
+            log_compares: false,
+            p2_in: 0,
+            compare_on_write: true,
         };
         // Reset values.
         c.put16(0xFE06, 3); // DPP3
@@ -259,6 +366,11 @@ impl Cpu {
                 v = (v & !(1 << 11)) | ((lvl as u16) << 11);
                 v
             }
+            // input pins read their level, output pins the latch
+            P2 => {
+                let dp = self.peek16(0xFFC2);
+                (self.peek16(P2) & dp) | (self.p2_in & !dp)
+            }
             _ => self.peek16(a),
         };
         self.watch_hit(a, v, false);
@@ -303,6 +415,19 @@ impl Cpu {
     }
 
     fn on_write(&mut self, a: u32, old: u16, v: u16) {
+        // a CAPCOM timer written to a compare value matches like a count
+        // would [assumed]. The SIMK41 code steps T7 by software across the
+        // crank gap and needs CC24 to fire then; without this it drops sync
+        // every few revolutions.
+        if self.compare_on_write {
+            match a {
+                0xFE50 => self.compare_equal(0, 0, v),
+                0xFE52 => self.compare_equal(0, 1, v),
+                0xF050 => self.compare_equal(1, 0, v),
+                0xF052 => self.compare_equal(1, 1, v),
+                _ => {}
+            }
+        }
         match a {
             0xFF60..=0xFF9E | 0xF160..=0xF19E | PSW => self.irq_check = true,
             S0TBUF => self.asc_tx_write(v as u8),
@@ -1237,6 +1362,7 @@ impl Cpu {
         self.cycles += cyc;
         self.tick_capcom(cyc);
         self.tick_gpt(cyc);
+        self.tick_wheels();
         // ADC
         if let Some(t) = self.adc_busy_until
             && self.cycles >= t
@@ -1359,21 +1485,131 @@ impl Cpu {
         self.set_ir(S0RIC);
     }
 
-    fn tick_capcom(&mut self, cyc: u64) {
-        // CAPCOM1: T01CON, T0/T1, T0REL/T1REL, CCM0-3, CC0-15.
-        // CAPCOM2: T78CON, T7/T8 (ESFR), T7REL/T8REL, CCM4-7, CC16-31.
+    fn tick_wheels(&mut self) {
+        for i in 0..self.wheels.len() {
+            loop {
+                let w = &self.wheels[i];
+                let Some(half) = w.half_pitch(self.fcpu) else {
+                    // stopped: start timing afresh when it turns again
+                    self.wheels[i].next_at = 0;
+                    break;
+                };
+                if w.next_at == 0 {
+                    self.wheels[i].next_at = self.cycles + half;
+                    break;
+                }
+                if w.next_at > self.cycles {
+                    break;
+                }
+                let (rising, pos) = (w.rising, w.pos);
+                let tooth = pos < w.teeth - w.missing;
+                if tooth {
+                    for p in self.wheels[i].targets.clone() {
+                        self.pin_edge(p, rising);
+                    }
+                    self.wheels[i].edges += 1;
+                }
+                let w = &mut self.wheels[i];
+                if rising {
+                    w.pos = (w.pos + 1) % w.teeth;
+                    w.pos720 = (w.pos720 + 1) % (2 * w.teeth);
+                }
+                w.rising = !rising;
+                w.next_at += half;
+                // cam edges at whole tooth positions (on the leading flank)
+                if !rising && let Some(cam) = &w.cam {
+                    let p = w.pos720;
+                    let edge = if p == cam.fall {
+                        Some(false)
+                    } else if p == cam.rise {
+                        Some(true)
+                    } else {
+                        None
+                    };
+                    if let Some(level) = edge {
+                        for t in cam.targets.clone() {
+                            self.pin_edge(t, level);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// An edge on a timer input pin.
+    pub fn pin_edge(&mut self, pin: Pin, rising: bool) {
+        let src = if rising { 1 } else { 2 };
+        // CAPCOM1 pins are P2.0-P2.15 (T7IN shares P2.15): the code also
+        // reads their levels
+        let p2_bit = match pin {
+            Pin::Cc { unit: 0, ch } => Some(ch),
+            Pin::T7In => Some(15),
+            _ => None,
+        };
+        if let Some(b) = p2_bit {
+            if rising {
+                self.p2_in |= 1 << b;
+            } else {
+                self.p2_in &= !(1 << b);
+            }
+        }
+        match pin {
+            Pin::Cc { unit, ch } => self.capture_edge(unit, ch, rising),
+            Pin::T0In => self.capcom_count(0, src),
+            Pin::T7In => self.capcom_count(1, src),
+            Pin::CapIn => self.capin_edge(rising),
+        }
+    }
+
+    /// An edge on a CAPCOM pin: a channel in capture mode for that edge
+    /// latches its timer into CCx and requests its interrupt.
+    pub fn capture_edge(&mut self, unit: u8, ch: u8, rising: bool) {
         const CC2_IC: [u32; 16] = [
             0xF160, 0xF162, 0xF164, 0xF166, 0xF168, 0xF16A, 0xF16C, 0xF16E, 0xF170, 0xF172, 0xF174,
             0xF176, 0xF178, 0xF184, 0xF18C, 0xF194,
         ];
+        let ch = (ch & 15) as u32;
+        let (t_a, ccm_a, cc_a) = if unit == 0 {
+            (0xFE50, 0xFF52, 0xFE80)
+        } else {
+            (0xF050, 0xFF22, 0xFE60)
+        };
+        let f = (self.peek16(ccm_a + 2 * (ch / 4)) >> (4 * (ch % 4))) & 15;
+        let hit = match f & 7 {
+            1 => rising,
+            2 => !rising,
+            3 => true,
+            _ => false,
+        };
+        if !hit {
+            return;
+        }
+        let t = self.peek16(t_a + 2 * ((f >> 3) as u32));
+        self.put16(cc_a + 2 * ch, t);
+        let ic = if unit == 0 {
+            0xFF78 + 2 * ch
+        } else {
+            CC2_IC[ch as usize]
+        };
+        self.set_ir(ic);
+    }
+
+    fn capcom_regs(unit: usize) -> (u32, u32, u32, u32, u32, [u32; 2]) {
+        if unit == 0 {
+            (0xFF50, 0xFE50, 0xFE54, 0xFF52, 0xFE80, [0xFF9C, 0xFF9E])
+        } else {
+            (0xFF20, 0xF050, 0xF054, 0xFF22, 0xFE60, [0xF17A, 0xF17C])
+        }
+    }
+
+    fn tick_capcom(&mut self, cyc: u64) {
+        // CAPCOM1: T01CON, T0/T1, T0REL/T1REL, CCM0-3, CC0-15.
+        // CAPCOM2: T78CON, T7/T8 (ESFR), T7REL/T8REL, CCM4-7, CC16-31.
+        // Timers in counter mode (TxM) count input events instead
+        // (`capcom_count`).
         for unit in 0..2 {
-            let (con_a, t_a, rel_a, ccm_a, cc_a, tic) = if unit == 0 {
-                (0xFF50, 0xFE50, 0xFE54, 0xFF52, 0xFE80, [0xFF9C, 0xFF9E])
-            } else {
-                (0xFF20, 0xF050, 0xF054, 0xFF22, 0xFE60, [0xF17A, 0xF17C])
-            };
-            let con = self.peek16(con_a);
-            for (t, &tic_t) in tic.iter().enumerate() {
+            let con = self.peek16(Self::capcom_regs(unit).0);
+            for t in 0..2 {
                 let c = con >> (8 * t);
                 if c & 0x40 == 0 || c & 0x08 != 0 {
                     continue;
@@ -1386,42 +1622,118 @@ impl Cpu {
                     continue;
                 }
                 self.acc_t[ai] %= pre;
-                let ta = t_a + 2 * t as u32;
-                let old = self.peek16(ta);
-                let mut new = old as u64 + inc;
-                let mut ovf = false;
-                if new > 0xFFFF {
-                    ovf = true;
-                    let rel = self.peek16(rel_a + 2 * t as u32) as u64;
-                    new = rel + (new - 0x10000) % (0x10000 - rel).max(1);
-                }
-                self.put16(ta, new as u16);
-                if ovf {
-                    self.set_ir(tic_t);
-                }
-                for ch in 0..16u32 {
-                    let ccm = self.peek16(ccm_a + 2 * (ch / 4));
-                    let f = (ccm >> (4 * (ch % 4))) & 15;
-                    if f & 7 < 4 || ((f >> 3) as usize) != t {
-                        continue;
-                    }
-                    let cv = self.peek16(cc_a + 2 * ch);
-                    let hit = if !ovf {
-                        cv > old && cv as u64 <= new
-                    } else {
-                        cv > old || cv as u64 <= new
-                    };
-                    if hit {
-                        let ic = if unit == 0 {
-                            0xFF78 + 2 * ch
-                        } else {
-                            CC2_IC[ch as usize]
-                        };
-                        self.set_ir(ic);
-                    }
+                self.capcom_inc(unit, t, inc);
+            }
+        }
+    }
+
+    /// A count event for CAPCOM timers in counter mode. `source`: 0 = GPT2
+    /// T6 over/underflow, 1 = rising and 2 = falling edge on the timer's
+    /// input pin (T0IN, T7IN). Only T0 and T7 have a counter input.
+    fn capcom_count(&mut self, unit: usize, source: u8) {
+        let c = self.peek16(Self::capcom_regs(unit).0) & 0xFF;
+        if c & 0x40 == 0 || c & 0x08 == 0 {
+            return;
+        }
+        let hit = matches!((c & 3, source), (0, 0) | (1, 1) | (2, 2) | (3, 1) | (3, 2));
+        if hit {
+            self.capcom_inc(unit, 0, 1);
+        }
+    }
+
+    /// Compare channels of timer `t` in `unit` whose CC register equals `v`.
+    fn compare_equal(&mut self, unit: usize, t: usize, v: u16) {
+        const CC2_IC: [u32; 16] = [
+            0xF160, 0xF162, 0xF164, 0xF166, 0xF168, 0xF16A, 0xF16C, 0xF16E, 0xF170, 0xF172, 0xF174,
+            0xF176, 0xF178, 0xF184, 0xF18C, 0xF194,
+        ];
+        let (_, _, _, ccm_a, cc_a, _) = Self::capcom_regs(unit);
+        for ch in 0..16u32 {
+            let f = (self.peek16(ccm_a + 2 * (ch / 4)) >> (4 * (ch % 4))) & 15;
+            if f & 7 < 4 || ((f >> 3) as usize) != t || self.peek16(cc_a + 2 * ch) != v {
+                continue;
+            }
+            let ic = if unit == 0 {
+                0xFF78 + 2 * ch
+            } else {
+                CC2_IC[ch as usize]
+            };
+            self.set_ir(ic);
+        }
+    }
+
+    fn capcom_inc(&mut self, unit: usize, t: usize, inc: u64) {
+        const CC2_IC: [u32; 16] = [
+            0xF160, 0xF162, 0xF164, 0xF166, 0xF168, 0xF16A, 0xF16C, 0xF16E, 0xF170, 0xF172, 0xF174,
+            0xF176, 0xF178, 0xF184, 0xF18C, 0xF194,
+        ];
+        let (_, t_a, rel_a, ccm_a, cc_a, tic) = Self::capcom_regs(unit);
+        let ta = t_a + 2 * t as u32;
+        let old = self.peek16(ta);
+        let mut new = old as u64 + inc;
+        let mut ovf = false;
+        if new > 0xFFFF {
+            ovf = true;
+            let rel = self.peek16(rel_a + 2 * t as u32) as u64;
+            new = rel + (new - 0x10000) % (0x10000 - rel).max(1);
+        }
+        self.put16(ta, new as u16);
+        if ovf {
+            self.set_ir(tic[t]);
+        }
+        for ch in 0..16u32 {
+            let ccm = self.peek16(ccm_a + 2 * (ch / 4));
+            let f = (ccm >> (4 * (ch % 4))) & 15;
+            if f & 7 < 4 || ((f >> 3) as usize) != t {
+                continue;
+            }
+            let cv = self.peek16(cc_a + 2 * ch);
+            let hit = if !ovf {
+                cv > old && cv as u64 <= new
+            } else {
+                cv > old || cv as u64 <= new
+            };
+            if hit {
+                let ic = if unit == 0 {
+                    0xFF78 + 2 * ch
+                } else {
+                    CC2_IC[ch as usize]
+                };
+                self.set_ir(ic);
+                if self.log_compares {
+                    self.events.push(Event::Compare {
+                        at: self.cycles,
+                        unit: unit as u8,
+                        ch: ch as u8,
+                        mode: (f & 7) as u8,
+                    });
                 }
             }
         }
+    }
+
+    /// An edge on GPT2's CAPIN pin: with T5SC set and a matching CI edge,
+    /// CAPREL latches T5 (T5 is cleared if T5CLR) and CRIR is set.
+    pub fn capin_edge(&mut self, rising: bool) {
+        let con = self.peek16(0xFF46);
+        if con & 0x8000 == 0 {
+            return;
+        }
+        let hit = match (con >> 12) & 3 {
+            1 => rising,
+            2 => !rising,
+            3 => true,
+            _ => false,
+        };
+        if !hit {
+            return;
+        }
+        let t5 = self.peek16(0xFE46);
+        self.put16(0xFE4A, t5);
+        if con & 0x4000 != 0 {
+            self.put16(0xFE46, 0);
+        }
+        self.set_ir(0xFF6A);
     }
 
     fn tick_gpt(&mut self, cyc: u64) {
@@ -1478,6 +1790,11 @@ impl Cpu {
                     None => new.rem_euclid(0x10000),
                 };
                 self.set_ir(ic);
+                if i == 4 {
+                    // T6 over/underflow: count input of CAPCOM T0/T7 (TxI = X00)
+                    self.capcom_count(0, 0);
+                    self.capcom_count(1, 0);
+                }
             }
             self.put16(ta, new as u16);
         }

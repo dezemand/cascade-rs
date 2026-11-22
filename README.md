@@ -30,6 +30,8 @@ engine, ABS and traction control data.
 | `cascade-gui` | Desktop front end (GPUI via `gpui-kit`): a flat Hi-Scan layout with a live data view. macOS. |
 | `cascade-j2534` | Minimal SAE J2534 PassThru access for ISO 14230; vendor-DLL backend on Windows. |
 | `ecuc167` | Infineon C167 disassembler and emulator for running an engine ECU dump offline behind the same interface. |
+| `ecusim` | The engine ECU dump running in real time as its own process (`ecusim serve`), with an open-loop engine model and a socket that testers connect to. |
+| `ecusim-gui` | Control panel for `ecusim`: ignition, starter, throttle, temperatures, battery, road speed (GPUI). macOS. |
 | `ecu8051` | Siemens 80C517-class 8051 emulator, used to analyse an older engine ECU ROM. |
 
 Also: `protocol/` (what the Hi-Scan firmware asks the car and how it scales
@@ -57,7 +59,8 @@ cargo test                 # works without any ROM; ROM-dependent tests skip
 The binaries end up in `target/release/` (`cascade`, `kdiag`, `ecuc167`,
 `ecu8051`). The Python tools need Python 3 and nothing else. ROM-dependent
 tests run when `CASCADE_ROM` (a Hi-Scan pack) and, for the ECU tests,
-`CASCADE_ECU_ROM` (an engine ECU dump) point at your files.
+`CASCADE_ECU_ROM` (an engine ECU dump) point at your files;
+`CASCADE_ECU_ROM_NOIMMO` (a dump without immobiliser) runs the crank test.
 
 The GUI is built separately because GPUI pulls in about 500 crates:
 
@@ -124,6 +127,38 @@ saves it next to the ROM as `ROM.eep`, as the original does (`--eeprom PATH`
 for another file, `--no-eeprom` to keep it in memory), and keeps it across
 power cycles. `cascade run` starts blank unless given `--eeprom FILE`, so
 headless runs stay reproducible.
+
+## A running engine ECU
+
+`ecusim` runs a GK 2.0 SIMK41 engine ECU dump in real time, as a separate
+process. It powers the ECU with the ignition, turns a 60-2 crank wheel and
+the cam, and feeds the sensors from an engine model. The Hi-Scan GUI (line
+option "Process"), `kdiag --ecusim auto` and `cascade run --ecusim auto`
+connect to it as testers.
+
+```sh
+tools/bundle-ecusim.sh
+open target/EcuSim.app --args --rom path/to/simk41-without-immobiliser.bin
+kdiag log --ecusim auto --duration-s 5
+```
+
+Or headless: `ecusim serve --rom ROM`, then `ecusim set ignition on`,
+`ecusim set starter on`, `ecusim set throttle 20`, `ecusim status`.
+
+- Use a dump **without immobiliser**. With one, the ECU stops crank
+  processing when its immobiliser does not answer; this project does not
+  work around that.
+- The sensor curves were measured by sweeping each input through the
+  ROM. The engine model itself is open loop and invented: engine speed
+  follows the starter and the throttle, not the ECU's injection and ignition,
+  which are not decoded yet.
+- On the Hi-Scan use TIBURON → ENGINE L4 → **2003**: that is the data
+  layout this ECU sends. Other model years expect another layout and show
+  nonsense (a negative engine speed, for example).
+- Road speed goes to whichever input the running software reads: CC30 on
+  the GK-20 dump, CC13 on the non-immobiliser one.
+- The crank is a 60-2 wheel on CC15/T7IN plus GPT2 CAPIN, the cam on CC14.
+  The ECU's engine speed follows it steadily from 250 to 6000 rpm.
 
 ## Safety
 

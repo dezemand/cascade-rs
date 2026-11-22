@@ -749,6 +749,7 @@ dependencies = [
  "cascade-core",
  "cascade-iface",
  "ecuc167",
+ "ecusim",
 ]
 
 [[package]]
@@ -767,6 +768,7 @@ dependencies = [
  "cascade-j2534",
  "cascade-runner",
  "ecuc167",
+ "ecusim",
  "serialport",
 ]
 
@@ -779,6 +781,7 @@ dependencies = [
  "cascade-iface",
  "cascade-runner",
  "ecuc167",
+ "ecusim",
  "gpui-kit",
 ]
 
@@ -1397,6 +1400,22 @@ name = "ecuc167"
 version = "0.1.0"
 dependencies = [
  "cascade-iface",
+]
+
+[[package]]
+name = "ecusim"
+version = "0.1.0"
+dependencies = [
+ "cascade-iface",
+ "ecuc167",
+]
+
+[[package]]
+name = "ecusim-gui"
+version = "0.1.0"
+dependencies = [
+ "ecusim",
+ "gpui-kit",
 ]
 
 [[package]]

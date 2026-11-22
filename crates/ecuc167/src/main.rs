@@ -20,6 +20,16 @@
 //! - `--gap MS` tester inter-byte gap (default 2), `--wake-low MS` /
 //!   `--wake-high MS` fast-init pattern (default 25 / 25)
 //! - `--adc CH=VAL` ADC input (10 bit), `--no-echo`
+//! - `--wheel PINS:TEETH:MISSING:RPM` a toothed wheel on timer inputs, `+`
+//!   separated: `t0in`, `t7in`, `capin`, `cc0`..`cc31` (e.g.
+//!   `t0in+capin:60:2:800`; `cc30` is the vehicle speed input)
+//! - `--cam PINS:FALL:RISE` a cam level locked to the last wheel: low from
+//!   crank tooth position FALL to RISE over 720 degrees (0..2 x teeth)
+//! - `--compares` print every CAPCOM compare match
+//! - `--p2-in HEX` levels of undriven P2 input pins (default 0)
+//! - `--no-compare-on-write` compare matches only on timer counts, not when
+//!   software writes a CAPCOM timer
+//! - `--rpm-at MS=RPM` change the first wheel's speed at that time
 //! - `--trace-from MS --trace-n N` instruction trace, `--prof` hot spots,
 //!   `--watch LO-HI` log accesses to a physical address range (`--watch-w`:
 //!   writes only),
@@ -239,6 +249,11 @@ struct RunOpts {
     wake_low: f64,
     wake_high: f64,
     adc: Vec<(usize, u16)>,
+    wheels: Vec<cpu::Wheel>,
+    compares: bool,
+    rpm_at: Vec<(f64, f64)>,
+    p2_in: Option<u16>,
+    cmp_wr: bool,
     echo: bool,
     trace_from: Option<f64>,
     trace_n: u64,
@@ -264,6 +279,11 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
         wake_low: 25.0,
         wake_high: 25.0,
         adc: Vec::new(),
+        wheels: Vec::new(),
+        compares: false,
+        rpm_at: Vec::new(),
+        p2_in: None,
+        cmp_wr: true,
         echo: true,
         trace_from: None,
         trace_n: 2000,
@@ -314,6 +334,52 @@ fn parse_run(a: &[String]) -> Result<RunOpts, String> {
                 let (l, h) = s.split_once('-').unwrap_or((&s, &s));
                 o.watch.push((hexnum(l)?, hexnum(h)?));
             }
+            "--compares" => o.compares = true,
+            "--no-compare-on-write" => o.cmp_wr = false,
+            "--p2-in" => o.p2_in = Some(hexnum(&v()?)? as u16),
+            "--rpm-at" => {
+                // MS=RPM: set the first wheel's speed at that time
+                let a = v()?;
+                let (t, r) = a.split_once('=').ok_or("--rpm-at MS=RPM")?;
+                let num = |x: &str| x.parse::<f64>().map_err(|e| format!("--rpm-at {x}: {e}"));
+                o.rpm_at.push((num(t)?, num(r)?));
+            }
+            "--cam" => {
+                // PINS:FALL:RISE in crank tooth positions over 720 degrees,
+                // locked to the last --wheel
+                let a = v()?;
+                let f: Vec<&str> = a.split(':').collect();
+                let [pins, fall, rise] = f[..] else {
+                    return Err("--cam PINS:FALL:RISE".into());
+                };
+                let targets = pins
+                    .split('+')
+                    .map(str::parse)
+                    .collect::<Result<Vec<cpu::Pin>, _>>()?;
+                let n = |x: &str| x.parse::<u32>().map_err(|e| format!("--cam {x}: {e}"));
+                let w = o.wheels.last_mut().ok_or("--cam needs a --wheel first")?;
+                w.cam = Some(cpu::Cam {
+                    targets,
+                    fall: n(fall)?,
+                    rise: n(rise)?,
+                });
+            }
+            "--wheel" => {
+                // PINS:TEETH:MISSING:RPM, e.g. t0in+capin:60:2:800
+                let a = v()?;
+                let f: Vec<&str> = a.split(':').collect();
+                let [pins, t, m, rpm] = f[..] else {
+                    return Err("--wheel PINS:TEETH:MISSING:RPM".into());
+                };
+                let pins = pins
+                    .split('+')
+                    .map(str::parse)
+                    .collect::<Result<Vec<cpu::Pin>, _>>()?;
+                let num = |x: &str| x.parse::<f64>().map_err(|e| format!("--wheel {x}: {e}"));
+                let mut w = cpu::Wheel::new(pins, num(t)? as u32, num(m)? as u32);
+                w.rpm = num(rpm)?;
+                o.wheels.push(w);
+            }
             "--dump" => {
                 let a = hexnum(&v()?)?;
                 let n = hexnum(&v()?)?;
@@ -348,6 +414,12 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
     c.echo = o.echo;
     for &(ch, v) in &o.adc {
         c.adc[ch & 15] = v;
+    }
+    c.wheels = o.wheels.clone();
+    c.log_compares = o.compares;
+    c.compare_on_write = o.cmp_wr;
+    if let Some(p) = o.p2_in {
+        c.p2_in = p;
     }
     c.watch = o.watch.clone();
     c.watch_writes_only = o.watch_w;
@@ -401,6 +473,13 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
                 }
             }
         }
+        if let Some(&(t, r)) = o.rpm_at.iter().rev().find(|(t, _)| ms(c.cycles) >= *t)
+            && let Some(w) = c.wheels.first_mut()
+            && w.rpm != r
+            && t >= 0.0
+        {
+            w.rpm = r;
+        }
         if let Err(e) = c.step() {
             stop = Some(e);
             break;
@@ -412,6 +491,15 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
                     rx.push(byte);
                     if let Phase::Await { last, .. } = &mut phase {
                         *last = Some(at);
+                    }
+                }
+                Event::Compare { at, unit, ch, mode } => {
+                    if o.compares {
+                        println!(
+                            "{:9.3} ms  CC{} mode {mode}",
+                            ms(at),
+                            unit as u32 * 16 + ch as u32
+                        );
                     }
                 }
                 Event::Baud { at, s0bg, s0con } => println!(
@@ -507,6 +595,12 @@ fn cmd_run(a: &[String]) -> Result<(), String> {
         c.flash_writes,
         c.ssc_log.len()
     );
+    for (i, w) in c.wheels.iter().enumerate() {
+        println!(
+            "           wheel {i}: {} edges, {} rpm at the end",
+            w.edges, w.rpm
+        );
+    }
     if let Some(p) = &c.prof {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));

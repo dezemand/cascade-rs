@@ -31,6 +31,8 @@
 //! --j2534-mock (any OS) runs the same message-level path against --sim or
 //! --sim-ecu. `kdiag j2534-list` shows installed drivers (Windows).
 //!
+//! --ecusim SOCKET|auto talks to `ecusim serve` (the ECU dump running in
+//! real time as its own process; `auto` = its default socket), in wall time.
 //! --sim-ecu ROM runs the engine ECU's own code instead (a SIMK41 dump, in the
 //! `ecuc167` emulator, virtual time; engine only). Sensors read mid-scale.
 //! `log` writes one CSV row per `21 01` response: time, decoded values from
@@ -101,6 +103,8 @@ struct Opts {
     system: System,
     allow_clear: bool,
     yes: bool,
+    /// Socket of an `ecusim` server (the ECU dump as its own process).
+    ecusim: Option<String>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -119,6 +123,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         system: System::Engine,
         allow_clear: false,
         yes: false,
+        ecusim: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -131,6 +136,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--sim" => o.sim = true,
             "--j2534" => o.j2534 = Some(val()?),
             "--j2534-mock" => o.j2534_mock = true,
+            "--ecusim" => o.ecusim = Some(val()?),
             "--sim-ecu" => {
                 o.sim_ecu = Some(val()?);
                 o.sim = true;
@@ -162,9 +168,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             _ => return Err(format!("unexpected argument {a:?}")),
         }
     }
-    let sources = o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8;
+    let sources =
+        o.sim as u8 + o.port.is_some() as u8 + o.j2534.is_some() as u8 + o.ecusim.is_some() as u8;
     if sources != 1 {
-        return Err("give exactly one of --sim, --port DEV or --j2534 DLL|auto".into());
+        return Err(
+            "give exactly one of --sim, --port DEV, --ecusim SOCKET|auto or --j2534 DLL|auto"
+                .into(),
+        );
     }
     if o.system == System::Tcs && (o.j2534.is_some() || o.j2534_mock) {
         return Err("traction control (ISO 9141-2, 5-baud init) is not done over J2534 yet".into());
@@ -436,6 +446,8 @@ fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
             }
             None => Box::new(SimLine::new(KwpEcu::new(sim_config(o.system)))),
         }
+    } else if let Some(sock) = &o.ecusim {
+        open_ecusim(sock)?
     } else {
         open_serial(o)?
     };
@@ -446,6 +458,23 @@ fn open_line(o: &Opts) -> Result<Box<dyn Line>, String> {
         )),
         None => line,
     })
+}
+
+#[cfg(all(feature = "serial", unix))]
+fn open_ecusim(sock: &str) -> Result<Box<dyn Line>, String> {
+    let path = if sock == "auto" {
+        ecusim::default_socket()
+    } else {
+        sock.into()
+    };
+    let l = cascade_diag::ecusim_line::EcusimLine::connect(&path)
+        .map_err(|e| format!("{}: {e} (is `ecusim serve` running?)", path.display()))?;
+    Ok(Box::new(l))
+}
+
+#[cfg(not(all(feature = "serial", unix)))]
+fn open_ecusim(_sock: &str) -> Result<Box<dyn Line>, String> {
+    Err("--ecusim needs a Unix build with the `serial` feature".into())
 }
 
 #[cfg(all(feature = "serial", unix))]
@@ -742,7 +771,7 @@ fn main() -> ExitCode {
             [flag, dev] if flag == "--port" => selftest(dev),
             _ => Err("usage: kdiag selftest --port DEV".into()),
         },
-        _ => Err("usage: kdiag dtc|log|clear|ident|crash|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
+        _ => Err("usage: kdiag dtc|log|clear|ident|crash|selftest|j2534-list (--sim [--sim-ecu ROM] [--j2534-mock] | --port DEV | --ecusim SOCKET|auto | --j2534 DLL|auto) [--system engine|abs|srs|tcs] [--out F] \
                   [--trace F.jsonl] [--interval-ms N] [--duration-s N] [--no-echo] [--wake break|zero]"
             .into()),
     };
