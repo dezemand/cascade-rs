@@ -56,17 +56,44 @@ const WARN: u32 = 0xf87171;
 /// The app's chrome (side panel, live data) follows the platform; the
 /// handset keeps its own colours above.
 use cascade_theme::{self as ui, Palette};
+use gpui_kit::component::input::{Input, InputEvent};
 
 /// What each diagnostic line is, for people: name and one line.
 const LINE_INFO: [(&str, &str); 7] = [
-    ("Canned responder", "Upstream CASCADE's fixed replies"),
-    ("Engine ECU model", "KWP2000 model with warm-idle values"),
-    ("Engine ECU dump", "The ECU's own code, emulated"),
-    ("Nothing", "An open line: nothing answers"),
+    ("Test replies", "Upstream CASCADE's fixed replies"),
+    (
+        "Built-in engine model",
+        "KWP2000 model with warm-idle values",
+    ),
+    ("Engine ECU dump", "The ECU's own code, emulated here"),
+    ("Nothing connected", "An open line: nothing answers"),
     ("Car, via adapter", "A serial K-line adapter on a real car"),
     ("Recorded session", "Answers from a kdiag trace"),
-    ("Simulated car", "The ecusim process (EcuSim)"),
+    ("EcuSim", "The whole simulated car, in the EcuSim app"),
 ];
+
+/// What the Hi-Scan is connected to, as the Connection tab groups it;
+/// each group holds one or more of the lines above (by index).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineGroup {
+    Car,
+    Simulated,
+    Recording,
+    None,
+}
+
+/// Lines in each group, in the order they are offered.
+const SIMULATED: [usize; 3] = [PROCESS, ECU, 1];
+const NO_CAR: [usize; 2] = [3, 0];
+
+fn group_of(i: usize) -> LineGroup {
+    match i {
+        ADAPTER => LineGroup::Car,
+        REPLAY => LineGroup::Recording,
+        i if SIMULATED.contains(&i) => LineGroup::Simulated,
+        _ => LineGroup::None,
+    }
+}
 
 /// The side panel's tabs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,9 +173,8 @@ const REPLAY: usize = 5;
 const PROCESS: usize = 6;
 
 /// The line to an `ecusim` server (connected inside the emulator thread).
-fn process_iface() -> IfaceKind {
-    let sock = ecusim::default_socket();
-    let label = "ECU process (ecusim)".to_string();
+fn process_iface(sock: std::path::PathBuf) -> IfaceKind {
+    let label = format!("EcuSim ({})", ecusim::endpoint_label(&sock));
     // waits for (and survives restarts of) the server, like a cable that
     // gets plugged in later
     let make: cascade_runner::IfaceFactory = std::sync::Arc::new(move || {
@@ -337,10 +363,24 @@ struct CascadeView {
     live_port: Option<String>,
     /// Extended ROM (troubleshooting pack) behind the main pack, if any.
     exrom_name: Option<String>,
+    /// The Connection tab's choices, applied with Connect: line, adapter
+    /// port and echo, EcuSim endpoint (text field), and a counter of files
+    /// loaded (ECU dump, trace) to notice a new file.
+    draft_line: usize,
+    draft_port: Option<String>,
+    draft_echo: bool,
+    endpoint: Entity<gpui_kit::component::input::InputState>,
+    applied_endpoint: String,
+    files_gen: u64,
+    applied_files_gen: u64,
+    /// The line last chosen in the Simulated and None groups.
+    sim_choice: usize,
+    none_choice: usize,
     /// The side panel is shown, and which of its tabs.
     sidebar: bool,
     tab: SideTab,
     _appearance: Subscription,
+    _endpoint_subs: Vec<Subscription>,
     _refresh: Task<()>,
 }
 
@@ -415,6 +455,7 @@ impl CascadeView {
             }
         });
         let snap = runner.snapshot();
+        let mut endpoint_subs: Vec<Subscription> = Vec::new();
         Self {
             runner,
             snap,
@@ -428,6 +469,28 @@ impl CascadeView {
             } else {
                 0
             },
+            draft_line: if replay.is_some() || replay_err.is_some() {
+                REPLAY
+            } else if ecu_first {
+                ECU
+            } else {
+                0
+            },
+            draft_port: None,
+            draft_echo: true,
+            endpoint: {
+                let default = ecusim::default_socket().display().to_string();
+                let e = cx.new(|cx| {
+                    gpui_kit::component::input::InputState::new(window, cx)
+                        .placeholder("/path/to/socket or host:port")
+                        .default_value(default)
+                });
+                endpoint_subs.push(cx.subscribe(&e, |_, _, _: &InputEvent, cx| cx.notify()));
+                e
+            },
+            applied_endpoint: ecusim::default_socket().display().to_string(),
+            files_gen: 0,
+            applied_files_gen: 0,
             ports: Vec::new(),
             port: None,
             adapter_echo: true,
@@ -440,8 +503,16 @@ impl CascadeView {
             live_snap: live::LiveSnap::default(),
             live_port: None,
             exrom_name,
+            // the EcuSim process if one is running, else the built-in model
+            sim_choice: if ecusim::default_socket().exists() {
+                PROCESS
+            } else {
+                1
+            },
+            none_choice: 0,
             sidebar: true,
             tab: SideTab::Connection,
+            _endpoint_subs: endpoint_subs,
             _appearance: cx.observe_window_appearance(window, |_, window, cx| {
                 gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
                 cx.notify();
@@ -475,20 +546,74 @@ impl CascadeView {
                 Some(l) => IfaceKind::Kwp(l.config.clone()),
                 None => IfaceKind::Null,
             },
-            (PROCESS, _) => process_iface(),
+            (PROCESS, _) => match ecusim::Endpoint::parse(&self.applied_endpoint) {
+                Ok(ecusim::Endpoint::Unix(path)) => process_iface(path),
+                // TCP is not built yet (and Connect refuses it)
+                _ => IfaceKind::Null,
+            },
             (i, _) => iface_kind(i),
         }
     }
 
-    /// Switch to an adapter port: power-cycle onto it at real time (a real
-    /// line has real-time partners).
-    fn use_port(&mut self, port: String) {
-        self.port = Some(port);
-        self.runner.send(Command::Speed(Speed::Real(1.0)));
-        self.runner.send(Command::Restart(self.current_iface()));
+    /// Whether the Connection tab differs from the line in use.
+    fn pending(&self, cx: &App) -> bool {
+        let endpoint = self.endpoint.read(cx).value();
+        self.draft_line != self.iface_choice
+            || (self.draft_line == ADAPTER
+                && (self.draft_port != self.port || self.draft_echo != self.adapter_echo))
+            || (self.draft_line == PROCESS && endpoint.trim() != self.applied_endpoint)
+            || (matches!(self.draft_line, ECU | REPLAY) && self.files_gen != self.applied_files_gen)
     }
 
-    /// Ask for a `kdiag --trace` file and power-cycle onto it.
+    /// Why Connect cannot apply the draft, if it cannot.
+    fn blocked(&self, cx: &App) -> Option<String> {
+        match self.draft_line {
+            ADAPTER if self.draft_port.is_none() => Some("Choose a port.".into()),
+            ECU if self.ecu.is_none() => Some("Open an ECU dump first.".into()),
+            REPLAY if self.replay.is_none() => Some("Open a kdiag trace first.".into()),
+            PROCESS => match ecusim::Endpoint::parse(&self.endpoint.read(cx).value()) {
+                Ok(ecusim::Endpoint::Unix(_)) => None,
+                Ok(e @ ecusim::Endpoint::Tcp { .. }) => Some(format!(
+                    "{} is TCP, which EcuSim does not offer yet.",
+                    e.label()
+                )),
+                Err(e) => Some(e),
+            },
+            _ => None,
+        }
+    }
+
+    /// Apply the Connection tab: power-cycle the handset onto that line.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.blocked(cx).is_some() {
+            return;
+        }
+        self.iface_choice = self.draft_line;
+        self.port = self.draft_port.clone();
+        self.adapter_echo = self.draft_echo;
+        self.applied_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        self.applied_files_gen = self.files_gen;
+        // a real car and EcuSim are real-time partners
+        if matches!(self.iface_choice, ADAPTER | PROCESS) {
+            self.runner.send(Command::Speed(Speed::Real(1.0)));
+        }
+        self.runner.send(Command::Restart(self.current_iface()));
+        cx.notify();
+    }
+
+    /// Put the Connection tab back to the line in use.
+    fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_line = self.iface_choice;
+        self.draft_port = self.port.clone();
+        self.draft_echo = self.adapter_echo;
+        let applied = self.applied_endpoint.clone();
+        self.endpoint
+            .update(cx, |e, cx| e.set_value(applied, window, cx));
+        self.applied_files_gen = self.files_gen;
+        cx.notify();
+    }
+
+    /// Ask for a `kdiag --trace` file (used once Connect applies it).
     fn open_trace(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -506,7 +631,7 @@ impl CascadeView {
                         Ok(l) => {
                             v.replay = Some(l);
                             v.replay_err = None;
-                            v.runner.send(Command::Restart(v.current_iface()));
+                            v.files_gen += 1;
                         }
                         Err(e) => v.replay_err = Some(format!("{}: {e}", p.display())),
                     }
@@ -517,7 +642,7 @@ impl CascadeView {
         .detach();
     }
 
-    /// Ask for an engine ECU dump and power-cycle onto it.
+    /// Ask for an engine ECU dump (used once Connect applies it).
     fn open_ecu(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -535,7 +660,7 @@ impl CascadeView {
                         Ok(r) => {
                             v.ecu = Some(r);
                             v.ecu_err = None;
-                            v.runner.send(Command::Restart(v.current_iface()));
+                            v.files_gen += 1;
                         }
                         Err(e) => v.ecu_err = Some(format!("{}: {e}", p.display())),
                     }
@@ -936,34 +1061,20 @@ impl CascadeView {
         let ports = self.ports.iter().enumerate().fold(
             div().flex().flex_col().gap(px(2.)),
             |d, (i, port)| {
-                let selected = self.port.as_deref() == Some(port.as_str());
+                let selected = self.draft_port.as_deref() == Some(port.as_str());
                 let name = port.trim_start_matches("/dev/cu.").to_string();
                 let path = port.clone();
                 d.child(
-                    div()
-                        .id(("port", i))
-                        .px(px(8.))
-                        .py(px(3.))
-                        .rounded(px(ui::RADIUS))
-                        .text_size(px(ui::BODY))
-                        .cursor_pointer()
-                        .map(|d| {
-                            if selected {
-                                d.bg(rgb(p.accent)).text_color(rgb(p.on_accent))
-                            } else {
-                                d.text_color(rgb(p.label))
-                                    .hover(move |s| s.bg(rgb(p.fill_hover)))
-                            }
-                        })
-                        .child(name)
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            v.use_port(path.clone());
+                    ui::radio(p, ("port", i), name, None, selected).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.draft_port = Some(path.clone());
                             cx.notify();
-                        })),
+                        },
+                    )),
                 )
             },
         );
-        let echo = self.adapter_echo;
+        let echo = self.draft_echo;
         div()
             .flex()
             .flex_col()
@@ -976,7 +1087,16 @@ impl CascadeView {
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(6.))
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        ui::checkbox(p, "echo", "Adapter echoes its bytes", echo).on_click(
+                            cx.listener(move |v, _, _, cx| {
+                                v.draft_echo = !echo;
+                                cx.notify();
+                            }),
+                        ),
+                    )
                     .child(
                         ui::button(p, "rescan", Some(IconName::RefreshCw), "Rescan").on_click(
                             cx.listener(|v, _, _, cx| {
@@ -984,16 +1104,6 @@ impl CascadeView {
                                 cx.notify();
                             }),
                         ),
-                    )
-                    .child(
-                        ui::button(p, "echo", None, if echo { "Echo on" } else { "Echo off" })
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                v.adapter_echo = !echo;
-                                if let Some(port) = v.port.clone() {
-                                    v.use_port(port);
-                                }
-                                cx.notify();
-                            })),
                     ),
             )
             .child(ui::note(
@@ -1214,29 +1324,54 @@ impl CascadeView {
     }
 
     /// Choose diagnostic line `i`.
+    /// EcuSim's endpoint: a path (Unix socket) or host:port (TCP), and
+    /// whether something listens there.
+    fn endpoint_field(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let text = self.endpoint.read(cx).value();
+        let (dot, note) = match ecusim::Endpoint::parse(&text) {
+            Ok(ecusim::Endpoint::Unix(path)) if path.exists() => {
+                (p.green, "Unix socket · EcuSim is listening".to_string())
+            }
+            Ok(ecusim::Endpoint::Unix(_)) => (
+                p.tertiary,
+                "Unix socket · nothing there yet; the line connects when EcuSim starts".to_string(),
+            ),
+            Ok(ecusim::Endpoint::Tcp { .. }) => {
+                (p.tertiary, "TCP · not offered by EcuSim yet".to_string())
+            }
+            Err(e) => (p.red, e),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(Input::new(&self.endpoint).font_family(ui::mono()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .size(px(6.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(dot)),
+                    )
+                    .child(ui::note(p, note)),
+            )
+    }
+
+    /// Choose line `i` in the Connection tab (Connect applies it).
     fn choose_line(&mut self, i: usize, cx: &mut Context<Self>) {
-        self.iface_choice = i;
-        if i == ADAPTER {
-            // pick a port first; nothing changes until then
-            self.ports = cascade_diag::serial::list_ports();
-        } else if i == ECU {
-            if self.ecu.is_some() {
-                self.runner.send(Command::Restart(self.current_iface()));
-            } else {
-                self.open_ecu(cx);
-            }
-        } else if i == PROCESS {
-            // a real-time partner: run at real time
-            self.runner.send(Command::Speed(Speed::Real(1.0)));
-            self.runner.send(Command::Restart(self.current_iface()));
-        } else if i == REPLAY {
-            if self.replay.is_some() {
-                self.runner.send(Command::Restart(self.current_iface()));
-            } else {
-                self.open_trace(cx);
-            }
-        } else {
-            self.runner.send(Command::Restart(iface_kind(i)));
+        self.draft_line = i;
+        match group_of(i) {
+            LineGroup::Simulated => self.sim_choice = i,
+            LineGroup::None => self.none_choice = i,
+            LineGroup::Car => self.ports = cascade_diag::serial::list_ports(),
+            LineGroup::Recording => {}
         }
         cx.notify();
     }
@@ -1244,48 +1379,92 @@ impl CascadeView {
     /// Connection tab: the lines to choose from, and the chosen line's own
     /// controls.
     fn connection(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let list = LINE_INFO.iter().enumerate().fold(
-            div().flex().flex_col().gap(px(1.)),
-            |d, (i, (n, w))| {
-                let on = i == self.iface_choice;
-                d.child(
-                    div()
-                        .id(("line", i))
-                        .flex()
-                        .flex_col()
-                        .px(px(8.))
-                        .py(px(4.))
-                        .rounded(px(ui::RADIUS))
-                        .cursor_pointer()
-                        .map(|d| {
-                            if on {
-                                d.bg(rgb(p.accent))
-                            } else {
-                                d.hover(move |s| s.bg(rgb(p.fill_hover)))
-                            }
-                        })
-                        .child(
-                            div()
-                                .text_size(px(ui::BODY))
-                                .text_color(rgb(if on { p.on_accent } else { p.label }))
-                                .child(*n),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(ui::SMALL))
-                                .text_color(rgb(if on { p.on_accent } else { p.secondary }))
-                                .child(*w),
-                        )
-                        .on_click(cx.listener(move |v, _, _, cx| v.choose_line(i, cx))),
-                )
-            },
-        );
-        let detail: Option<Div> = match self.iface_choice {
-            ADAPTER => Some(self.adapter_panel(p, cx)),
-            ECU => Some(self.ecu_panel(p, cx)),
-            REPLAY => Some(self.replay_panel(p, cx)),
-            _ => None,
+        let group = group_of(self.draft_line);
+        let picker = [
+            (LineGroup::Car, "Car"),
+            (LineGroup::Simulated, "Simulated"),
+            (LineGroup::Recording, "Recording"),
+            (LineGroup::None, "None"),
+        ]
+        .into_iter()
+        .fold(ui::segmented(p), |d, (g, name)| {
+            d.child(ui::segment(p, name, name, group == g).on_click(cx.listener(
+                move |v, _, _, cx| {
+                    if group_of(v.draft_line) == g {
+                        return;
+                    }
+                    let i = match g {
+                        LineGroup::Car => ADAPTER,
+                        LineGroup::Simulated => v.sim_choice,
+                        LineGroup::Recording => REPLAY,
+                        LineGroup::None => v.none_choice,
+                    };
+                    v.choose_line(i, cx);
+                },
+            )))
+        });
+        // the choices within a group, with the chosen one's own options
+        // right under it
+        let variants = |lines: &[usize], cx: &mut Context<Self>| {
+            lines
+                .iter()
+                .fold(div().flex().flex_col().gap(px(6.)), |d, &i| {
+                    let (name, what) = LINE_INFO[i];
+                    let on = self.draft_line == i;
+                    d.child(
+                        ui::radio(p, ("line", i), name, Some(what.into()), on)
+                            .on_click(cx.listener(move |v, _, _, cx| v.choose_line(i, cx))),
+                    )
+                    .when(on && i == ECU, |d| {
+                        d.child(self.ecu_panel(p, cx).pl(px(21.)))
+                    })
+                    .when(on && i == PROCESS, |d| {
+                        d.child(self.endpoint_field(p, cx).pl(px(21.)))
+                    })
+                })
         };
+        let options: Div = match group {
+            LineGroup::Car => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(ui::note(p, LINE_INFO[ADAPTER].1))
+                .child(self.adapter_panel(p, cx)),
+            LineGroup::Simulated => variants(&SIMULATED, cx),
+            LineGroup::Recording => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(ui::note(p, LINE_INFO[REPLAY].1))
+                .child(self.replay_panel(p, cx)),
+            LineGroup::None => variants(&NO_CAR, cx),
+        };
+        // nothing changes until Connect
+        let pending = self.pending(cx);
+        let blocked = self.blocked(cx);
+        let actions = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .when_some(blocked.clone().filter(|_| pending), |d, why| {
+                d.child(ui::note(p, why))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(6.))
+                    .child(
+                        ui::button(p, "line-revert", None, "Revert")
+                            .on_click(cx.listener(|v, _, window, cx| v.revert(window, cx))),
+                    )
+                    .child(
+                        ui::default_button(p, "line-connect", None, "Connect")
+                            .when(blocked.is_some(), |d| d.opacity(0.4))
+                            .on_click(cx.listener(|v, _, _, cx| v.connect(cx))),
+                    ),
+            );
         let snap = &self.snap;
         let pins = (1..=16).fold(div().flex().flex_row().flex_wrap().gap(px(3.)), |d, pin| {
             let on = snap.line == pin;
@@ -1361,15 +1540,12 @@ impl CascadeView {
             .flex()
             .flex_col()
             .gap(px(10.))
-            .child(ui::header(p, "Diagnostic Line"))
-            .child(list)
+            .child(ui::header(p, "Connected To"))
+            .child(picker)
+            .child(options)
+            .when(pending, |d| d.child(actions))
             .child(div().h(px(1.)).bg(rgb(p.separator)))
             .child(status)
-            .when_some(detail, |d, x| {
-                d.child(div().h(px(1.)).bg(rgb(p.separator)))
-                    .child(ui::header(p, LINE_INFO[self.iface_choice].0))
-                    .child(x)
-            })
     }
 
     /// Emulator tab: run, reset, speed.

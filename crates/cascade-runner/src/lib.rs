@@ -479,6 +479,10 @@ impl Emu {
                 self.cpu.eeprom.mem = eeprom;
                 self.log = log;
                 self.total_cycles = 0;
+                // measured from the old count, these would underflow
+                self.ratio_cycles = 0;
+                self.ratio_wall = Instant::now();
+                self.act = Activity::default();
                 self.log_read = 0;
                 self.iface_label = match &error {
                     Some(_) => format!("{} (failed to open)", iface.label()),

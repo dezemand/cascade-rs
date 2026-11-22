@@ -336,3 +336,52 @@ pub fn checkbox(
         )
         .child(text.into())
 }
+
+/// A radio button with a label and an optional line of detail under it.
+pub fn radio(
+    p: Palette,
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    detail: Option<SharedString>,
+    selected: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(7.))
+        .py(px(2.))
+        .cursor_pointer()
+        .child(
+            div()
+                .mt(px(2.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(14.))
+                .rounded_full()
+                .map(|d| {
+                    if selected {
+                        d.bg(rgb(p.accent))
+                            .child(div().size(px(5.)).rounded_full().bg(rgb(p.on_accent)))
+                    } else {
+                        d.bg(rgb(p.fill)).border_1().border_color(rgb(p.tertiary))
+                    }
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .text_size(px(BODY))
+                        .text_color(rgb(p.label))
+                        .child(text.into()),
+                )
+                .when_some(detail, |d, t| d.child(note(p, t))),
+        )
+}

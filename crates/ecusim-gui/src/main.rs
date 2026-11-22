@@ -717,9 +717,11 @@ impl Panel {
                             )),
                     ),
             )
-            .child(div().text_color(rgb(p.secondary)).child(format!(
-                "Testers connected: {} · time ×{}",
+            .child(div().truncate().text_color(rgb(p.secondary)).child(format!(
+                "{} · {} tester{} · time ×{}",
+                ecusim::endpoint_label(&self.socket),
                 self.get("testers"),
+                if self.get("testers") == "1" { "" } else { "s" },
                 self.get("time")
             )))
             .when_some(self.last_error.clone(), |d, e| {
@@ -1107,10 +1109,34 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
+                    .child(caption("Connection"))
+                    .child(
+                        div()
+                            .font_family(ui::mono())
+                            .text_size(px(ui::SMALL))
+                            .text_color(rgb(pal().label))
+                            .child(ecusim::endpoint_label(&self.socket)),
+                    )
+                    .child(caption(self.socket.display().to_string()))
+                    .child(caption(format!(
+                        "{} · testers connected: {}",
+                        if self.conn.is_some() {
+                            "connected"
+                        } else {
+                            "not connected"
+                        },
+                        self.get("testers")
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
                     .child(caption("Testers"))
                     .child(caption(
-                        "Connect with the Hi-Scan GUI (line \"Simulated car\"), \
-                         kdiag --ecusim auto, or kdiag elm --ecusim auto.",
+                        "Cascade: Connected To → Simulated → EcuSim. kdiag: --ecusim auto \
+                         (this socket) or --ecusim PATH; kdiag elm --ecusim auto for OBD apps.",
                     ))
                     .child(caption(format!("ADC {}", self.get("adc")))),
             )
@@ -1488,8 +1514,16 @@ impl Render for Setup {
                     .items_center()
                     .justify_between()
                     .child(
-                        ghost("connect", "Connect to a running ecusim")
-                            .on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                ghost("connect", "Connect to a running ecusim")
+                                    .on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))),
+                            )
+                            .child(caption(ecusim::endpoint_label(&self.socket))),
                     )
                     .child(start),
             )
