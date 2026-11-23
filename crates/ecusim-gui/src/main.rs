@@ -56,6 +56,15 @@ fn use_palette(window: &Window, cx: &mut App) {
     t.tokens.slider_thumb = Hsla::from(rgb(0xffffff)).into();
 }
 
+/// Re-render `window` (and re-sync gpui-kit's theme) when the system
+/// switches between light and dark.
+fn follow_appearance<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Subscription {
+    cx.observe_window_appearance(window, |_, window, cx| {
+        gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
+        cx.notify();
+    })
+}
+
 /// A slider bound to one control.
 struct Control {
     name: &'static str,
@@ -79,7 +88,7 @@ struct Panel {
 }
 
 impl Panel {
-    fn new(socket: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(socket: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // name, label, unit, min, max, step, default, decimals
         #[allow(clippy::type_complexity)]
         let specs: [(&str, &str, &str, f32, f32, f32, f32, usize); 6] = [
@@ -91,7 +100,7 @@ impl Panel {
             ("idle", "Idle speed", "rpm", 600., 1200., 10., 800., 0),
         ];
         let mut controls = Vec::new();
-        let mut subs = Vec::new();
+        let mut subs = vec![follow_appearance(window, cx)];
         for (name, label, unit, min, max, step, val, decimals) in specs {
             let state = cx.new(|_| {
                 SliderState::new()
@@ -1232,8 +1241,8 @@ fn open_panel(socket: PathBuf, cx: &mut App) {
         }),
         ..Default::default()
     };
-    gpui_kit::open_window(opts, cx, move |_, cx| {
-        cx.new(|cx| Panel::new(socket.clone(), cx))
+    gpui_kit::open_window(opts, cx, move |window, cx| {
+        cx.new(|cx| Panel::new(socket.clone(), window, cx))
     })
     .expect("failed to open window");
 }
@@ -1248,10 +1257,11 @@ struct Setup {
     server: Server,
     error: Option<String>,
     busy: bool,
+    _appearance: Subscription,
 }
 
 impl Setup {
-    fn new(socket: PathBuf, server: Server) -> Self {
+    fn new(socket: PathBuf, server: Server, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = ecusim::settings::Settings::load("ecusim-gui");
         let dump = settings.recent("rom").into_iter().next();
         Self {
@@ -1261,6 +1271,7 @@ impl Setup {
             server,
             error: None,
             busy: false,
+            _appearance: follow_appearance(window, cx),
         }
     }
 
@@ -1573,8 +1584,8 @@ fn main() {
                     ..Default::default()
                 };
                 let (socket, server) = (socket.clone(), server.clone());
-                gpui_kit::open_window(opts, cx, move |_, cx| {
-                    cx.new(|_| Setup::new(socket.clone(), server.clone()))
+                gpui_kit::open_window(opts, cx, move |window, cx| {
+                    cx.new(|cx| Setup::new(socket.clone(), server.clone(), window, cx))
                 })
                 .expect("failed to open window");
             } else {

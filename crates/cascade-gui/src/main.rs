@@ -1682,16 +1682,44 @@ impl CascadeView {
 
     /// Always at the foot of the side panel: is it running, how fast, on
     /// which line.
-    fn status(&self, p: Palette) -> Div {
-        let s = &self.snap;
-        let secs = s.total_cycles as f64 / 10_000_000.0;
-        let (state, dot) = if s.stopped.is_some() {
+    /// The emulator's run state and the colour of its dot.
+    fn run_state(&self, p: Palette) -> (&'static str, u32) {
+        if self.snap.stopped.is_some() {
             ("Stopped", p.red)
-        } else if s.paused {
+        } else if self.snap.paused {
             ("Paused", p.tertiary)
         } else {
             ("Running", p.green)
-        };
+        }
+    }
+
+    /// One-line run state for the toolbar while the sidebar (and its status
+    /// footer) is hidden.
+    fn state_badge(&self, p: Palette) -> Div {
+        let (state, dot) = self.run_state(p);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .min_w(px(0.))
+            .text_size(px(ui::SMALL))
+            .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(dot)))
+            .child(
+                div()
+                    .truncate()
+                    .text_color(rgb(p.secondary))
+                    .child(match &self.snap.stopped {
+                        Some(why) => format!("Stopped: {why}"),
+                        None => state.to_string(),
+                    }),
+            )
+    }
+
+    fn status(&self, p: Palette) -> Div {
+        let s = &self.snap;
+        let secs = s.total_cycles as f64 / 10_000_000.0;
+        let (state, dot) = self.run_state(p);
         div()
             .flex()
             .flex_col()
@@ -1841,12 +1869,23 @@ impl CascadeView {
                     ),
             )
             .child(
-                ui::button(p, "sidebar", Some(IconName::PanelRight), "")
-                    .when(self.sidebar, |d| d.bg(rgb(p.selected)))
-                    .on_click(cx.listener(|v, _, _, cx| {
-                        v.sidebar = !v.sidebar;
-                        cx.notify();
-                    })),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_w(px(0.))
+                    // the status footer is hidden with the sidebar
+                    .when(!self.sidebar, |d| d.child(self.state_badge(p)))
+                    .child(
+                        ui::button(p, "sidebar", Some(IconName::PanelRight), "")
+                            .flex_none()
+                            .when(self.sidebar, |d| d.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.sidebar = !v.sidebar;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }

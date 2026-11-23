@@ -192,8 +192,9 @@ pub fn note(p: Palette, text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// A plain push button; `icon` alone makes a square icon button.
-pub fn button(
+/// The shape and content shared by both button variants, without a hover
+/// style (GPUI allows one per element).
+fn base_button(
     p: Palette,
     id: impl Into<ElementId>,
     icon: Option<IconName>,
@@ -218,11 +219,20 @@ pub fn button(
         .text_size(px(BODY))
         .text_color(rgb(p.label))
         .cursor_pointer()
-        .hover(move |s| s.bg(rgb(p.fill_hover)))
         .when_some(icon, |d, i| {
             d.child(gpui_kit::component::Icon::new(i).size(px(14.)))
         })
         .when(!icon_only, |d| d.child(text))
+}
+
+/// A plain push button; `icon` alone makes a square icon button.
+pub fn button(
+    p: Palette,
+    id: impl Into<ElementId>,
+    icon: Option<IconName>,
+    text: impl Into<SharedString>,
+) -> Stateful<Div> {
+    base_button(p, id, icon, text).hover(move |s| s.bg(rgb(p.fill_hover)))
 }
 
 /// The default button of a view: the platform accent.
@@ -232,7 +242,7 @@ pub fn default_button(
     icon: Option<IconName>,
     text: impl Into<SharedString>,
 ) -> Stateful<Div> {
-    button(p, id, icon, text)
+    base_button(p, id, icon, text)
         .bg(rgb(p.accent))
         .border_color(rgb(p.accent))
         .text_color(rgb(p.on_accent))
