@@ -223,6 +223,7 @@ fn ecu_iface(r: &EcuRom) -> IfaceKind {
 }
 
 /// A loaded recording: file name, ECU configuration, one-line summary.
+#[derive(Clone)]
 struct Loaded {
     name: String,
     config: KwpConfig,
@@ -373,6 +374,10 @@ struct CascadeView {
     applied_endpoint: String,
     files_gen: u64,
     applied_files_gen: u64,
+    /// The dump and recording in use: `ecu` and `replay` above are the
+    /// Connection tab's (newly opened) ones until Connect applies them.
+    applied_ecu: Option<EcuRom>,
+    applied_replay: Option<Loaded>,
     /// The line last chosen in the Simulated and None groups.
     sim_choice: usize,
     none_choice: usize,
@@ -494,6 +499,8 @@ impl CascadeView {
             ports: Vec::new(),
             port: None,
             adapter_echo: true,
+            applied_replay: replay.clone(),
+            applied_ecu: ecu.clone(),
             replay,
             replay_err,
             ecu,
@@ -538,11 +545,11 @@ impl CascadeView {
         match (self.iface_choice, &self.port) {
             (ADAPTER, Some(p)) => adapter_iface(p.clone(), self.adapter_echo),
             (ADAPTER, None) => IfaceKind::Null,
-            (ECU, _) => match &self.ecu {
+            (ECU, _) => match &self.applied_ecu {
                 Some(r) => ecu_iface(r),
                 None => IfaceKind::Null,
             },
-            (REPLAY, _) => match &self.replay {
+            (REPLAY, _) => match &self.applied_replay {
                 Some(l) => IfaceKind::Kwp(l.config.clone()),
                 None => IfaceKind::Null,
             },
@@ -593,6 +600,8 @@ impl CascadeView {
         self.adapter_echo = self.draft_echo;
         self.applied_endpoint = self.endpoint.read(cx).value().trim().to_string();
         self.applied_files_gen = self.files_gen;
+        self.applied_ecu = self.ecu.clone();
+        self.applied_replay = self.replay.clone();
         // a real car and EcuSim are real-time partners
         if matches!(self.iface_choice, ADAPTER | PROCESS) {
             self.runner.send(Command::Speed(Speed::Real(1.0)));
@@ -609,6 +618,10 @@ impl CascadeView {
         let applied = self.applied_endpoint.clone();
         self.endpoint
             .update(cx, |e, cx| e.set_value(applied, window, cx));
+        self.ecu = self.applied_ecu.clone();
+        self.replay = self.applied_replay.clone();
+        self.ecu_err = None;
+        self.replay_err = None;
         self.applied_files_gen = self.files_gen;
         cx.notify();
     }

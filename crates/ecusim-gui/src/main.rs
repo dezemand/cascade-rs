@@ -1143,10 +1143,18 @@ impl Panel {
                     .flex_col()
                     .gap(px(4.))
                     .child(caption("Testers"))
-                    .child(caption(
-                        "Cascade: Connected To → Simulated → EcuSim. kdiag: --ecusim auto \
-                         (this socket) or --ecusim PATH; kdiag elm --ecusim auto for OBD apps.",
-                    ))
+                    .child(caption({
+                        // kdiag's `auto` is the default socket, not this one
+                        let arg = if self.socket == ecusim::default_socket() {
+                            "auto".to_string()
+                        } else {
+                            self.socket.display().to_string()
+                        };
+                        format!(
+                            "Cascade: Connected To → Simulated → EcuSim. kdiag: --ecusim {arg}; \
+                             kdiag elm --ecusim {arg} for OBD apps."
+                        )
+                    }))
                     .child(caption(format!("ADC {}", self.get("adc")))),
             )
     }
