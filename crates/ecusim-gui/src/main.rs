@@ -13,7 +13,7 @@
 //! Ignition, a hold-to-crank START button, throttle, temperatures, battery,
 //! road speed and idle speed go to the engine model; the panel shows what
 //! the model does and what the ECU reports about itself. Testers (the
-//! Hi-Scan GUI's "Process" line, `kdiag --ecusim auto`) connect to the same
+//! Hi-Scan GUI's "Simulated car" line, `kdiag --ecusim auto`) connect to the same
 //! socket.
 
 mod cli;
@@ -26,19 +26,44 @@ use std::time::Duration;
 use ecusim::client::Conn;
 use ecusim::plant::Fault;
 use ecusim::proto::{ToClient, ToServer};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-const BG: u32 = 0x0e0f11;
-const CARD: u32 = 0x17181b;
-const EDGE: u32 = 0x25272c;
-const TEXT: u32 = 0xe7e9ec;
-const DIM: u32 = 0x8a8f98;
-const ACCENT: u32 = 0xf5b82e;
-const ACCENT_TEXT: u32 = 0x1d1606;
-const OK: u32 = 0x4ade80;
-const WARN: u32 = 0xf87171;
+use cascade_theme::{self as ui, Palette};
+
+thread_local! {
+    /// The platform palette for the window being drawn (set at the start
+    /// of each `render`).
+    static PALETTE: std::cell::Cell<Palette> =
+        std::cell::Cell::new(Palette::of(WindowAppearance::Dark));
+}
+
+fn pal() -> Palette {
+    PALETTE.with(|p| p.get())
+}
+
+/// Use the palette for `window`'s appearance; gpui-kit's sliders follow it.
+fn use_palette(window: &Window, cx: &mut App) {
+    let p = Palette::of(window.appearance());
+    PALETTE.with(|c| c.set(p));
+    let t = gpui_kit::component::Theme::global_mut(cx);
+    let accent: Hsla = rgb(p.accent).into();
+    t.colors.slider_bar = accent;
+    t.colors.slider_thumb = rgb(0xffffff).into();
+    t.tokens.slider_bar = accent.into();
+    t.tokens.slider_thumb = Hsla::from(rgb(0xffffff)).into();
+}
+
+/// Re-render `window` (and re-sync gpui-kit's theme) when the system
+/// switches between light and dark.
+fn follow_appearance<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Subscription {
+    cx.observe_window_appearance(window, |_, window, cx| {
+        gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
+        cx.notify();
+    })
+}
 
 /// A slider bound to one control.
 struct Control {
@@ -57,11 +82,13 @@ struct Panel {
     controls: Vec<Control>,
     cranking: bool,
     tab: Tab,
+    /// The side panel (codes, faults, CAN, power) is shown.
+    sidebar: bool,
     _subs: Vec<Subscription>,
 }
 
 impl Panel {
-    fn new(socket: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(socket: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // name, label, unit, min, max, step, default, decimals
         #[allow(clippy::type_complexity)]
         let specs: [(&str, &str, &str, f32, f32, f32, f32, usize); 6] = [
@@ -73,7 +100,7 @@ impl Panel {
             ("idle", "Idle speed", "rpm", 600., 1200., 10., 800., 0),
         ];
         let mut controls = Vec::new();
-        let mut subs = Vec::new();
+        let mut subs = vec![follow_appearance(window, cx)];
         for (name, label, unit, min, max, step, val, decimals) in specs {
             let state = cx.new(|_| {
                 SliderState::new()
@@ -118,6 +145,7 @@ impl Panel {
             controls,
             cranking: false,
             tab: Tab::Codes,
+            sidebar: true,
             _subs: subs,
         }
     }
@@ -217,14 +245,18 @@ impl Panel {
                 .id(SharedString::from(id))
                 .px(px(10.))
                 .py(px(5.))
-                .rounded(px(6.))
+                .rounded(px(ui::RADIUS))
                 .border_1()
-                .border_color(rgb(if active { ACCENT } else { EDGE }))
-                .bg(rgb(CARD))
+                .border_color(rgb(if active {
+                    pal().accent
+                } else {
+                    pal().separator
+                }))
+                .bg(rgb(pal().panel))
                 .text_xs()
-                .text_color(rgb(if active { ACCENT } else { TEXT }))
+                .text_color(rgb(if active { pal().accent } else { pal().label }))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x1f2024)))
+                .hover(|s| s.bg(rgb(pal().fill_hover)))
                 .child(label)
         };
         let time = self.get("time").to_string();
@@ -232,7 +264,7 @@ impl Panel {
             div().flex().flex_row().gap(px(6.)).items_center().child(
                 div()
                     .text_xs()
-                    .text_color(rgb(DIM))
+                    .text_color(rgb(pal().secondary))
                     .w(px(70.))
                     .child("Time"),
             ),
@@ -264,7 +296,7 @@ impl Panel {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(DIM))
+                        .text_color(rgb(pal().secondary))
                         .w(px(70.))
                         .child("Snapshots"),
                 )
@@ -297,7 +329,7 @@ impl Panel {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(DIM))
+                    .text_color(rgb(pal().secondary))
                     .child("Fast-forward drops to 1× while a tester is connected."),
             )
     }
@@ -317,14 +349,17 @@ fn card() -> Div {
         .flex()
         .flex_col()
         .p(px(12.))
-        .rounded(px(10.))
-        .bg(rgb(CARD))
+        .rounded(px(7.))
+        .bg(rgb(pal().panel))
         .border_1()
-        .border_color(rgb(EDGE))
+        .border_color(rgb(pal().separator))
 }
 
 fn caption(text: impl Into<SharedString>) -> Div {
-    div().text_xs().text_color(rgb(DIM)).child(text.into())
+    div()
+        .text_xs()
+        .text_color(rgb(pal().secondary))
+        .child(text.into())
 }
 
 /// Entries of a comma list in the status ("none" and "–" are empty).
@@ -336,150 +371,165 @@ fn list(v: &str) -> Vec<String> {
 }
 
 impl Panel {
-    /// A compact reading: caption over value and unit.
-    fn gauge(&self, label: &'static str, value: String, unit: &'static str) -> Div {
-        card()
+    /// One reading: label over value and unit, no box.
+    fn reading(&self, label: &'static str, value: String, unit: &'static str) -> Div {
+        let p = pal();
+        div()
+            .flex()
+            .flex_col()
             .gap(px(2.))
-            .py(px(8.))
-            .min_w(px(96.))
-            .flex_1()
-            .child(caption(label))
+            .w(relative(1. / 3.))
+            .child(ui::note(p, label))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_baseline()
                     .gap(px(4.))
-                    .child(div().text_lg().text_color(rgb(TEXT)).child(value))
-                    .child(div().text_xs().text_color(rgb(DIM)).child(unit)),
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_family(ui::mono())
+                            .text_color(rgb(p.label))
+                            .child(value),
+                    )
+                    .child(ui::note(p, unit)),
             )
     }
 
-    fn top_bar(&self, cx: &mut Context<Self>) -> Div {
+    /// The car's controls and the side panel toggle, across the top.
+    fn toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let p = pal();
         let connected = self.conn.is_some() && !self.status.is_empty();
         let ign = self.get("ignition") == "on";
         let running = matches!(self.get("engine"), "running" | "cranking");
-        let btn = |id: &'static str| {
-            div()
-                .id(id)
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .h(px(44.))
-                .px(px(16.))
-                .rounded(px(8.))
-                .text_sm()
-                .cursor_pointer()
-        };
-        let key = btn("ignition")
-            .border_1()
-            .border_color(rgb(if ign { ACCENT } else { EDGE }))
-            .bg(rgb(CARD))
-            .text_color(rgb(if ign { ACCENT } else { TEXT }))
-            .hover(|s| s.bg(rgb(0x1f2024)))
-            .child(if ign { "IGNITION ON" } else { "IGNITION OFF" })
-            .on_click(cx.listener(move |v, _, _, cx| {
-                v.set("ignition", if ign { "off" } else { "on" });
+        let key = ui::button(
+            p,
+            "ignition",
+            None,
+            if ign { "Ignition On" } else { "Ignition Off" },
+        )
+        .when(ign, |d| {
+            d.bg(rgb(p.selected))
+                .text_color(rgb(p.accent))
+                .border_color(rgb(p.accent))
+        })
+        .on_click(cx.listener(move |v, _, _, cx| {
+            v.set("ignition", if ign { "off" } else { "on" });
+            if ign {
+                v.starter(false, cx);
+            }
+            cx.notify();
+        }));
+        let start = ui::default_button(
+            p,
+            "start",
+            None,
+            if self.cranking {
+                "Cranking…"
+            } else {
+                "Start"
+            },
+        )
+        .min_w(px(90.))
+        .when(!ign, |d| d.opacity(0.4))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |v, _, _, cx| {
                 if ign {
-                    v.starter(false, cx);
+                    v.starter(true, cx);
                 }
-                cx.notify();
-            }));
-        let start = btn("start")
-            .min_w(px(120.))
-            .bg(rgb(if self.cranking { 0xd99c17 } else { ACCENT }))
-            .text_color(rgb(ACCENT_TEXT))
-            .font_weight(FontWeight::SEMIBOLD)
-            .when(!ign, |d| d.opacity(0.4))
-            .child("START")
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::NORMAL)
-                    .child("hold to crank"),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |v, _, _, cx| {
-                    if ign {
-                        v.starter(true, cx);
-                    }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|v, _, _, cx| v.starter(false, cx)),
-            );
-        let stop = btn("stop")
-            .border_1()
-            .border_color(rgb(EDGE))
-            .bg(rgb(CARD))
-            .text_color(rgb(TEXT))
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|v, _, _, cx| v.starter(false, cx)),
+        );
+        let stop = ui::button(p, "stop", None, "Stop")
             .when(!running, |d| d.opacity(0.4))
-            .hover(|s| s.bg(rgb(0x1f2024)))
-            .child("STOP")
             .on_click(cx.listener(move |v, _, _, cx| {
                 if running {
                     v.set("engine", "stop");
                 }
                 cx.notify();
             }));
-        let model = if self.get("model") == "closed" {
-            "runs on the ECU's fuel and spark"
-        } else {
-            "open-loop engine model"
-        };
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
+            .gap(px(12.))
+            .h(px(52.))
+            .px(px(16.))
+            .bg(rgb(p.panel))
+            .border_b_1()
+            .border_color(rgb(p.separator))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .child(div().text_lg().text_color(rgb(TEXT)).child("GK 2.0 engine"))
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .text_size(px(ui::BODY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("GK 2.0 Engine"),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .child(div().size(px(7.)).rounded_full().bg(rgb(if connected {
-                                OK
+                            .gap(px(5.))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(if connected {
+                                p.green
                             } else {
-                                WARN
+                                p.red
                             })))
-                            .child(caption(if connected {
-                                format!(
-                                    "{} · ECU {} · {model}",
-                                    self.get("family").to_uppercase(),
-                                    self.get("ecu")
-                                )
-                            } else {
-                                "not connected to ecusim".to_string()
-                            })),
+                            .child(ui::note(
+                                p,
+                                if connected {
+                                    if self.get("model") == "closed" {
+                                        "Runs on the ECU's own fuel and spark"
+                                    } else {
+                                        "Open-loop engine model"
+                                    }
+                                } else {
+                                    "Not connected to ecusim"
+                                },
+                            )),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(8.))
+                    .items_center()
+                    .gap(px(6.))
                     .child(key)
                     .child(start)
-                    .child(stop),
+                    .child(stop)
+                    .child(div().w(px(8.)))
+                    .child(
+                        ui::button(p, "sidebar", Some(IconName::PanelRight), "")
+                            .when(self.sidebar, |d| d.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.sidebar = !v.sidebar;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 
-    fn gauges(&self) -> Div {
+    /// Engine speed large, the other readings below it.
+    fn readings(&self) -> Div {
+        let p = pal();
         let engine = self.get("engine").to_string();
-        let color = match engine.as_str() {
-            "running" => OK,
-            "cranking" => ACCENT,
-            _ => DIM,
+        let (state, color) = match engine.as_str() {
+            "running" => ("Running", p.green),
+            "cranking" => ("Cranking", p.accent),
+            "stalled" => ("Stalled", p.red),
+            _ => ("Off", p.tertiary),
         };
         let ecu_on = self.get("ecu") == "on";
         let ecu = |k: &str| {
@@ -489,178 +539,224 @@ impl Panel {
                 "–".into()
             }
         };
-        let speed = card()
-            .gap(px(2.))
-            .py(px(8.))
-            .min_w(px(170.))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .child(caption("ENGINE SPEED"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(color))
-                            .child(engine.to_uppercase()),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(rgb(TEXT))
-                            .child(self.get("rpm").to_string()),
-                    )
-                    .child(div().text_xs().text_color(rgb(DIM)).child("rpm")),
-            );
+        let rule = || div().h(px(1.)).bg(rgb(p.separator));
+        let lambda = self.get("model") == "closed" && engine == "running";
         div()
             .flex()
-            .flex_row()
-            .gap(px(8.))
-            .child(speed)
-            .child(self.gauge("Battery", self.get("battery").into(), "V"))
-            .child(self.gauge("MAP", self.get("map").into(), "kPa"))
-            .child(self.gauge("Front O2", self.get("o2_front").into(), "mV"))
-            .when(self.get("model") == "closed" && engine == "running", |d| {
-                d.child(self.gauge("Mixture λ", self.get("lambda").into(), ""))
-            })
-            .child(self.gauge("ECU coolant", ecu("ecu_coolant"), "°C"))
-            .child(self.gauge("ECU road speed", ecu("ecu_speed"), "km/h"))
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(ui::header(p, "Engine Speed"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_baseline()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_size(px(44.))
+                                            .font_family(ui::mono())
+                                            .child(self.get("rpm").to_string()),
+                                    )
+                                    .child(ui::note(p, "rpm")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .pb(px(10.))
+                            .child(div().size(px(8.)).rounded_full().bg(rgb(color)))
+                            .child(div().text_size(px(ui::BODY)).child(state)),
+                    ),
+            )
+            .child(rule())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_y(px(12.))
+                    .child(self.reading("Battery", self.get("battery").into(), "V"))
+                    .child(self.reading("Manifold pressure", self.get("map").into(), "kPa"))
+                    .child(self.reading("Front O2", self.get("o2_front").into(), "mV"))
+                    .when(lambda, |d| {
+                        d.child(self.reading("Mixture λ", self.get("lambda").into(), ""))
+                    })
+                    .child(self.reading("ECU coolant", ecu("ecu_coolant"), "°C"))
+                    .child(self.reading("ECU road speed", ecu("ecu_speed"), "km/h")),
+            )
     }
 
-    fn drive(&self, cx: &mut Context<Self>) -> Div {
-        let sliders = self
-            .controls
-            .iter()
-            .fold(div().flex().flex_col().gap(px(10.)), |d, c| {
+    /// The driver's and the environment's inputs, one row each.
+    fn controls_form(&self, cx: &mut Context<Self>) -> Div {
+        let p = pal();
+        self.controls.iter().fold(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(ui::header(p, "Controls")),
+            |d, c| {
                 let v = c.state.read(cx).value().start();
                 let unused = c.name == "speed" && self.get("speed_input") == "none";
                 d.child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap(px(3.))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(14.))
+                        .h(px(32.))
                         .child(
                             div()
-                                .flex()
-                                .flex_row()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(if unused { DIM } else { TEXT }))
-                                        .child(c.label),
-                                )
-                                .child(div().text_sm().text_color(rgb(DIM)).child(if unused {
+                                .w(px(110.))
+                                .text_size(px(ui::BODY))
+                                .text_color(rgb(if unused { p.tertiary } else { p.label }))
+                                .child(c.label),
+                        )
+                        .child(div().flex_1().child(Slider::new(&c.state).disabled(unused)))
+                        .child(
+                            div()
+                                .w(px(80.))
+                                .text_right()
+                                .font_family(ui::mono())
+                                .text_size(px(ui::BODY))
+                                .text_color(rgb(p.secondary))
+                                .child(if unused {
                                     "not read".to_string()
                                 } else {
                                     format!("{:.*} {}", c.decimals, v, c.unit)
-                                })),
-                        )
-                        .child(Slider::new(&c.state).disabled(unused)),
+                                }),
+                        ),
                 )
-            });
-        card()
-            .gap(px(12.))
-            .w(px(340.))
-            .flex_none()
-            .child(caption("DRIVE"))
-            .child(sliders)
+            },
+        )
     }
 
-    fn tabs(&self, cx: &mut Context<Self>) -> Div {
+    /// The side panel: tabs, their content, and a status footer.
+    fn side(&self, cx: &mut Context<Self>) -> Div {
+        let p = pal();
         let codes = list(self.get("dtcs"));
         let module_codes: usize = ["abs_dtcs", "tcs_dtcs", "srs_dtcs"]
             .iter()
             .map(|k| list(self.get(k)).len())
             .sum();
         let n_faults = list(self.get("faults")).len() + list(self.get("intermittent")).len();
-        let tab = |id: &'static str, label: String, t: Tab, active: Tab| {
-            let on = t == active;
-            div()
-                .id(id)
-                .px(px(12.))
-                .py(px(6.))
-                .rounded(px(6.))
-                .text_sm()
-                .text_color(rgb(if on { ACCENT } else { DIM }))
-                .when(on, |d| d.bg(rgb(0x1f2024)))
-                .cursor_pointer()
-                .hover(|s| s.text_color(rgb(TEXT)))
-                .child(label)
-        };
-        let count = |n: usize| {
+        let count = |name: &str, n: usize| {
             if n > 0 {
-                format!(" ({n})")
+                format!("{name} ({n})")
             } else {
-                String::new()
+                name.to_string()
             }
         };
-        let bar = div()
-            .flex()
-            .flex_row()
-            .gap(px(4.))
-            .child(
-                tab(
-                    "tab-codes",
-                    format!("Fault codes{}", count(codes.len() + module_codes)),
-                    Tab::Codes,
-                    self.tab,
-                )
-                .on_click(cx.listener(|v, _, _, cx| {
-                    v.tab = Tab::Codes;
-                    cx.notify();
-                })),
-            )
-            .child(
-                tab(
-                    "tab-faults",
-                    format!("Inject faults{}", count(n_faults)),
-                    Tab::Faults,
-                    self.tab,
-                )
-                .on_click(cx.listener(|v, _, _, cx| {
-                    v.tab = Tab::Faults;
-                    cx.notify();
-                })),
-            )
-            .child(
-                tab("tab-can", "CAN bus".into(), Tab::Can, self.tab).on_click(cx.listener(
-                    |v, _, _, cx| {
-                        v.tab = Tab::Can;
+        let tabs = [
+            (
+                Tab::Codes,
+                "tab-codes",
+                count("Codes", codes.len() + module_codes),
+            ),
+            (Tab::Faults, "tab-faults", count("Faults", n_faults)),
+            (Tab::Can, "tab-can", "CAN".to_string()),
+            (Tab::Power, "tab-power", "Power".to_string()),
+        ]
+        .into_iter()
+        .fold(ui::segmented(p), |d, (t, id, label)| {
+            d.child(
+                ui::segment(p, id, label, self.tab == t).on_click(cx.listener(
+                    move |v, _, _, cx| {
+                        v.tab = t;
                         cx.notify();
                     },
                 )),
             )
-            .child(
-                tab("tab-power", "Power & time".into(), Tab::Power, self.tab).on_click(
-                    cx.listener(|v, _, _, cx| {
-                        v.tab = Tab::Power;
-                        cx.notify();
-                    }),
-                ),
-            );
+        });
         let body = match self.tab {
             Tab::Codes => self.codes_view(),
             Tab::Faults => self.faults_view(cx),
             Tab::Can => self.can_view(),
             Tab::Power => self.power_view(cx),
         };
-        card().gap(px(12.)).flex_1().min_w(px(0.)).child(bar).child(
-            div()
-                .id("tab-body")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .child(body),
-        )
+        let ecu_on = self.get("ecu") == "on";
+        let status = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(14.))
+            .py(px(8.))
+            .border_t_1()
+            .border_color(rgb(p.separator))
+            .text_size(px(ui::SMALL))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(7.)).rounded_full().bg(rgb(if ecu_on {
+                        p.green
+                    } else {
+                        p.tertiary
+                    })))
+                    .child(div().text_color(rgb(p.label)).child(if ecu_on {
+                        "ECU on"
+                    } else {
+                        "ECU off"
+                    }))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(ui::mono())
+                            .text_color(rgb(p.secondary))
+                            .child(format!(
+                                "{} · {} s",
+                                self.get("family").to_uppercase(),
+                                self.get("ecu_s")
+                            )),
+                    ),
+            )
+            .child(div().truncate().text_color(rgb(p.secondary)).child(format!(
+                "{} · {} tester{} · time ×{}",
+                ecusim::endpoint_label(&self.socket),
+                self.get("testers"),
+                if self.get("testers") == "1" { "" } else { "s" },
+                self.get("time")
+            )))
+            .when_some(self.last_error.clone(), |d, e| {
+                d.child(div().truncate().text_color(rgb(p.red)).child(e))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .w(px(380.))
+            .h_full()
+            .bg(rgb(p.panel))
+            .border_l_1()
+            .border_color(rgb(p.separator))
+            .text_size(px(ui::BODY))
+            .child(div().p(px(10.)).child(tabs))
+            .child(
+                div()
+                    .id("side-body")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px(px(14.))
+                    .pb(px(14.))
+                    .child(body),
+            )
+            .child(status)
     }
 
     fn codes_view(&self) -> Div {
@@ -674,9 +770,9 @@ impl Panel {
                 .py(px(3.))
                 .child(
                     div()
-                        .font_family("Menlo")
+                        .font_family(ui::mono())
                         .text_sm()
-                        .text_color(rgb(if warn { WARN } else { TEXT }))
+                        .text_color(rgb(if warn { pal().red } else { pal().label }))
                         .child(code),
                 )
                 .child(caption(note))
@@ -699,7 +795,7 @@ impl Panel {
             if codes.is_empty() {
                 div()
                     .text_sm()
-                    .text_color(rgb(OK))
+                    .text_color(rgb(pal().green))
                     .child("No stored fault codes")
             } else {
                 codes
@@ -714,9 +810,9 @@ impl Panel {
             }
         };
         let source = if self.get("ecu_source") == "kline" {
-            "ENGINE ECU · read over its K-line while no tester is connected"
+            "Engine ECU · read over its K-line while no tester is connected"
         } else {
-            "ENGINE ECU · from its fault memory"
+            "Engine ECU · from its fault memory"
         };
         let modules = [
             ("abs_dtcs", "ABS"),
@@ -732,14 +828,17 @@ impl Panel {
                     .flex_row()
                     .justify_between()
                     .py(px(3.))
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(name))
+                    .child(div().text_sm().text_color(rgb(pal().label)).child(name))
                     .child(if codes.is_empty() {
-                        div().text_sm().text_color(rgb(OK)).child("no codes")
+                        div()
+                            .text_sm()
+                            .text_color(rgb(pal().green))
+                            .child("no codes")
                     } else {
                         div()
-                            .font_family("Menlo")
+                            .font_family(ui::mono())
                             .text_sm()
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(pal().label))
                             .child(codes.join("  ").replace(':', " "))
                     }),
             )
@@ -761,11 +860,11 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(caption("OTHER MODULES (models)"))
+                    .child(caption("Other modules (models)"))
                     .child(modules),
             )
             .child(caption(
-                "Read and erase them with the Hi-Scan (line \"Process\"; ERAS with key on, \
+                "Read and erase them with the Hi-Scan (line \"Simulated car\"; ERAS with key on, \
                  engine off) or kdiag --ecusim auto. Codes stay through key cycles.",
             ))
     }
@@ -793,7 +892,7 @@ impl Panel {
                     d.child(
                         div()
                             .id(SharedString::from(format!("fault-{}", f.name())))
-                            .w(relative(0.493))
+                            .w_full()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -801,21 +900,25 @@ impl Panel {
                             .gap(px(8.))
                             .px(px(10.))
                             .py(px(6.))
-                            .rounded(px(6.))
+                            .rounded(px(ui::RADIUS))
                             .border_1()
                             .border_color(rgb(if on {
-                                ACCENT
+                                pal().accent
                             } else if flicker {
-                                0x8a6d1f
+                                pal().tertiary
                             } else {
-                                EDGE
+                                pal().separator
                             }))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x1f2024)))
+                            .hover(|s| s.bg(rgb(pal().fill_hover)))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(if on || flicker { ACCENT } else { TEXT }))
+                                    .text_color(rgb(if on || flicker {
+                                        pal().accent
+                                    } else {
+                                        pal().label
+                                    }))
                                     .child(if flicker {
                                         format!("{} · intermittent", f.label())
                                     } else {
@@ -825,8 +928,8 @@ impl Panel {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_family("Menlo")
-                                    .text_color(rgb(DIM))
+                                    .font_family(ui::mono())
+                                    .text_color(rgb(pal().secondary))
                                     .child(code),
                             )
                             .on_click(cx.listener(move |v, _, _, cx| {
@@ -873,30 +976,23 @@ impl Panel {
                 Some((p.next()?.into(), p.next()?.into(), p.next()?.into()))
             })
             .collect();
+        // identifier and data, what the frame is underneath
         let row = |id: String, label: &'static str, data: String| {
             div()
                 .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(12.))
+                .flex_col()
                 .py(px(3.))
                 .child(
                     div()
-                        .w(px(36.))
-                        .font_family("Menlo")
+                        .flex()
+                        .flex_row()
+                        .gap(px(12.))
+                        .font_family(ui::mono())
                         .text_sm()
-                        .text_color(rgb(ACCENT))
-                        .child(id),
+                        .child(div().w(px(36.)).text_color(rgb(pal().accent)).child(id))
+                        .child(div().text_color(rgb(pal().label)).child(data)),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .font_family("Menlo")
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .child(data),
-                )
-                .child(caption(label))
+                .when(!label.is_empty(), |d| d.child(caption(label).pl(px(48.))))
         };
         let spaced = |h: &str| {
             h.as_bytes()
@@ -933,7 +1029,7 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(caption("ENGINE ECU SENDS (500 kbit/s, every 10 ms)"))
+                    .child(caption("Engine ECU sends (500 kbit/s, every 10 ms)"))
                     .child(list)
                     .child(caption(decoded)),
             )
@@ -942,13 +1038,20 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(caption("OTHER NODES"))
-                    .child(div().text_sm().text_color(rgb(TEXT)).child(match nodes {
-                        "esp,gearbox" => "ESP (153, 1F0) and gearbox computer (43F) sending",
-                        "esp" => "ESP sending; gearbox computer silent",
-                        "gearbox" => "Gearbox computer sending; ESP silent",
-                        _ => "None: nothing acknowledges the ECU's frames",
-                    }))
+                    .child(caption("Other nodes"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(pal().label))
+                            .child(match nodes {
+                                "esp,gearbox" => {
+                                    "ESP (153, 1F0) and gearbox computer (43F) sending"
+                                }
+                                "esp" => "ESP sending; gearbox computer silent",
+                                "gearbox" => "Gearbox computer sending; ESP silent",
+                                _ => "None: nothing acknowledges the ECU's frames",
+                            }),
+                    )
                     .child(caption(
                         "Silence them in Inject faults (CAN: ...). Automatic-gearbox dumps \
                          then store P1602 or P0600 with the engine running. Watch the bus \
@@ -966,13 +1069,17 @@ impl Panel {
             .justify_center()
             .h(px(36.))
             .px(px(14.))
-            .rounded(px(8.))
+            .rounded(px(ui::RADIUS))
             .border_1()
-            .border_color(rgb(if battery_on { EDGE } else { WARN }))
+            .border_color(rgb(if battery_on {
+                pal().separator
+            } else {
+                pal().red
+            }))
             .text_sm()
-            .text_color(rgb(if battery_on { TEXT } else { WARN }))
+            .text_color(rgb(if battery_on { pal().label } else { pal().red }))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x1f2024)))
+            .hover(|s| s.bg(rgb(pal().fill_hover)))
             .child(if battery_on {
                 "Disconnect battery"
             } else {
@@ -991,7 +1098,7 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(caption("BATTERY"))
+                    .child(caption("Battery"))
                     .child(div().flex().flex_row().child(battery))
                     .child(caption(
                         "A disconnect power-cycles the ECU and wipes its memory, fault codes \
@@ -1003,7 +1110,7 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(caption("TIME AND SNAPSHOTS"))
+                    .child(caption("Time and snapshots"))
                     .child(self.time_and_snapshots(cx)),
             )
             .child(
@@ -1011,59 +1118,88 @@ impl Panel {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(caption("ECU"))
+                    .child(caption("Connection"))
+                    .child(
+                        div()
+                            .font_family(ui::mono())
+                            .text_size(px(ui::SMALL))
+                            .text_color(rgb(pal().label))
+                            .child(ecusim::endpoint_label(&self.socket)),
+                    )
+                    .child(caption(self.socket.display().to_string()))
                     .child(caption(format!(
-                        "running for {} s · testers connected: {} · ADC {}",
-                        self.get("ecu_s"),
-                        self.get("testers"),
-                        self.get("adc")
+                        "{} · testers connected: {}",
+                        if self.conn.is_some() {
+                            "connected"
+                        } else {
+                            "not connected"
+                        },
+                        self.get("testers")
                     ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(caption("Testers"))
+                    .child(caption({
+                        // kdiag's `auto` is the default socket, not this one
+                        let arg = if self.socket == ecusim::default_socket() {
+                            "auto".to_string()
+                        } else {
+                            self.socket.display().to_string()
+                        };
+                        format!(
+                            "Cascade: Connected To → Simulated → EcuSim. kdiag: --ecusim {arg}; \
+                             kdiag elm --ecusim {arg} for OBD apps."
+                        )
+                    }))
+                    .child(caption(format!("ADC {}", self.get("adc")))),
             )
     }
 }
 
 impl Render for Panel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let footer = caption(match &self.last_error {
-            Some(e) => e.clone(),
-            None => "Testers: Hi-Scan GUI line \"Process\" · kdiag --ecusim auto · \
-                     kdiag elm --ecusim auto"
-                .to_string(),
-        });
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use_palette(window, cx);
+        let p = pal();
         div()
             .id("root")
             .size_full()
             .flex()
-            .flex_col()
-            .gap(px(12.))
-            .p(px(16.))
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .flex_row()
+            .bg(rgb(p.canvas))
+            .text_color(rgb(p.label))
             // a release anywhere stops the starter
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|v, _, _, cx| v.starter(false, cx)),
             )
-            .child(self.top_bar(cx))
-            .child(self.gauges())
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(12.))
                     .flex_1()
-                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.toolbar(cx))
                     .child(
                         div()
-                            .id("drive-scroll")
-                            .flex_none()
-                            .h_full()
+                            .id("main")
+                            .flex_1()
+                            .min_h(px(0.))
                             .overflow_y_scroll()
-                            .child(self.drive(cx)),
-                    )
-                    .child(self.tabs(cx)),
+                            .flex()
+                            .flex_col()
+                            .gap(px(22.))
+                            .p(px(20.))
+                            .child(self.readings())
+                            .child(div().h(px(1.)).bg(rgb(p.separator)))
+                            .child(self.controls_form(cx)),
+                    ),
             )
-            .child(footer)
+            .when(self.sidebar, |d| d.child(self.side(cx)))
     }
 }
 
@@ -1113,8 +1249,8 @@ fn open_panel(socket: PathBuf, cx: &mut App) {
         }),
         ..Default::default()
     };
-    gpui_kit::open_window(opts, cx, move |_, cx| {
-        cx.new(|cx| Panel::new(socket.clone(), cx))
+    gpui_kit::open_window(opts, cx, move |window, cx| {
+        cx.new(|cx| Panel::new(socket.clone(), window, cx))
     })
     .expect("failed to open window");
 }
@@ -1129,10 +1265,11 @@ struct Setup {
     server: Server,
     error: Option<String>,
     busy: bool,
+    _appearance: Subscription,
 }
 
 impl Setup {
-    fn new(socket: PathBuf, server: Server) -> Self {
+    fn new(socket: PathBuf, server: Server, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let settings = ecusim::settings::Settings::load("ecusim-gui");
         let dump = settings.recent("rom").into_iter().next();
         Self {
@@ -1142,6 +1279,7 @@ impl Setup {
             server,
             error: None,
             busy: false,
+            _appearance: follow_appearance(window, cx),
         }
     }
 
@@ -1248,18 +1386,19 @@ fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<D
         .justify_center()
         .h(px(34.))
         .px(px(14.))
-        .rounded(px(8.))
+        .rounded(px(ui::RADIUS))
         .border_1()
-        .border_color(rgb(EDGE))
+        .border_color(rgb(pal().separator))
         .text_sm()
-        .text_color(rgb(TEXT))
+        .text_color(rgb(pal().label))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x1f2024)))
+        .hover(|s| s.bg(rgb(pal().fill_hover)))
         .child(label.into())
 }
 
 impl Render for Setup {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use_palette(window, cx);
         let recent: Vec<PathBuf> = self
             .settings
             .recent("rom")
@@ -1275,7 +1414,13 @@ impl Render for Setup {
                     .gap(px(2.))
                     .flex_1()
                     .min_w(px(0.))
-                    .child(div().truncate().text_sm().text_color(rgb(TEXT)).child(name))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(pal().label))
+                            .child(name),
+                    )
                     .child(caption(dir).truncate())
             }
             None => div().flex_1().child(caption("No dump chosen yet")),
@@ -1293,16 +1438,16 @@ impl Render for Setup {
                         .gap(px(12.))
                         .px(px(10.))
                         .py(px(6.))
-                        .rounded(px(6.))
+                        .rounded(px(ui::RADIUS))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x1f2024)))
+                        .hover(|s| s.bg(rgb(pal().fill_hover)))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
                                 .truncate()
                                 .text_sm()
-                                .text_color(rgb(TEXT))
+                                .text_color(rgb(pal().label))
                                 .child(name),
                         )
                         .child(caption(dir).flex_none().max_w(px(160.)).truncate())
@@ -1322,9 +1467,9 @@ impl Render for Setup {
             .justify_center()
             .h(px(40.))
             .px(px(22.))
-            .rounded(px(8.))
-            .bg(rgb(ACCENT))
-            .text_color(rgb(ACCENT_TEXT))
+            .rounded(px(ui::RADIUS))
+            .bg(rgb(pal().accent))
+            .text_color(rgb(pal().on_accent))
             .font_weight(FontWeight::SEMIBOLD)
             .when(!can_start, |d| d.opacity(0.4))
             .cursor_pointer()
@@ -1344,8 +1489,8 @@ impl Render for Setup {
             .flex_col()
             .gap(px(16.))
             .p(px(24.))
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(pal().canvas))
+            .text_color(rgb(pal().label))
             .child(
                 div()
                     .flex()
@@ -1360,7 +1505,7 @@ impl Render for Setup {
             .child(
                 card()
                     .gap(px(12.))
-                    .child(caption("ENGINE ECU DUMP"))
+                    .child(caption("Engine ECU dump"))
                     .child(
                         div()
                             .flex()
@@ -1374,7 +1519,7 @@ impl Render for Setup {
                             ),
                     )
                     .when(!recent_list_is_empty(&self.settings, &self.dump), |d| {
-                        d.child(caption("RECENT")).child(recent_list)
+                        d.child(caption("Recent")).child(recent_list)
                     })
                     .child(caption(
                         "A 256 KB (SIMK41) or 512 KB (SIMK43) dump without immobiliser. \
@@ -1388,13 +1533,21 @@ impl Render for Setup {
                     .items_center()
                     .justify_between()
                     .child(
-                        ghost("connect", "Connect to a running ecusim")
-                            .on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                ghost("connect", "Connect to a running ecusim")
+                                    .on_click(cx.listener(|v, _, w, cx| v.connect(w, cx))),
+                            )
+                            .child(caption(ecusim::endpoint_label(&self.socket))),
                     )
                     .child(start),
             )
             .when_some(self.error.clone(), |d, e| {
-                d.child(div().text_sm().text_color(rgb(WARN)).child(e))
+                d.child(div().text_sm().text_color(rgb(pal().red)).child(e))
             })
     }
 }
@@ -1427,7 +1580,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            gpui_kit::component::Theme::sync_system_appearance(None, cx);
             if setup {
                 let bounds = Bounds::centered(None, size(px(640.), px(480.)), cx);
                 let opts = WindowOptions {
@@ -1439,8 +1592,8 @@ fn main() {
                     ..Default::default()
                 };
                 let (socket, server) = (socket.clone(), server.clone());
-                gpui_kit::open_window(opts, cx, move |_, cx| {
-                    cx.new(|_| Setup::new(socket.clone(), server.clone()))
+                gpui_kit::open_window(opts, cx, move |window, cx| {
+                    cx.new(|cx| Setup::new(socket.clone(), server.clone(), window, cx))
                 })
                 .expect("failed to open window");
             } else {

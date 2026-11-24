@@ -23,6 +23,8 @@ pub struct Eeprom {
     mode: Mode,
     /// 128 16-bit words, stored as upstream's `.eep` file (host byte order).
     pub mem: [u16; 128],
+    /// Transactions started (chip selects), for activity displays.
+    pub accesses: u64,
 }
 
 impl Default for Eeprom {
@@ -36,6 +38,7 @@ impl Default for Eeprom {
             addr: 0,
             mode: Mode::Cmd,
             mem: [0; 128],
+            accesses: 0,
         }
     }
 }
@@ -61,6 +64,7 @@ impl Eeprom {
 
     pub fn toggle_inputs(&mut self, ena: bool, clk: bool, bit: bool) -> R<()> {
         if !self.enable && ena {
+            self.accesses += 1;
             self.mode = Mode::Cmd;
             self.cmd = 0;
             self.bit_count = 3;

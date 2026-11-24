@@ -127,6 +127,11 @@ impl Serial {
         self.baudrate & 0x7fff
     }
 
+    /// The divisor the firmware asked for (before a forced baud rate).
+    pub fn requested_divisor(&self) -> u16 {
+        self.specified_baudrate & 0x7fff
+    }
+
     pub fn set_baudrate(&mut self, now: u64, divisor: u8, clock: u32) {
         self.force_baud_rate = false;
         self.bitbang_reads_after_slow_init = 0;

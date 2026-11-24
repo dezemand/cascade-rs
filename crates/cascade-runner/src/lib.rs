@@ -117,6 +117,28 @@ pub struct Snapshot {
     /// Increments whenever `log` changes.
     pub log_seq: u64,
     pub uart_tx: u64,
+    /// The diagnostic line the firmware selected (OBD pin; 42 = CAN).
+    pub line: i32,
+    /// The adapter is expected to echo our bytes.
+    pub echo: bool,
+    /// Baud rate in use and the one the firmware asked for (0 = none yet).
+    pub baud: u32,
+    pub baud_requested: u32,
+    /// Activity counters and when each kind was last seen.
+    pub act: Activity,
+}
+
+/// Line and EEPROM activity, for status lights. Times are in
+/// [`Snapshot::total_cycles`]; 0 = never.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub rx_bytes: u64,
+    pub eeprom_accesses: u64,
+    /// Byte received, byte sent, K pulled low (break / init), EEPROM.
+    pub last_rx: u64,
+    pub last_tx: u64,
+    pub last_break: u64,
+    pub last_eeprom: u64,
 }
 
 impl Default for Snapshot {
@@ -133,6 +155,11 @@ impl Default for Snapshot {
             stopped: None,
             resets: 0,
             iface: String::new(),
+            line: 0,
+            echo: false,
+            baud: 0,
+            baud_requested: 0,
+            act: Activity::default(),
             log: VecDeque::new(),
             log_seq: 0,
             uart_tx: 0,
@@ -241,6 +268,7 @@ struct Emu {
     frame_seq: u64,
     lines: VecDeque<String>,
     log_seq: u64,
+    act: Activity,
     // pacing
     anchor_wall: Instant,
     anchor_cycles: u64,
@@ -350,6 +378,7 @@ impl Emu {
             frame_seq: 0,
             lines: VecDeque::new(),
             log_seq: 0,
+            act: Activity::default(),
             anchor_wall: now,
             anchor_cycles: 0,
             ratio_wall: now,
@@ -450,6 +479,10 @@ impl Emu {
                 self.cpu.eeprom.mem = eeprom;
                 self.log = log;
                 self.total_cycles = 0;
+                // measured from the old count, these would underflow
+                self.ratio_cycles = 0;
+                self.ratio_wall = Instant::now();
+                self.act = Activity::default();
                 self.log_read = 0;
                 self.iface_label = match &error {
                     Some(_) => format!("{} (failed to open)", iface.label()),
@@ -548,6 +581,18 @@ impl Emu {
             let log = self.log.borrow();
             if log.len() > self.log_read {
                 for e in &log[self.log_read..] {
+                    let now = self.total_cycles.max(1);
+                    match e.event {
+                        Event::Rx(_) => {
+                            self.act.rx_bytes += 1;
+                            self.act.last_rx = now;
+                        }
+                        Event::Tx(_) => self.act.last_tx = now,
+                        Event::SlowInitBit(false) | Event::SlowInitImminent => {
+                            self.act.last_break = now
+                        }
+                        _ => {}
+                    }
                     self.lines.push_back(format_event(e));
                     if self.lines.len() > LOG_KEEP {
                         self.lines.pop_front();
@@ -592,6 +637,18 @@ impl Emu {
             s.resets = self.resets;
             s.iface = self.iface_label.clone();
             s.uart_tx = self.cpu.stats.uart_tx;
+            let a = self.cpu.eeprom.accesses;
+            if a != self.act.eeprom_accesses {
+                self.act.eeprom_accesses = a;
+                self.act.last_eeprom = self.total_cycles.max(1);
+            }
+            let clock = self.cpu.clock();
+            let baud = |div: u16| if div == 0 { 0 } else { clock / 16 / div as u32 };
+            s.line = self.cpu.serial.comm_line();
+            s.echo = self.cpu.serial.echo();
+            s.baud = baud(self.cpu.serial.baud_divisor());
+            s.baud_requested = baud(self.cpu.serial.requested_divisor());
+            s.act = self.act;
         }
     }
 

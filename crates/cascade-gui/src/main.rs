@@ -27,31 +27,84 @@ use cascade_iface::KwpConfig;
 use cascade_runner::{Command, IfaceKind, Runner, Snapshot, Speed};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
-use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-// Palette: neutral darks, one accent.
-const DESK: u32 = 0x0e0f11;
-const CARD: u32 = 0x17181b;
-const CARD_EDGE: u32 = 0x25272c;
-const BEZEL: u32 = 0x0a0b0c;
+// The handset's own colours (neutral darks, the Hi-Scan yellow on ENTER).
+const CARD: u32 = 0x1c1f23;
+/// The darker face around the brand line and the screen.
+const FACE: u32 = 0x131518;
+const CARD_EDGE: u32 = 0x2b2f34;
+const BEZEL: u32 = 0x08090a;
 const LCD_BG: u32 = 0xc6cfb6;
 const LCD_FG: u32 = 0x1b2318;
-const KEY: u32 = 0x222428;
-const KEY_HOVER: u32 = 0x2a2d32;
-const KEY_DOWN: u32 = 0x363a41;
-const KEY_EDGE: u32 = 0x2e3136;
+const KEY: u32 = 0x2b2f35;
+/// Function keys: quieter than the rest.
+const FKEY: u32 = 0x22262b;
+const FKEY_TEXT: u32 = 0xa9b0b8;
+const KEY_HOVER: u32 = 0x343940;
+const KEY_DOWN: u32 = 0x3e444c;
 const TEXT: u32 = 0xe7e9ec;
 const TEXT_DIM: u32 = 0x8a8f98;
-const ACCENT: u32 = 0xf5b82e;
-const ACCENT_HOVER: u32 = 0xffc84f;
-const ACCENT_DOWN: u32 = 0xd99c17;
+const ACCENT: u32 = 0xf2c14e;
+const ACCENT_HOVER: u32 = 0xf7cd68;
+const ACCENT_DOWN: u32 = 0xd9a738;
 const ACCENT_TEXT: u32 = 0x1d1606;
 const OK: u32 = 0x4ade80;
 const WARN: u32 = 0xf87171;
-const PANEL: u32 = 0x131416;
-const LOG_BG: u32 = 0x0b0c0d;
+
+/// The app's chrome (side panel, live data) follows the platform; the
+/// handset keeps its own colours above.
+use cascade_theme::{self as ui, Palette};
+use gpui_kit::component::input::{Input, InputEvent};
+
+/// What each diagnostic line is, for people: name and one line.
+const LINE_INFO: [(&str, &str); 7] = [
+    ("Test replies", "Upstream CASCADE's fixed replies"),
+    (
+        "Built-in engine model",
+        "KWP2000 model with warm-idle values",
+    ),
+    ("Engine ECU dump", "The ECU's own code, emulated here"),
+    ("Nothing connected", "An open line: nothing answers"),
+    ("Car, via adapter", "A serial K-line adapter on a real car"),
+    ("Recorded session", "Answers from a kdiag trace"),
+    ("EcuSim", "The whole simulated car, in the EcuSim app"),
+];
+
+/// What the Hi-Scan is connected to, as the Connection tab groups it;
+/// each group holds one or more of the lines above (by index).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineGroup {
+    Car,
+    Simulated,
+    Recording,
+    None,
+}
+
+/// Lines in each group, in the order they are offered.
+const SIMULATED: [usize; 3] = [PROCESS, ECU, 1];
+const NO_CAR: [usize; 2] = [3, 0];
+
+fn group_of(i: usize) -> LineGroup {
+    match i {
+        ADAPTER => LineGroup::Car,
+        REPLAY => LineGroup::Recording,
+        i if SIMULATED.contains(&i) => LineGroup::Simulated,
+        _ => LineGroup::None,
+    }
+}
+
+/// The side panel's tabs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SideTab {
+    Connection,
+    Emulator,
+    Developer,
+}
+
+/// Toolbar height in points.
+const TOOLBAR_H: f32 = 40.0;
 
 /// Side panel width in points.
 const PANEL_W: f32 = 300.0;
@@ -106,21 +159,22 @@ fn kwp_engine() -> KwpConfig {
     cfg
 }
 
-const IFACES: [&str; 7] = ["Fake", "KWP", "ECU", "None", "Port", "Replay", "Process"];
+/// Diagnostic lines by index (names in LINE_INFO): 0 canned responder
+/// (upstream fake), 1 KWP2000 model, 2 ECU dump, 3 none, 4 adapter,
+/// 5 replay, 6 ecusim process.
 /// Index of "ECU" (the engine ECU's own code, a SIMK41 dump in ecuc167).
 const ECU: usize = 2;
-/// Index of the serial adapter ("Port") in IFACES.
+/// Index of the serial adapter ("Port") in LINE_INFO.
 const ADAPTER: usize = 4;
-/// Index of "Replay" (a `kdiag --trace` recording) in IFACES.
+/// Index of "Replay" (a `kdiag --trace` recording) in LINE_INFO.
 const REPLAY: usize = 5;
 /// Index of "Process": an `ecusim serve` process (the ECU dump running in
 /// real time with an engine model) on its default socket.
 const PROCESS: usize = 6;
 
 /// The line to an `ecusim` server (connected inside the emulator thread).
-fn process_iface() -> IfaceKind {
-    let sock = ecusim::default_socket();
-    let label = "ECU process (ecusim)".to_string();
+fn process_iface(sock: std::path::PathBuf) -> IfaceKind {
+    let label = format!("EcuSim ({})", ecusim::endpoint_label(&sock));
     // waits for (and survives restarts of) the server, like a cable that
     // gets plugged in later
     let make: cascade_runner::IfaceFactory = std::sync::Arc::new(move || {
@@ -169,6 +223,7 @@ fn ecu_iface(r: &EcuRom) -> IfaceKind {
 }
 
 /// A loaded recording: file name, ECU configuration, one-line summary.
+#[derive(Clone)]
 struct Loaded {
     name: String,
     config: KwpConfig,
@@ -238,6 +293,8 @@ enum Face {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tone {
     Plain,
+    /// F1-F6: a quieter row above the keypad.
+    Function,
     Accent,
 }
 
@@ -307,6 +364,28 @@ struct CascadeView {
     live_port: Option<String>,
     /// Extended ROM (troubleshooting pack) behind the main pack, if any.
     exrom_name: Option<String>,
+    /// The Connection tab's choices, applied with Connect: line, adapter
+    /// port and echo, EcuSim endpoint (text field), and a counter of files
+    /// loaded (ECU dump, trace) to notice a new file.
+    draft_line: usize,
+    draft_port: Option<String>,
+    draft_echo: bool,
+    endpoint: Entity<gpui_kit::component::input::InputState>,
+    applied_endpoint: String,
+    files_gen: u64,
+    applied_files_gen: u64,
+    /// The dump and recording in use: `ecu` and `replay` above are the
+    /// Connection tab's (newly opened) ones until Connect applies them.
+    applied_ecu: Option<EcuRom>,
+    applied_replay: Option<Loaded>,
+    /// The line last chosen in the Simulated and None groups.
+    sim_choice: usize,
+    none_choice: usize,
+    /// The side panel is shown, and which of its tabs.
+    sidebar: bool,
+    tab: SideTab,
+    _appearance: Subscription,
+    _endpoint_subs: Vec<Subscription>,
     _refresh: Task<()>,
 }
 
@@ -381,6 +460,7 @@ impl CascadeView {
             }
         });
         let snap = runner.snapshot();
+        let mut endpoint_subs: Vec<Subscription> = Vec::new();
         Self {
             runner,
             snap,
@@ -394,9 +474,33 @@ impl CascadeView {
             } else {
                 0
             },
+            draft_line: if replay.is_some() || replay_err.is_some() {
+                REPLAY
+            } else if ecu_first {
+                ECU
+            } else {
+                0
+            },
+            draft_port: None,
+            draft_echo: true,
+            endpoint: {
+                let default = ecusim::default_socket().display().to_string();
+                let e = cx.new(|cx| {
+                    gpui_kit::component::input::InputState::new(window, cx)
+                        .placeholder("/path/to/socket or host:port")
+                        .default_value(default)
+                });
+                endpoint_subs.push(cx.subscribe(&e, |_, _, _: &InputEvent, cx| cx.notify()));
+                e
+            },
+            applied_endpoint: ecusim::default_socket().display().to_string(),
+            files_gen: 0,
+            applied_files_gen: 0,
             ports: Vec::new(),
             port: None,
             adapter_echo: true,
+            applied_replay: replay.clone(),
+            applied_ecu: ecu.clone(),
             replay,
             replay_err,
             ecu,
@@ -406,6 +510,20 @@ impl CascadeView {
             live_snap: live::LiveSnap::default(),
             live_port: None,
             exrom_name,
+            // the EcuSim process if one is running, else the built-in model
+            sim_choice: if ecusim::default_socket().exists() {
+                PROCESS
+            } else {
+                1
+            },
+            none_choice: 0,
+            sidebar: true,
+            tab: SideTab::Connection,
+            _endpoint_subs: endpoint_subs,
+            _appearance: cx.observe_window_appearance(window, |_, window, cx| {
+                gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
+                cx.notify();
+            }),
             _refresh: refresh,
         }
     }
@@ -427,28 +545,88 @@ impl CascadeView {
         match (self.iface_choice, &self.port) {
             (ADAPTER, Some(p)) => adapter_iface(p.clone(), self.adapter_echo),
             (ADAPTER, None) => IfaceKind::Null,
-            (ECU, _) => match &self.ecu {
+            (ECU, _) => match &self.applied_ecu {
                 Some(r) => ecu_iface(r),
                 None => IfaceKind::Null,
             },
-            (REPLAY, _) => match &self.replay {
+            (REPLAY, _) => match &self.applied_replay {
                 Some(l) => IfaceKind::Kwp(l.config.clone()),
                 None => IfaceKind::Null,
             },
-            (PROCESS, _) => process_iface(),
+            (PROCESS, _) => match ecusim::Endpoint::parse(&self.applied_endpoint) {
+                Ok(ecusim::Endpoint::Unix(path)) => process_iface(path),
+                // TCP is not built yet (and Connect refuses it)
+                _ => IfaceKind::Null,
+            },
             (i, _) => iface_kind(i),
         }
     }
 
-    /// Switch to an adapter port: power-cycle onto it at real time (a real
-    /// line has real-time partners).
-    fn use_port(&mut self, port: String) {
-        self.port = Some(port);
-        self.runner.send(Command::Speed(Speed::Real(1.0)));
-        self.runner.send(Command::Restart(self.current_iface()));
+    /// Whether the Connection tab differs from the line in use.
+    fn pending(&self, cx: &App) -> bool {
+        let endpoint = self.endpoint.read(cx).value();
+        self.draft_line != self.iface_choice
+            || (self.draft_line == ADAPTER
+                && (self.draft_port != self.port || self.draft_echo != self.adapter_echo))
+            || (self.draft_line == PROCESS && endpoint.trim() != self.applied_endpoint)
+            || (matches!(self.draft_line, ECU | REPLAY) && self.files_gen != self.applied_files_gen)
     }
 
-    /// Ask for a `kdiag --trace` file and power-cycle onto it.
+    /// Why Connect cannot apply the draft, if it cannot.
+    fn blocked(&self, cx: &App) -> Option<String> {
+        match self.draft_line {
+            ADAPTER if self.draft_port.is_none() => Some("Choose a port.".into()),
+            ECU if self.ecu.is_none() => Some("Open an ECU dump first.".into()),
+            REPLAY if self.replay.is_none() => Some("Open a kdiag trace first.".into()),
+            PROCESS => match ecusim::Endpoint::parse(&self.endpoint.read(cx).value()) {
+                Ok(ecusim::Endpoint::Unix(_)) => None,
+                Ok(e @ ecusim::Endpoint::Tcp { .. }) => Some(format!(
+                    "{} is TCP, which EcuSim does not offer yet.",
+                    e.label()
+                )),
+                Err(e) => Some(e),
+            },
+            _ => None,
+        }
+    }
+
+    /// Apply the Connection tab: power-cycle the handset onto that line.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.blocked(cx).is_some() {
+            return;
+        }
+        self.iface_choice = self.draft_line;
+        self.port = self.draft_port.clone();
+        self.adapter_echo = self.draft_echo;
+        self.applied_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        self.applied_files_gen = self.files_gen;
+        self.applied_ecu = self.ecu.clone();
+        self.applied_replay = self.replay.clone();
+        // a real car and EcuSim are real-time partners
+        if matches!(self.iface_choice, ADAPTER | PROCESS) {
+            self.runner.send(Command::Speed(Speed::Real(1.0)));
+        }
+        self.runner.send(Command::Restart(self.current_iface()));
+        cx.notify();
+    }
+
+    /// Put the Connection tab back to the line in use.
+    fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_line = self.iface_choice;
+        self.draft_port = self.port.clone();
+        self.draft_echo = self.adapter_echo;
+        let applied = self.applied_endpoint.clone();
+        self.endpoint
+            .update(cx, |e, cx| e.set_value(applied, window, cx));
+        self.ecu = self.applied_ecu.clone();
+        self.replay = self.applied_replay.clone();
+        self.ecu_err = None;
+        self.replay_err = None;
+        self.applied_files_gen = self.files_gen;
+        cx.notify();
+    }
+
+    /// Ask for a `kdiag --trace` file (used once Connect applies it).
     fn open_trace(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -466,7 +644,7 @@ impl CascadeView {
                         Ok(l) => {
                             v.replay = Some(l);
                             v.replay_err = None;
-                            v.runner.send(Command::Restart(v.current_iface()));
+                            v.files_gen += 1;
                         }
                         Err(e) => v.replay_err = Some(format!("{}: {e}", p.display())),
                     }
@@ -477,7 +655,7 @@ impl CascadeView {
         .detach();
     }
 
-    /// Ask for an engine ECU dump and power-cycle onto it.
+    /// Ask for an engine ECU dump (used once Connect applies it).
     fn open_ecu(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -495,7 +673,7 @@ impl CascadeView {
                         Ok(r) => {
                             v.ecu = Some(r);
                             v.ecu_err = None;
-                            v.runner.send(Command::Restart(v.current_iface()));
+                            v.files_gen += 1;
                         }
                         Err(e) => v.ecu_err = Some(format!("{}: {e}", p.display())),
                     }
@@ -516,21 +694,24 @@ impl CascadeView {
         }
     }
 
-    /// LCD scale for the current window: a multiple of 0.5 points per LCD
-    /// pixel, so on a 2x display every LCD pixel is whole device pixels.
-    fn lcd_scale(window: &Window) -> f32 {
+    /// LCD scale for the current window: points per LCD pixel, as large as
+    /// the window allows (see `lcd` for how it stays sharp).
+    fn lcd_scale(&self, window: &Window) -> f32 {
         let vp = window.viewport_size();
-        let fit = ((f32::from(vp.width) - PANEL_W - 24.0) / DEVICE_W_PER_SCALE)
-            .min((f32::from(vp.height) - 24.0) / DEVICE_H_PER_SCALE);
-        ((fit * 2.0).floor() / 2.0).clamp(1.0, 6.0)
+        let side = if self.sidebar { PANEL_W } else { 0.0 };
+        let fit = ((f32::from(vp.width) - side - 24.0) / DEVICE_W_PER_SCALE)
+            .min((f32::from(vp.height) - TOOLBAR_H - 24.0) / DEVICE_H_PER_SCALE);
+        // continuous, in 1/16 steps so small resizes do not relayout; the
+        // LCD stays sharp because its pixels are snapped to the screen's
+        ((fit * 16.0).floor() / 16.0).clamp(1.0, 6.0)
     }
 
     fn lcd(&self, g: Geo) -> impl IntoElement {
         let frame = self.snap.frame.clone();
         let scale = g.scale;
         div()
-            .p(px(Geo::BEZEL * g.u))
-            .rounded(px(14.0 * g.u))
+            .p(px(4.0 * g.u))
+            .rounded(px(6.0 * g.u))
             .bg(rgb(BEZEL))
             .child(
                 div().rounded(px(4.0 * g.u)).overflow_hidden().child(
@@ -539,6 +720,13 @@ impl CascadeView {
                         move |bounds, _, window, _| {
                             window.paint_quad(fill(bounds, rgb(LCD_BG)));
                             let o = bounds.origin;
+                            // LCD pixel edges on whole screen pixels: neighbours
+                            // share an edge, nothing is blurred, sizes differ by
+                            // at most one screen pixel
+                            let dpr = window.scale_factor();
+                            let snap = |v: f32| (v * dpr).round() / dpr;
+                            let ex = |i: usize| snap(f32::from(o.x) + i as f32 * scale);
+                            let ey = |i: usize| snap(f32::from(o.y) + i as f32 * scale);
                             for y in 0..LCD_HEIGHT {
                                 let row = &frame[y * LCD_WIDTH / 8..(y + 1) * LCD_WIDTH / 8];
                                 let on = |x: usize| row[x / 8] & (0x80 >> (x % 8)) != 0;
@@ -553,11 +741,8 @@ impl CascadeView {
                                         x += 1;
                                     }
                                     let b = Bounds::new(
-                                        point(
-                                            o.x + px(start as f32 * scale),
-                                            o.y + px(y as f32 * scale),
-                                        ),
-                                        size(px((x - start) as f32 * scale), px(scale)),
+                                        point(px(ex(start)), px(ey(y))),
+                                        size(px(ex(x) - ex(start)), px(ey(y + 1) - ey(y))),
                                     );
                                     window.paint_quad(fill(b, rgb(LCD_FG)));
                                 }
@@ -588,8 +773,10 @@ impl CascadeView {
             Cap::Power => self.mouse_key == Some(Cap::Power),
         };
         let (bg, hover, pressed, fg, edge) = match tone {
-            Tone::Plain => (KEY, KEY_HOVER, KEY_DOWN, TEXT, KEY_EDGE),
-            Tone::Accent => (ACCENT, ACCENT_HOVER, ACCENT_DOWN, ACCENT_TEXT, ACCENT_DOWN),
+            // filled keys, no visible outline
+            Tone::Plain => (KEY, KEY_HOVER, KEY_DOWN, TEXT, KEY),
+            Tone::Function => (FKEY, KEY_HOVER, KEY_DOWN, FKEY_TEXT, FKEY),
+            Tone::Accent => (ACCENT, ACCENT_HOVER, ACCENT_DOWN, ACCENT_TEXT, ACCENT),
         };
         let height = h * g.row + (h - 1.0) * g.gap;
         let content: AnyElement = match face {
@@ -611,12 +798,12 @@ impl CascadeView {
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(10.0 * g.u))
+            .rounded(px(7.0 * g.u))
             .bg(rgb(if down { pressed } else { bg }))
             .border_1()
             .border_color(rgb(edge))
             .text_color(rgb(fg))
-            .text_size(px(14.0 * g.u))
+            .text_size(px(13.0 * g.u))
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
             .when(!down, |d| d.hover(move |s| s.bg(rgb(hover))))
@@ -658,26 +845,26 @@ impl CascadeView {
             .flex_row()
             .items_center()
             .justify_between()
-            .h(px(32.0 * u))
+            .h(px(26.0 * u))
+            .px(px(4.0 * u))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.0 * u))
+                    .gap(px(5.0 * u))
                     .child(
                         div()
-                            .w(px(8.0 * u))
-                            .h(px(8.0 * u))
-                            .rounded_full()
-                            .bg(rgb(ACCENT)),
+                            .text_size(px(13.0 * u))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(TEXT))
+                            .child("HI-SCAN"),
                     )
                     .child(
                         div()
-                            .text_size(px(14.0 * u))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
-                            .child("Hi-SCAN Pro"),
+                            .text_size(px(13.0 * u))
+                            .text_color(rgb(TEXT_DIM))
+                            .child("PRO"),
                     ),
             )
             .child(
@@ -720,19 +907,25 @@ impl CascadeView {
                             g,
                             cx,
                         )
-                        .w(px(32.0 * u))
-                        .h(px(32.0 * u))
+                        .w(px(26.0 * u))
+                        .h(px(26.0 * u))
+                        .bg(rgb(FACE))
                         .rounded_full(),
                     ),
             );
 
+        let f = |s: &Self, id: &str, t: &'static str, key: Key, cx: &mut Context<Self>| {
+            s.key(id, txt(t), Cap::Key(key), 1.0, 0.72, Tone::Function, g, cx)
+        };
+        // as wide as the keypad below (which has a gap between its blocks)
         let fkeys = row()
-            .child(k(self, "f1", txt("F1"), Key::F1, 1.0, cx))
-            .child(k(self, "f2", txt("F2"), Key::F2, 1.0, cx))
-            .child(k(self, "f3", txt("F3"), Key::F3, 1.0, cx))
-            .child(k(self, "f4", txt("F4"), Key::F4, 1.0, cx))
-            .child(k(self, "f5", txt("F5"), Key::F5, 1.0, cx))
-            .child(k(self, "f6", txt("F6"), Key::F6, 1.0, cx));
+            .justify_between()
+            .child(f(self, "f1", "F1", Key::F1, cx))
+            .child(f(self, "f2", "F2", Key::F2, cx))
+            .child(f(self, "f3", "F3", Key::F3, cx))
+            .child(f(self, "f4", "F4", Key::F4, cx))
+            .child(f(self, "f5", "F5", Key::F5, cx))
+            .child(f(self, "f6", "F6", Key::F6, cx));
 
         let r3 = |s: &Self,
                   a: (&'static str, Key),
@@ -847,14 +1040,23 @@ impl CascadeView {
             .flex()
             .flex_col()
             .gap(px(16.0 * u))
-            .p(px(20.0 * u))
-            .rounded(px(28.0 * u))
+            .p(px(16.0 * u))
+            .rounded(px(20.0 * u))
             .bg(rgb(CARD))
             .border_1()
             .border_color(rgb(CARD_EDGE))
-            .shadow_lg()
-            .child(header)
-            .child(self.lcd(g))
+            .shadow_md()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0 * u))
+                    .p(px(8.0 * u))
+                    .rounded(px(12.0 * u))
+                    .bg(rgb(FACE))
+                    .child(header)
+                    .child(self.lcd(g)),
+            )
             .child(div().h(px(2.0 * u)))
             .child(fkeys)
             .child(
@@ -867,236 +1069,213 @@ impl CascadeView {
             )
     }
 
-    /// Port list and options shown when "Adapter" is selected.
-    fn adapter_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ports =
-            self.ports
-                .iter()
-                .enumerate()
-                .fold(div().flex().flex_col().gap(px(4.)), |d, (i, p)| {
-                    let selected = self.port.as_deref() == Some(p.as_str());
-                    let name = p.trim_start_matches("/dev/cu.").to_string();
-                    let path = p.clone();
-                    let b = Button::new(SharedString::from(format!("port-{i}")))
-                        .label(name)
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            v.use_port(path.clone());
+    /// Adapter ports and options (line "Car, via adapter").
+    fn adapter_panel(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let ports = self.ports.iter().enumerate().fold(
+            div().flex().flex_col().gap(px(2.)),
+            |d, (i, port)| {
+                let selected = self.draft_port.as_deref() == Some(port.as_str());
+                let name = port.trim_start_matches("/dev/cu.").to_string();
+                let path = port.clone();
+                d.child(
+                    ui::radio(p, ("port", i), name, None, selected).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.draft_port = Some(path.clone());
                             cx.notify();
-                        }));
-                    d.child(if selected { b.primary() } else { b.ghost() })
-                });
-        let echo = self.adapter_echo;
+                        },
+                    )),
+                )
+            },
+        );
+        let echo = self.draft_echo;
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .p(px(8.))
-            .rounded(px(8.))
-            .bg(rgb(CARD))
-            .text_sm()
+            .gap(px(8.))
             .when(self.ports.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_color(rgb(TEXT_DIM))
-                        .child("No adapter found. Plug it in and rescan."),
-                )
+                d.child(ui::note(p, "No adapter found. Plug it in and rescan."))
             })
             .child(ports)
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(6.))
+                    .items_center()
+                    .justify_between()
                     .child(
-                        Button::new("rescan")
-                            .icon(IconName::RefreshCw)
-                            .label("Rescan")
-                            .ghost()
-                            .on_click(cx.listener(|v, _, _, cx| {
-                                v.ports = cascade_diag::serial::list_ports();
+                        ui::checkbox(p, "echo", "Adapter echoes its bytes", echo).on_click(
+                            cx.listener(move |v, _, _, cx| {
+                                v.draft_echo = !echo;
                                 cx.notify();
-                            })),
+                            }),
+                        ),
                     )
                     .child(
-                        Button::new("echo")
-                            .label(if echo { "Echo: on" } else { "Echo: off" })
-                            .ghost()
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                v.adapter_echo = !echo;
-                                if let Some(p) = v.port.clone() {
-                                    v.use_port(p);
-                                }
+                        ui::button(p, "rescan", Some(IconName::RefreshCw), "Rescan").on_click(
+                            cx.listener(|v, _, _, cx| {
+                                v.ports = cascade_diag::serial::list_ports();
                                 cx.notify();
-                            })),
+                            }),
+                        ),
                     ),
             )
-            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
-                "Runs the original Hi-Scan software on the car. Its menus include actuator \
-                 tests and resets: use them only on purpose.",
+            .child(ui::note(
+                p,
+                "Runs the original Hi-Scan software on the car. Its menus include \
+                 actuator tests and resets: use them only on purpose.",
             ))
     }
 
-    /// ECU dump and file button shown when "ECU" is selected.
-    fn ecu_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let card = div()
+    /// The loaded ECU dump (line "Engine ECU dump").
+    fn ecu_panel(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .p(px(8.))
-            .rounded(px(8.))
-            .bg(rgb(CARD))
-            .text_sm();
-        let card = match &self.ecu {
-            Some(r) => card
-                .child(div().font_family("Menlo").text_xs().child(r.name.clone()))
-                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
-                    "{} KB engine ECU dump (SIMK41, C167) at address 0x11",
-                    r.data.len() / 1024
-                ))),
-            None => card.child(div().text_color(rgb(TEXT_DIM)).child("No ECU dump loaded.")),
-        };
-        card.when_some(self.ecu_err.clone(), |d, e| {
-            d.child(div().text_xs().text_color(rgb(WARN)).child(e))
-        })
-        .child(
-            Button::new("open-ecu")
-                .icon(IconName::FolderOpen)
-                .label("Open ECU dump…")
-                .ghost()
-                .on_click(cx.listener(|v, _, _, cx| v.open_ecu(cx))),
-        )
-        .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
-            "The engine ECU's own code answers: use Tiburon / Engine L4 / 2003. Sensors \
-             read 2.5 V, no crank signal. It powers on at the first wake-up and needs \
-             about 3 s of ECU time to boot.",
-        ))
+            .child(match &self.ecu {
+                Some(r) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(ui::BODY))
+                            .text_color(rgb(p.label))
+                            .child(r.name.clone()),
+                    )
+                    .child(ui::note(
+                        p,
+                        format!("{} KB C167 engine ECU, address 0x11", r.data.len() / 1024),
+                    )),
+                None => ui::note(p, "No ECU dump loaded."),
+            })
+            .when_some(self.ecu_err.clone(), |d, e| {
+                d.child(ui::note(p, e).text_color(rgb(p.red)))
+            })
+            .child(
+                div().flex().flex_row().child(
+                    ui::button(p, "open-ecu", None, "Open ECU Dump…")
+                        .on_click(cx.listener(|v, _, _, cx| v.open_ecu(cx))),
+                ),
+            )
+            .child(ui::note(
+                p,
+                "Use Tiburon / Engine L4 / 2003. It boots at the first wake-up \
+                 (about 3 s of ECU time).",
+            ))
     }
 
-    /// Recording and file button shown when "Replay" is selected.
-    fn replay_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let card = div()
+    /// The loaded recording (line "Recorded session").
+    fn replay_panel(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .p(px(8.))
-            .rounded(px(8.))
-            .bg(rgb(CARD))
-            .text_sm();
-        let card = match &self.replay {
-            Some(l) => card
-                .child(div().font_family("Menlo").child(l.name.clone()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(TEXT_DIM))
-                        .child(l.summary.clone()),
+            .child(match &self.replay {
+                Some(l) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(ui::BODY))
+                            .text_color(rgb(p.label))
+                            .child(l.name.clone()),
+                    )
+                    .child(ui::note(p, l.summary.clone())),
+                None => ui::note(p, "No recording loaded."),
+            })
+            .when_some(self.replay_err.clone(), |d, e| {
+                d.child(ui::note(p, e).text_color(rgb(p.red)))
+            })
+            .child(
+                div().flex().flex_row().child(
+                    ui::button(p, "open-trace", None, "Open kdiag Trace…")
+                        .on_click(cx.listener(|v, _, _, cx| v.open_trace(cx))),
                 ),
-            None => card.child(
-                div()
-                    .text_color(rgb(TEXT_DIM))
-                    .child("No recording loaded."),
-            ),
-        };
-        card.when_some(self.replay_err.clone(), |d, e| {
-            d.child(div().text_xs().text_color(rgb(WARN)).child(e))
-        })
-        .child(
-            Button::new("open-trace")
-                .icon(IconName::FolderOpen)
-                .label("Open kdiag trace…")
-                .ghost()
-                .on_click(cx.listener(|v, _, _, cx| v.open_trace(cx))),
-        )
-        .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(
-            "Answers each request with what the car answered, in recorded order, \
-             then from the start again. Requests never recorded get the ECU model's replies.",
-        ))
+            )
     }
 
     /// Native live data: engine `21 01` through kdiag's client, decoded with
     /// the protocol CSV. Independent of the emulator.
-    fn live_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn live_panel(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let s = &self.live_snap;
         let running = self.live.is_some() && s.running;
         let ports = cascade_diag::serial::list_ports();
         let sources = std::iter::once(None)
             .chain(ports.into_iter().map(Some))
             .enumerate()
-            .fold(
-                div().flex().flex_row().flex_wrap().gap(px(4.)),
-                |d, (i, p)| {
-                    let label = p.as_deref().map_or("Simulator".to_string(), |p| {
-                        p.trim_start_matches("/dev/cu.").to_string()
-                    });
-                    let selected = self.live_port == p;
-                    let b = Button::new(SharedString::from(format!("live-src-{i}")))
-                        .label(label)
-                        .compact()
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            v.live_port = p.clone();
+            .fold(ui::segmented(p), |d, (i, port)| {
+                let label = port.as_deref().map_or("Simulator".to_string(), |port| {
+                    port.trim_start_matches("/dev/cu.").to_string()
+                });
+                let selected = self.live_port == port;
+                d.child(
+                    ui::segment(p, ("live-src", i), label, selected).on_click(cx.listener(
+                        move |v, _, _, cx| {
+                            v.live_port = port.clone();
                             v.live = None;
                             cx.notify();
-                        }));
-                    d.child(if selected { b.primary() } else { b.ghost() })
-                },
-            );
-        let start = Button::new("live-start")
-            .icon(if running {
-                IconName::Pause
-            } else {
-                IconName::Play
-            })
-            .label(if running { "Stop" } else { "Start" })
-            .primary()
-            .on_click(cx.listener(move |v, _, _, cx| {
-                if running {
-                    v.live = None;
-                    v.live_snap.running = false;
-                    v.live_snap.status = "stopped".into();
-                } else {
-                    let src = match &v.live_port {
-                        None => live::Source::Sim,
-                        Some(p) => live::Source::Port {
-                            path: p.clone(),
-                            echo: v.adapter_echo,
                         },
-                    };
-                    v.live = Some(live::Live::start(src));
-                }
-                cx.notify();
-            }));
-        let rows = s.rows.iter().fold(
+                    )),
+                )
+            });
+        let start = if running {
+            ui::button(p, "live-start", Some(IconName::Pause), "Stop")
+        } else {
+            ui::default_button(p, "live-start", Some(IconName::Play), "Start")
+        }
+        .on_click(cx.listener(move |v, _, _, cx| {
+            if running {
+                v.live = None;
+                v.live_snap.running = false;
+                v.live_snap.status = "stopped".into();
+            } else {
+                let src = match &v.live_port {
+                    None => live::Source::Sim,
+                    Some(port) => live::Source::Port {
+                        path: port.clone(),
+                        echo: v.adapter_echo,
+                    },
+                };
+                v.live = Some(live::Live::start(src));
+            }
+            cx.notify();
+        }));
+        let rows = s.rows.iter().enumerate().fold(
             div().flex().flex_col().w_full(),
-            |d, (name, value, unit)| {
+            |d, (i, (name, value, unit))| {
                 d.child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .px(px(12.))
-                        .py(px(5.))
-                        .border_b_1()
-                        .border_color(rgb(CARD_EDGE))
+                        .px(px(10.))
+                        .py(px(3.))
+                        .when(i % 2 == 1, |d| {
+                            d.bg(rgb(if p.dark { 0x252525 } else { 0xf4f5f5 }))
+                        })
                         .child(
                             div()
                                 .flex_1()
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(p.label))
                                 .child(name.replace('_', " ")),
                         )
                         .child(
                             div()
                                 .w(px(110.))
                                 .text_right()
-                                .font_family("Menlo")
-                                .text_color(rgb(TEXT))
+                                .font_family(ui::mono())
+                                .text_color(rgb(p.label))
                                 .child(value.clone()),
                         )
                         .child(
                             div()
                                 .w(px(56.))
                                 .pl(px(8.))
-                                .text_xs()
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(p.secondary))
                                 .child(unit.clone()),
                         ),
                 )
@@ -1105,15 +1284,11 @@ impl CascadeView {
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(10.))
             .w(px(560.))
             .max_h_full()
-            .p(px(16.))
-            .rounded(px(16.))
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgb(CARD_EDGE))
-            .text_color(rgb(TEXT))
+            .text_size(px(ui::BODY))
+            .text_color(rgb(p.label))
             .child(
                 div()
                     .flex()
@@ -1124,276 +1299,620 @@ impl CascadeView {
                         div()
                             .flex()
                             .flex_col()
+                            .gap(px(2.))
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Engine live data"),
+                                    .child("Engine Live Data"),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_DIM))
-                                    .child("kdiag client, read-only. 21 01 every 150 ms."),
-                            ),
+                            .child(ui::note(p, "kdiag client, read-only; 21 01 every 150 ms")),
                     )
                     .child(start),
             )
             .child(sources)
-            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(format!(
-                "{}  ·  {} reads, {} errors",
-                if s.status.is_empty() {
-                    "idle"
-                } else {
-                    &s.status
-                },
-                s.reads,
-                s.errors
-            )))
+            .child(ui::note(
+                p,
+                format!(
+                    "{} · {} reads · {} errors",
+                    if s.status.is_empty() {
+                        "idle"
+                    } else {
+                        &s.status
+                    },
+                    s.reads,
+                    s.errors
+                ),
+            ))
             .child(
                 div()
                     .id("live-rows")
                     .flex_1()
                     .overflow_y_scroll()
-                    .rounded(px(8.))
-                    .bg(rgb(PANEL))
-                    .text_sm()
+                    .rounded(px(ui::RADIUS))
+                    .border_1()
+                    .border_color(rgb(p.separator))
+                    .bg(rgb(p.panel))
                     .child(rows),
             )
     }
 
-    fn side(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = &self.snap;
-        let paused = s.paused;
-        let section = |t: &'static str| {
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT_DIM))
-                .child(t)
+    /// Choose diagnostic line `i`.
+    /// EcuSim's endpoint: a path (Unix socket) or host:port (TCP), and
+    /// whether something listens there.
+    fn endpoint_field(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let text = self.endpoint.read(cx).value();
+        let (dot, note) = match ecusim::Endpoint::parse(&text) {
+            Ok(ecusim::Endpoint::Unix(path)) if path.exists() => {
+                (p.green, "Unix socket · EcuSim is listening".to_string())
+            }
+            Ok(ecusim::Endpoint::Unix(_)) => (
+                p.tertiary,
+                "Unix socket · nothing there yet; the line connects when EcuSim starts".to_string(),
+            ),
+            Ok(ecusim::Endpoint::Tcp { .. }) => {
+                (p.tertiary, "TCP · not offered by EcuSim yet".to_string())
+            }
+            Err(e) => (p.red, e),
         };
-        let seg = |id: String, label: &'static str, selected: bool| {
-            let b = Button::new(SharedString::from(id)).label(label).flex_1();
-            if selected { b.primary() } else { b.ghost() }
-        };
-        let speeds = [
-            ("1×", Speed::Real(1.0)),
-            ("4×", Speed::Real(4.0)),
-            ("Max", Speed::Max),
-        ];
-        let speed_row = speeds.iter().fold(
-            div()
-                .flex()
-                .flex_row()
-                .gap(px(4.))
-                .p(px(3.))
-                .rounded(px(8.))
-                .bg(rgb(CARD)),
-            |d, &(label, speed)| {
-                d.child(
-                    seg(format!("speed-{label}"), label, s.speed == speed).on_click(
-                        cx.listener(move |v, _, _, _| v.runner.send(Command::Speed(speed))),
-                    ),
-                )
-            },
-        );
-        let line_row = IFACES.iter().enumerate().fold(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap(px(4.))
-                .p(px(3.))
-                .rounded(px(8.))
-                .bg(rgb(CARD)),
-            |d, (i, name)| {
-                d.child(
-                    // the options as a grid of equal buttons, three per row
-                    {
-                        let b = Button::new(SharedString::from(format!("iface-{i}")))
-                            .label(*name)
-                            .compact()
-                            .w(px((PANEL_W - 32.0 - 6.0 - 8.0) / 3.0 - 4.0));
-                        if self.iface_choice == i {
-                            b.primary()
-                        } else {
-                            b.ghost()
-                        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(Input::new(&self.endpoint).font_family(ui::mono()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .size(px(6.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(dot)),
+                    )
+                    .child(ui::note(p, note)),
+            )
+    }
+
+    /// Choose line `i` in the Connection tab (Connect applies it).
+    fn choose_line(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.draft_line = i;
+        match group_of(i) {
+            LineGroup::Simulated => self.sim_choice = i,
+            LineGroup::None => self.none_choice = i,
+            LineGroup::Car => self.ports = cascade_diag::serial::list_ports(),
+            LineGroup::Recording => {}
+        }
+        cx.notify();
+    }
+
+    /// Connection tab: the lines to choose from, and the chosen line's own
+    /// controls.
+    fn connection(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let group = group_of(self.draft_line);
+        let picker = [
+            (LineGroup::Car, "Car"),
+            (LineGroup::Simulated, "Simulated"),
+            (LineGroup::Recording, "Recording"),
+            (LineGroup::None, "None"),
+        ]
+        .into_iter()
+        .fold(ui::segmented(p), |d, (g, name)| {
+            d.child(ui::segment(p, name, name, group == g).on_click(cx.listener(
+                move |v, _, _, cx| {
+                    if group_of(v.draft_line) == g {
+                        return;
                     }
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        v.iface_choice = i;
-                        if i == ADAPTER {
-                            // pick a port first; nothing changes until then
-                            v.ports = cascade_diag::serial::list_ports();
-                        } else if i == ECU {
-                            if v.ecu.is_some() {
-                                v.runner.send(Command::Restart(v.current_iface()));
-                            } else {
-                                v.open_ecu(cx);
-                            }
-                        } else if i == PROCESS {
-                            // a real-time partner: run at real time
-                            v.runner.send(Command::Speed(Speed::Real(1.0)));
-                            v.runner.send(Command::Restart(v.current_iface()));
-                        } else if i == REPLAY {
-                            if v.replay.is_some() {
-                                v.runner.send(Command::Restart(v.current_iface()));
-                            } else {
-                                v.open_trace(cx);
-                            }
+                    let i = match g {
+                        LineGroup::Car => ADAPTER,
+                        LineGroup::Simulated => v.sim_choice,
+                        LineGroup::Recording => REPLAY,
+                        LineGroup::None => v.none_choice,
+                    };
+                    v.choose_line(i, cx);
+                },
+            )))
+        });
+        // the choices within a group, with the chosen one's own options
+        // right under it
+        let variants = |lines: &[usize], cx: &mut Context<Self>| {
+            lines
+                .iter()
+                .fold(div().flex().flex_col().gap(px(6.)), |d, &i| {
+                    let (name, what) = LINE_INFO[i];
+                    let on = self.draft_line == i;
+                    d.child(
+                        ui::radio(p, ("line", i), name, Some(what.into()), on)
+                            .on_click(cx.listener(move |v, _, _, cx| v.choose_line(i, cx))),
+                    )
+                    .when(on && i == ECU, |d| {
+                        d.child(self.ecu_panel(p, cx).pl(px(21.)))
+                    })
+                    .when(on && i == PROCESS, |d| {
+                        d.child(self.endpoint_field(p, cx).pl(px(21.)))
+                    })
+                })
+        };
+        let options: Div = match group {
+            LineGroup::Car => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(ui::note(p, LINE_INFO[ADAPTER].1))
+                .child(self.adapter_panel(p, cx)),
+            LineGroup::Simulated => variants(&SIMULATED, cx),
+            LineGroup::Recording => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(ui::note(p, LINE_INFO[REPLAY].1))
+                .child(self.replay_panel(p, cx)),
+            LineGroup::None => variants(&NO_CAR, cx),
+        };
+        // nothing changes until Connect
+        let pending = self.pending(cx);
+        let blocked = self.blocked(cx);
+        let actions = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .when_some(blocked.clone().filter(|_| pending), |d, why| {
+                d.child(ui::note(p, why))
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(6.))
+                    .child(
+                        ui::button(p, "line-revert", None, "Revert")
+                            .on_click(cx.listener(|v, _, window, cx| v.revert(window, cx))),
+                    )
+                    .child(
+                        ui::default_button(p, "line-connect", None, "Connect")
+                            .when(blocked.is_some(), |d| d.opacity(0.4))
+                            .on_click(cx.listener(|v, _, _, cx| v.connect(cx))),
+                    ),
+            );
+        let snap = &self.snap;
+        let pins = (1..=16).fold(div().flex().flex_row().flex_wrap().gap(px(3.)), |d, pin| {
+            let on = snap.line == pin;
+            d.child(
+                div()
+                    .w(px(22.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .text_size(px(ui::SMALL))
+                    .font_family(ui::mono())
+                    .map(|d| {
+                        if on {
+                            d.bg(rgb(p.accent)).text_color(rgb(p.on_accent))
                         } else {
-                            v.runner.send(Command::Restart(iface_kind(i)));
+                            d.border_1()
+                                .border_color(rgb(p.separator))
+                                .text_color(rgb(p.secondary))
                         }
-                        cx.notify();
-                    })),
-                )
-            },
-        );
+                    })
+                    .child(pin.to_string()),
+            )
+        });
+        let can = snap.line == 42;
+        let baud = |b: u32| {
+            if b == 0 {
+                "–".to_string()
+            } else {
+                b.to_string()
+            }
+        };
         let kv = |k: &'static str, v: String| {
             div()
                 .flex()
                 .flex_row()
                 .justify_between()
-                .text_sm()
-                .child(div().text_color(rgb(TEXT_DIM)).child(k))
-                .child(div().font_family("Menlo").child(v))
+                .child(div().text_color(rgb(p.secondary)).child(k))
+                .child(div().font_family(ui::mono()).child(v))
         };
-        let secs = s.total_cycles as f64 / 10_000_000.0;
-        let log_lines: Vec<String> = s.log.iter().rev().take(200).cloned().collect();
+        let status = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(ui::header(p, "Line Status"))
+            .child(ui::note(p, "OBD pin the Hi-Scan selected"))
+            .child(
+                pins.child(
+                    div()
+                        .h(px(18.))
+                        .px(px(5.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(3.))
+                        .text_size(px(ui::SMALL))
+                        .map(|d| {
+                            if can {
+                                d.bg(rgb(p.accent)).text_color(rgb(p.on_accent))
+                            } else {
+                                d.border_1()
+                                    .border_color(rgb(p.separator))
+                                    .text_color(rgb(p.secondary))
+                            }
+                        })
+                        .child("CAN"),
+                ),
+            )
+            .child(kv("Baud rate", baud(snap.baud)))
+            .child(kv("Requested", baud(snap.baud_requested)))
+            .child(kv("Echo", if snap.echo { "on" } else { "off" }.into()));
         div()
             .flex()
             .flex_col()
             .gap(px(10.))
-            .w(px(PANEL_W))
-            .h_full()
-            .p(px(16.))
-            .bg(rgb(PANEL))
-            .border_l_1()
-            .border_color(rgb(CARD_EDGE))
-            .text_color(rgb(TEXT))
-            .child(section("VIEW"))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(4.))
-                    .p(px(3.))
-                    .rounded(px(8.))
-                    .bg(rgb(CARD))
-                    .child(seg("view-dev".into(), "Hi-Scan", !self.live_view).on_click(
-                        cx.listener(|v, _, _, cx| {
-                            v.live_view = false;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(
-                        seg("view-live".into(), "Live data", self.live_view).on_click(cx.listener(
-                            |v, _, _, cx| {
-                                v.live_view = true;
-                                cx.notify();
-                            },
-                        )),
-                    ),
+            .child(ui::header(p, "Connected To"))
+            .child(picker)
+            .child(options)
+            .when(pending, |d| d.child(actions))
+            .child(div().h(px(1.)).bg(rgb(p.separator)))
+            .child(status)
+    }
+
+    /// Emulator tab: run, reset, speed.
+    fn emulator(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let s = &self.snap;
+        let paused = s.paused;
+        let speeds = [
+            ("1×", Speed::Real(1.0)),
+            ("4×", Speed::Real(4.0)),
+            ("Max", Speed::Max),
+        ];
+        let speed_row = speeds.iter().fold(ui::segmented(p), |d, &(text, speed)| {
+            d.child(
+                ui::segment(
+                    p,
+                    SharedString::from(format!("speed-{text}")),
+                    text,
+                    s.speed == speed,
+                )
+                .on_click(cx.listener(move |v, _, _, _| v.runner.send(Command::Speed(speed)))),
             )
-            .child(div().h(px(4.)))
-            .child(section("EMULATOR"))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(ui::header(p, "Handset"))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .gap(px(6.))
                     .child(
-                        Button::new("run")
-                            .icon(if paused {
+                        ui::button(
+                            p,
+                            "run",
+                            Some(if paused {
                                 IconName::Play
                             } else {
                                 IconName::Pause
-                            })
-                            .label(if paused { "Run" } else { "Pause" })
-                            .primary()
-                            .flex_1()
-                            .on_click(cx.listener(move |v, _, _, _| {
-                                v.runner.send(Command::Pause(!paused))
-                            })),
+                            }),
+                            if paused { "Run" } else { "Pause" },
+                        )
+                        .on_click(
+                            cx.listener(move |v, _, _, _| v.runner.send(Command::Pause(!paused))),
+                        ),
                     )
                     .child(
-                        Button::new("reset")
-                            .icon(IconName::RotateCcw)
-                            .label("Reset")
-                            .flex_1()
+                        ui::button(p, "reset", Some(IconName::RotateCcw), "Reset")
                             .on_click(cx.listener(|v, _, _, _| v.runner.send(Command::Reset))),
                     ),
             )
+            .child(ui::note(
+                p,
+                "Reset restarts the Hi-Scan's firmware; the EEPROM is kept.",
+            ))
+            .child(div().h(px(1.)).bg(rgb(p.separator)))
+            .child(ui::header(p, "Speed"))
             .child(speed_row)
-            .child(div().h(px(4.)))
-            .child(section("DIAGNOSTIC LINE"))
-            .child(line_row)
-            .when(self.iface_choice == ADAPTER, |d| {
-                d.child(self.adapter_panel(cx))
+            .child(ui::note(
+                p,
+                "Real time is needed with a car or the simulated car; Max runs the \
+                 firmware as fast as this computer can.",
+            ))
+            .when_some(self.exrom_name.clone(), |d, n| {
+                d.child(div().h(px(1.)).bg(rgb(p.separator)))
+                    .child(ui::header(p, "Troubleshooting Pack"))
+                    .child(div().truncate().child(n))
             })
-            .when(self.iface_choice == ECU, |d| d.child(self.ecu_panel(cx)))
-            .when(self.iface_choice == REPLAY, |d| {
-                d.child(self.replay_panel(cx))
-            })
-            .child(div().h(px(4.)))
-            .child(section("STATUS"))
+    }
+
+    /// Developer tab: CPU state and the line events.
+    fn developer(&self, p: Palette) -> Div {
+        let s = &self.snap;
+        let kv = |k: &'static str, v: String| {
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .text_size(px(ui::SMALL))
+                .child(div().text_color(rgb(p.secondary)).child(k))
+                .child(
+                    div()
+                        .font_family(ui::mono())
+                        .text_color(rgb(p.label))
+                        .child(v),
+                )
+        };
+        let log_lines: Vec<String> = s.log.iter().rev().take(200).cloned().collect();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .flex_1()
+            .min_h(px(0.))
+            .child(ui::header(p, "Firmware"))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .child(kv("Emulated", format!("{secs:.1} s")))
-                    .child(kv("Speed", format!("×{:.2}", s.ratio)))
+                    .gap(px(3.))
                     .child(kv("PC", format!("{:04X}", s.pc)))
                     .child(kv("Firmware resets", s.resets.to_string()))
-                    .child(kv("UART TX", s.uart_tx.to_string()))
-                    .child(kv("Line", s.iface.clone()))
-                    .child(kv(
-                        "Extended ROM",
-                        self.exrom_name
-                            .as_deref()
-                            .map_or("none".into(), |n| n.chars().take(18).collect()),
-                    )),
+                    .child(kv("Line", s.iface.clone())),
             )
-            .when_some(s.stopped.clone(), |d, why| {
-                d.child(
-                    div()
-                        .p(px(8.))
-                        .rounded(px(6.))
-                        .bg(rgb(0x3a1d1d))
-                        .text_color(rgb(WARN))
-                        .text_sm()
-                        .child(format!("Stopped: {why}")),
-                )
-            })
-            .child(div().h(px(4.)))
-            .child(section("LINE EVENTS"))
+            .child(ui::header(p, "Counters"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(kv("Bytes sent (UART TX)", s.uart_tx.to_string()))
+                    .child(kv("Bytes received", s.act.rx_bytes.to_string()))
+                    .child(kv("EEPROM accesses", s.act.eeprom_accesses.to_string())),
+            )
+            .child(ui::header(p, "Line Events"))
             .child(
                 div()
                     .id("log")
                     .flex_1()
+                    .min_h(px(80.))
                     .overflow_y_scroll()
-                    .rounded(px(8.))
-                    .bg(rgb(LOG_BG))
+                    .rounded(px(ui::RADIUS))
+                    .bg(rgb(p.canvas))
                     .border_1()
-                    .border_color(rgb(CARD_EDGE))
-                    .p(px(8.))
-                    .font_family("Menlo")
-                    .text_xs()
-                    .text_color(rgb(0xb5bac2))
+                    .border_color(rgb(p.separator))
+                    .p(px(6.))
+                    .font_family(ui::mono())
+                    .text_size(px(ui::SMALL))
+                    .text_color(rgb(p.secondary))
                     .children(log_lines.into_iter().map(|l| div().child(l))),
+            )
+    }
+
+    /// Always at the foot of the side panel: is it running, how fast, on
+    /// which line.
+    /// The emulator's run state and the colour of its dot.
+    fn run_state(&self, p: Palette) -> (&'static str, u32) {
+        if self.snap.stopped.is_some() {
+            ("Stopped", p.red)
+        } else if self.snap.paused {
+            ("Paused", p.tertiary)
+        } else {
+            ("Running", p.green)
+        }
+    }
+
+    /// One-line run state for the toolbar while the sidebar (and its status
+    /// footer) is hidden.
+    fn state_badge(&self, p: Palette) -> Div {
+        let (state, dot) = self.run_state(p);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .min_w(px(0.))
+            .text_size(px(ui::SMALL))
+            .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(dot)))
+            .child(
+                div()
+                    .truncate()
+                    .text_color(rgb(p.secondary))
+                    .child(match &self.snap.stopped {
+                        Some(why) => format!("Stopped: {why}"),
+                        None => state.to_string(),
+                    }),
+            )
+    }
+
+    fn status(&self, p: Palette) -> Div {
+        let s = &self.snap;
+        let secs = s.total_cycles as f64 / 10_000_000.0;
+        let (state, dot) = self.run_state(p);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .px(px(14.))
+            .py(px(8.))
+            .border_t_1()
+            .border_color(rgb(p.separator))
+            .text_size(px(ui::SMALL))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(7.)).rounded_full().bg(rgb(dot)))
+                    .child(div().text_color(rgb(p.label)).child(state))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .font_family(ui::mono())
+                            .text_color(rgb(p.secondary))
+                            .child(format!("{secs:.1} s  ×{:.2}", s.ratio)),
+                    ),
+            )
+            .child({
+                // lit while seen in the last 150 ms of emulated time
+                let recent = |t: u64| t != 0 && s.total_cycles.saturating_sub(t) < 1_500_000;
+                let a = &s.act;
+                [
+                    ("RX", recent(a.last_rx)),
+                    ("TX", recent(a.last_tx)),
+                    ("Break", recent(a.last_break)),
+                    ("EEPROM", recent(a.last_eeprom)),
+                    ("CAN", s.line == 42),
+                ]
+                .into_iter()
+                .fold(
+                    div().flex().flex_row().gap(px(10.)).py(px(2.)),
+                    |d, (name, on)| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(div().size(px(6.)).rounded_full().bg(rgb(if on {
+                                    p.accent
+                                } else {
+                                    p.separator
+                                })))
+                                .child(
+                                    div()
+                                        .text_color(rgb(if on { p.label } else { p.tertiary }))
+                                        .child(name),
+                                ),
+                        )
+                    },
+                )
+            })
+            .child(
+                div()
+                    .truncate()
+                    .text_color(rgb(p.secondary))
+                    .child(match &s.stopped {
+                        Some(why) => format!("Stopped: {why}"),
+                        None => LINE_INFO[self.iface_choice].0.to_string(),
+                    }),
+            )
+    }
+
+    fn side(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = [
+            (SideTab::Connection, "Connection"),
+            (SideTab::Emulator, "Emulator"),
+            (SideTab::Developer, "Developer"),
+        ]
+        .into_iter()
+        .fold(ui::segmented(p), |d, (t, name)| {
+            d.child(
+                ui::segment(p, name, name, self.tab == t).on_click(cx.listener(
+                    move |v, _, _, cx| {
+                        v.tab = t;
+                        cx.notify();
+                    },
+                )),
+            )
+        });
+        let body = match self.tab {
+            SideTab::Connection => self.connection(p, cx),
+            SideTab::Emulator => self.emulator(p, cx),
+            SideTab::Developer => self.developer(p),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .w(px(PANEL_W))
+            .h_full()
+            .bg(rgb(p.panel))
+            .border_l_1()
+            .border_color(rgb(p.separator))
+            .text_size(px(ui::BODY))
+            .text_color(rgb(p.label))
+            .child(div().p(px(10.)).child(tabs))
+            .child(
+                div()
+                    .id("side-body")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .px(px(14.))
+                    .pb(px(14.))
+                    .child(body),
+            )
+            .child(self.status(p))
+    }
+
+    /// Above the handset: which view, and the side panel toggle.
+    fn toolbar(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(TOOLBAR_H))
+            .px(px(10.))
+            .child(
+                ui::segmented(p)
+                    .w(px(200.))
+                    .child(
+                        ui::segment(p, "view-dev", "Hi-Scan", !self.live_view).on_click(
+                            cx.listener(|v, _, _, cx| {
+                                v.live_view = false;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        ui::segment(p, "view-live", "Live Data", self.live_view).on_click(
+                            cx.listener(|v, _, _, cx| {
+                                v.live_view = true;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .min_w(px(0.))
+                    // the status footer is hidden with the sidebar
+                    .when(!self.sidebar, |d| d.child(self.state_badge(p)))
+                    .child(
+                        ui::button(p, "sidebar", Some(IconName::PanelRight), "")
+                            .flex_none()
+                            .when(self.sidebar, |d| d.bg(rgb(p.selected)))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.sidebar = !v.sidebar;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
 
 impl Render for CascadeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let g = Geo::new(Self::lcd_scale(window));
+        let g = Geo::new(self.lcd_scale(window));
+        let p = Palette::of(window.appearance());
         div()
             .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_row()
-            .bg(rgb(DESK))
+            .bg(rgb(p.canvas))
             .on_key_down(cx.listener(|v, e: &KeyDownEvent, _, cx| {
                 let k = &e.keystroke;
                 if e.is_held || k.modifiers.platform || k.modifiers.control {
@@ -1425,18 +1944,26 @@ impl Render for CascadeView {
                     .flex_1()
                     .h_full()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(px(20.))
-                    .map(|d| {
-                        if self.live_view {
-                            d.child(self.live_panel(cx))
-                        } else {
-                            d.child(self.device(g, cx))
-                        }
-                    }),
+                    .flex_col()
+                    .child(self.toolbar(p, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(12.))
+                            .map(|d| {
+                                if self.live_view {
+                                    d.child(self.live_panel(p, cx))
+                                } else {
+                                    d.child(self.device(g, cx))
+                                }
+                            }),
+                    ),
             )
-            .child(self.side(cx))
+            .when(self.sidebar, |d| d.child(self.side(p, cx)))
     }
 }
 
@@ -1593,10 +2120,11 @@ impl Setup {
         window.remove_window();
     }
 
-    /// One file choice: label, chosen file (or what is missing), Choose…
-    /// and, for optional ones, a way to drop it.
+    /// One file choice: header, chosen file (or what is missing), Choose…
+    /// and, for optional ones, Remove.
     fn file_row(
         &self,
+        p: Palette,
         what: Pick,
         label: &'static str,
         none: &'static str,
@@ -1608,31 +2136,15 @@ impl Setup {
             Pick::Ecu => &self.ecu,
         };
         let (name, dir) = match chosen {
-            Some(p) => (
-                p.file_name()
-                    .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into()),
-                p.parent()
+            Some(f) => (
+                f.file_name()
+                    .map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into()),
+                f.parent()
                     .map_or(String::new(), |d| d.display().to_string()),
             ),
             None => (none.to_string(), String::new()),
         };
         let optional = !matches!(what, Pick::Pack);
-        let button = |id: &'static str, text: &'static str| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .h(px(30.))
-                .px(px(12.))
-                .rounded(px(7.))
-                .border_1()
-                .border_color(rgb(CARD_EDGE))
-                .text_sm()
-                .text_color(rgb(TEXT))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(KEY_HOVER)))
-                .child(text)
-        };
         let ids = match what {
             Pick::Pack => ("choose-pack", "clear-pack"),
             Pick::Exrom => ("choose-exrom", "clear-exrom"),
@@ -1641,14 +2153,14 @@ impl Setup {
         div()
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .child(div().text_xs().text_color(rgb(TEXT_DIM)).child(label))
+            .gap(px(4.))
+            .child(ui::header(p, label))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .child(
                         div()
                             .flex()
@@ -1658,22 +2170,17 @@ impl Setup {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_sm()
-                                    .text_color(rgb(if chosen.is_some() { TEXT } else { TEXT_DIM }))
+                                    .text_color(rgb(if chosen.is_some() {
+                                        p.label
+                                    } else {
+                                        p.secondary
+                                    }))
                                     .child(name),
                             )
-                            .when(!dir.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(rgb(TEXT_DIM))
-                                        .child(dir),
-                                )
-                            }),
+                            .when(!dir.is_empty(), |d| d.child(ui::note(p, dir).truncate())),
                     )
                     .when(optional && chosen.is_some(), |d| {
-                        d.child(button(ids.1, "Remove").on_click(cx.listener(
+                        d.child(ui::button(p, ids.1, None, "Remove").on_click(cx.listener(
                             move |v, _, _, cx| {
                                 match what {
                                     Pick::Pack => {}
@@ -1685,7 +2192,7 @@ impl Setup {
                         )))
                     })
                     .child(
-                        button(ids.0, "Choose…")
+                        ui::button(p, ids.0, None, "Choose…")
                             .on_click(cx.listener(move |v, _, _, cx| v.choose(what, cx))),
                     ),
             )
@@ -1693,152 +2200,122 @@ impl Setup {
 }
 
 impl Render for Setup {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::of(window.appearance());
         let recent: Vec<std::path::PathBuf> = self
             .settings
             .recent("pack")
             .into_iter()
-            .filter(|p| Some(p) != self.pack.as_ref())
+            .filter(|f| Some(f) != self.pack.as_ref())
             .collect();
+        let has_recent = !recent.is_empty();
         let recent_list =
             recent
                 .into_iter()
                 .enumerate()
-                .fold(div().flex().flex_col(), |d, (i, p)| {
-                    let name = p
+                .fold(div().flex().flex_col(), |d, (i, f)| {
+                    let name = f
                         .file_name()
-                        .map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into());
+                        .map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into());
                     d.child(
                         div()
                             .id(("recent", i))
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(ui::RADIUS))
                             .truncate()
-                            .text_sm()
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(p.label))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(KEY_HOVER)))
+                            .hover(move |s| s.bg(rgb(p.fill_hover)))
                             .child(name)
                             .on_click(cx.listener(move |v, _, _, cx| {
-                                v.pack = Some(p.clone());
+                                v.pack = Some(f.clone());
                                 cx.notify();
                             })),
                     )
                 });
-        let has_recent = self
-            .settings
-            .recent("pack")
-            .iter()
-            .any(|p| Some(p) != self.pack.as_ref());
         let can_start = self.pack.is_some();
-        let card = || {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(14.))
-                .p(px(16.))
-                .rounded(px(10.))
-                .bg(rgb(CARD))
-                .border_1()
-                .border_color(rgb(CARD_EDGE))
-        };
-        let eeprom_on = self.eeprom;
+        let rule = || div().h(px(1.)).bg(rgb(p.separator));
         div()
             .id("setup")
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(16.))
-            .p(px(24.))
-            .bg(rgb(DESK))
-            .text_color(rgb(TEXT))
+            .gap(px(14.))
+            .p(px(20.))
+            .bg(rgb(p.panel))
+            .text_size(px(ui::BODY))
+            .text_color(rgb(p.label))
             .overflow_y_scroll()
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(4.))
-                    .child(div().text_xl().child("Cascade"))
-                    .child(div().text_sm().text_color(rgb(TEXT_DIM)).child(
-                        "The Hi-Scan Pro, emulated. It runs your own pack; nothing is \
-                         bundled.",
-                    )),
-            )
-            .child(
-                card()
-                    .child(self.file_row(
-                        Pick::Pack,
-                        "HI-SCAN PACK",
-                        "No pack chosen yet (for example hyundai.his.dat)",
-                        cx,
-                    ))
-                    .when(has_recent, |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .child(div().text_xs().text_color(rgb(TEXT_DIM)).child("RECENT"))
-                                .child(recent_list),
-                        )
-                    }),
-            )
-            .child(
-                card()
-                    .child(self.file_row(
-                        Pick::Exrom,
-                        "TROUBLESHOOTING PACK (optional)",
-                        "None: the DTC HELP flow screens stay empty",
-                        cx,
-                    ))
-                    .child(self.file_row(
-                        Pick::Ecu,
-                        "ENGINE ECU DUMP (optional, for the ECU line)",
-                        "None: the ECU line can load one later",
-                        cx,
-                    ))
+                    .gap(px(2.))
                     .child(
                         div()
-                            .id("eeprom")
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .size(px(16.))
-                                    .rounded(px(4.))
-                                    .border_1()
-                                    .border_color(rgb(if eeprom_on { ACCENT } else { CARD_EDGE }))
-                                    .when(eeprom_on, |d| d.bg(rgb(ACCENT))),
-                            )
-                            .child(div().text_sm().child(
-                                "Keep the Hi-Scan's settings (EEPROM) in a file next to the pack",
-                            ))
-                            .on_click(cx.listener(|v, _, _, cx| {
-                                v.eeprom = !v.eeprom;
-                                cx.notify();
-                            })),
-                    ),
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Cascade"),
+                    )
+                    .child(ui::note(
+                        p,
+                        "The Hi-Scan Pro, emulated. It runs your own pack; nothing is bundled.",
+                    )),
             )
+            .child(rule())
+            .child(self.file_row(
+                p,
+                Pick::Pack,
+                "Hi-Scan Pack",
+                "No pack chosen (for example hyundai.his.dat)",
+                cx,
+            ))
+            .when(has_recent, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(ui::note(p, "Recent"))
+                        .child(recent_list),
+                )
+            })
+            .child(rule())
+            .child(self.file_row(
+                p,
+                Pick::Exrom,
+                "Troubleshooting Pack (optional)",
+                "None: the DTC HELP flow screens stay empty",
+                cx,
+            ))
+            .child(self.file_row(
+                p,
+                Pick::Ecu,
+                "Engine ECU Dump (optional, for the ECU line)",
+                "None: the ECU line can load one later",
+                cx,
+            ))
+            .child(
+                ui::checkbox(
+                    p,
+                    "eeprom",
+                    "Keep the Hi-Scan's settings (EEPROM) in a file next to the pack",
+                    self.eeprom,
+                )
+                .on_click(cx.listener(|v, _, _, cx| {
+                    v.eeprom = !v.eeprom;
+                    cx.notify();
+                })),
+            )
+            .child(div().flex_1())
+            .when_some(self.error.clone(), |d, e| {
+                d.child(ui::note(p, e).text_color(rgb(p.red)))
+            })
             .child(
                 div().flex().flex_row().justify_end().child(
-                    div()
-                        .id("start")
-                        .flex()
-                        .items_center()
-                        .h(px(40.))
-                        .px(px(22.))
-                        .rounded(px(8.))
-                        .bg(rgb(ACCENT))
-                        .text_color(rgb(ACCENT_TEXT))
-                        .font_weight(FontWeight::SEMIBOLD)
+                    ui::default_button(p, "start", None, "Power On")
                         .when(!can_start, |d| d.opacity(0.4))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(ACCENT_HOVER)))
-                        .child("Power on")
                         .on_click(cx.listener(move |v, _, w, cx| {
                             if can_start {
                                 v.start(w, cx);
@@ -1846,9 +2323,6 @@ impl Render for Setup {
                         })),
                 ),
             )
-            .when_some(self.error.clone(), |d, e| {
-                d.child(div().text_sm().text_color(rgb(WARN)).child(e))
-            })
     }
 }
 
@@ -1912,8 +2386,8 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            // the panel is dark; gpui-component's buttons must match
-            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            // gpui-component's widgets follow the system light/dark setting
+            gpui_kit::component::Theme::sync_system_appearance(None, cx);
             match start {
                 Some(s) => open_device(s, cx),
                 None => {
